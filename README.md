@@ -1,5 +1,8 @@
 # Syncplayer
 
+[![CI](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml/badge.svg)](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENCE.md)
+
 Syncplayer is intended to be a Rust/GStreamer video player for installations in which every host
 decodes independent local media against one Master-derived timeline. The accepted architecture is
 recorded in [`docs/adr/`](docs/adr/); [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) provides the broader
@@ -23,6 +26,7 @@ On Ubuntu, development packages typically include `libgstreamer1.0-dev` and
 
 ```sh
 cargo build --release
+cargo fmt --all -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
@@ -53,3 +57,13 @@ control connection after release is intentional: playback must not depend on a l
 See [`docs/prototypes/clock-sync.md`](docs/prototypes/clock-sync.md) for the measurement procedure,
 acceptance criteria, and known boundaries.
 
+## Contributing
+
+This is an early-stage project, but focused bug reports and pull requests are welcome. Read
+[`CONTRIBUTING.md`](CONTRIBUTING.md) before proposing a change. Security issues should be reported
+privately as described in [`SECURITY.md`](SECURITY.md).
+
+## License
+
+Licensed under either the Apache License, Version 2.0 or the MIT license, at your option. See
+[`LICENCE.md`](LICENCE.md) for details.

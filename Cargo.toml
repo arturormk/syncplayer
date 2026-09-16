@@ -6,6 +6,10 @@ rust-version = "1.95"
 publish = false
 description = "Experimental clock-synchronised local-media playback"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/arturormk/syncplayer"
+readme = "README.md"
+keywords = ["gstreamer", "multimedia", "synchronization", "video"]
+categories = ["multimedia::video"]
 
 [dependencies]
 anyhow = "1.0"
