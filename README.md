@@ -22,6 +22,22 @@ the final playback engine or protocol.
 On Ubuntu, development packages typically include `libgstreamer1.0-dev` and
 `libgstreamer-plugins-base1.0-dev`. Runtime plugin selection depends on the media and machine.
 
+## Quickstart
+
+On x86-64 Linux or a Raspberry Pi running a 64-bit OS, run:
+
+```sh
+./quickstart.sh
+```
+
+The script detects the native platform and offers to install missing build dependencies on Ubuntu,
+Debian, and Raspberry Pi OS. It can also install Rust through `rustup`. After a locked release
+build, it prints the absolute path to the executable.
+
+Builds are native because Syncplayer links to platform-specific GStreamer libraries; the script
+does not cross-compile or support 32-bit ARM. GStreamer runtime plugins for codecs, hardware
+decoding, video output, and audio output remain dependent on the chosen media and machine.
+
 ## Build and test
 
 ```sh
