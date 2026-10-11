@@ -40,6 +40,21 @@ Builds are native because Syncplayer links to platform-specific GStreamer librar
 does not cross-compile or support 32-bit ARM. GStreamer runtime plugins for codecs, hardware
 decoding, video output, and audio output remain dependent on the chosen media and machine.
 
+## Prepare media for Raspberry Pi players
+
+If any player is a Raspberry Pi, recompress every video intended for that player with the provided
+compatibility tool before deploying it:
+
+```sh
+./tools/prepare-video-for-rpi.sh -o video-rpi.mp4 video.mov
+```
+
+Add `--audio` when audio is required; the default output is video-only. The tool produces a
+conservative H.264/MP4 rendition for Raspberry Pi hardware decoding and tone-maps HDR sources to
+SDR Rec.709. This avoids GStreamer falling back to software decoding when a Pi decoder rejects HDR
+color caps. See [`docs/media-preparation.md`](docs/media-preparation.md) for requirements and the
+workflow for keeping host-specific renditions synchronized.
+
 ## Build and test
 
 ```sh
@@ -51,7 +66,9 @@ cargo clippy --all-targets -- -D warnings
 
 ## Two-host experiment
 
-Use a numbered-frame test video copied to both machines. Start the Master first:
+Use a numbered-frame test video copied to both machines. If either machine is a Raspberry Pi,
+prepare the test video as described above and copy that same prepared output to both machines.
+Start the Master first:
 
 ```sh
 RUST_LOG=syncplayer=debug cargo run --release -- \

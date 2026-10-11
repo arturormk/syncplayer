@@ -12,10 +12,17 @@ absolute clock timestamp as their base time.
 
 ## Test asset
 
-Use a 60 fps, constant-frame-rate, intra-frame-friendly test video lasting at least 60 seconds.
-Every frame should visibly contain its sequential frame number. Add a full-screen black/white
-transition and an audio click once per second. Copy the exact file to both machines and verify its
-cryptographic checksum before testing.
+Use a constant-frame-rate, intra-frame-friendly test video lasting at least 60 seconds: 60 fps for
+the general experiment, or 30 fps when using the Raspberry Pi compatibility profile below. Every
+frame should visibly contain its sequential frame number. Add a full-screen black/white transition
+and an audio click once per second. Copy the exact file to both machines and verify its cryptographic
+checksum before testing.
+
+If either test host is a Raspberry Pi, prepare the asset with
+[`tools/prepare-video-for-rpi.sh`](../../tools/prepare-video-for-rpi.sh), including `--audio` when
+the test asset has the required click track. Use that same prepared output on every host in this
+prototype so decoder or rendition differences do not contaminate the clock measurement. See
+[`docs/media-preparation.md`](../media-preparation.md) for the production rendition guidance.
 
 The prototype deliberately does not include an asset generator: codec/container choices are part
 of the test matrix and generated binaries do not belong in the repository.
