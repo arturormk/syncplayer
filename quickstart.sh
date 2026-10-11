@@ -177,6 +177,21 @@ ensure_rust() {
     command -v cargo >/dev/null 2>&1 || die 'cargo is not available after installing rustup.'
 }
 
+build_release() {
+    local -a cargo_args=(build --locked --release --target "$TARGET_TRIPLE")
+    local memory_kib
+
+    if [[ -z "${CARGO_BUILD_JOBS:-}" && -r /proc/meminfo ]]; then
+        memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+        if [[ "$memory_kib" =~ ^[0-9]+$ ]] && ((memory_kib < 2 * 1024 * 1024)); then
+            printf 'Low-memory system detected; limiting the build to one concurrent job.\n'
+            cargo_args+=(--jobs 1)
+        fi
+    fi
+
+    cargo "${cargo_args[@]}"
+}
+
 main() {
     local artifact
 
@@ -192,7 +207,7 @@ main() {
     rustup target add "$TARGET_TRIPLE"
 
     printf 'Building Syncplayer for %s...\n' "$TARGET_TRIPLE"
-    cargo build --locked --release --target "$TARGET_TRIPLE"
+    build_release
 
     artifact="$PROJECT_ROOT/target/$TARGET_TRIPLE/release/syncplayer"
     [[ -x "$artifact" ]] || die "The build completed, but no executable was found at $artifact"

@@ -32,7 +32,9 @@ On x86-64 Linux or a Raspberry Pi running a 64-bit OS, run:
 
 The script detects the native platform and offers to install missing build dependencies on Ubuntu,
 Debian, and Raspberry Pi OS. It can also install Rust through `rustup`. After a locked release
-build, it prints the absolute path to the executable.
+build, it prints the absolute path to the executable. On systems with less than 2 GiB of RAM, it
+limits Cargo to one concurrent job to prevent the Linux OOM killer from terminating `rustc`. Set
+`CARGO_BUILD_JOBS` explicitly to override that default.
 
 Builds are native because Syncplayer links to platform-specific GStreamer libraries; the script
 does not cross-compile or support 32-bit ARM. GStreamer runtime plugins for codecs, hardware
