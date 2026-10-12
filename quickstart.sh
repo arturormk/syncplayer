@@ -83,7 +83,7 @@ find_missing_apt_packages() {
             add_package libgstreamer-plugins-base1.0-dev
         fi
     fi
-    if ! command -v rustup >/dev/null 2>&1; then
+    if ! find_rustup; then
         if ! command -v curl >/dev/null 2>&1; then
             add_package curl
         fi
@@ -132,6 +132,23 @@ verify_build_dependencies() {
     fi
 }
 
+find_rustup() {
+    local cargo_bin
+
+    if command -v rustup >/dev/null 2>&1; then
+        return 0
+    fi
+
+    cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+    if [[ -x "$cargo_bin/rustup" ]]; then
+        PATH="$cargo_bin:$PATH"
+        export PATH
+        return 0
+    fi
+
+    return 1
+}
+
 ensure_system_dependencies() {
     find_missing_apt_packages
     if ((${#MISSING_PACKAGES[@]} > 0)); then
@@ -148,7 +165,7 @@ ensure_rust() {
     local cargo_env
     local installer
 
-    if ! command -v rustup >/dev/null 2>&1; then
+    if ! find_rustup; then
         command -v curl >/dev/null 2>&1 \
             || die 'curl is required to install Rust with rustup.'
         prompt_yes_no 'Rustup is missing. Install it with the official minimal-profile installer?' \
