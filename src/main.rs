@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_net as gst_net;
+use gstreamer_pbutils as gst_pbutils;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use syncplayer::playlist::{ItemPosition, PlaylistConfig, PlaylistCursor, Timeline};
 use syncplayer::protocol::{Message, Operation, ReleasePlan, read_message, write_message};
 use syncplayer::time::{ClockNs, MediaPositionNs};
 use tracing::{debug, error, info, warn};
@@ -70,15 +72,29 @@ struct SlaveArgs {
 #[derive(Debug, Args)]
 struct PlaybackArgs {
     /// Local media file. Master and Slave paths may differ.
-    #[arg(long, value_name = "PATH")]
-    media: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "playlist",
+        conflicts_with = "playlist"
+    )]
+    media: Option<PathBuf>,
+
+    /// Versioned TOML playlist. Entries are local to each host.
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "media",
+        conflicts_with = "media"
+    )]
+    playlist: Option<PathBuf>,
 
     /// Silence the selected audio stream.
     #[arg(long)]
     mute: bool,
 
-    /// Repeat the media continuously using playbin3's gapless handoff.
-    #[arg(long)]
+    /// Repeat `--media` continuously. Playlist looping is configured in TOML.
+    #[arg(long, requires = "media", conflicts_with = "playlist")]
     r#loop: bool,
 
     /// Override `GStreamer`'s automatically selected video sink.
@@ -363,13 +379,126 @@ fn monitor_master(mut stream: TcpStream, master: SocketAddr, player: Arc<Player>
     });
 }
 
+#[derive(Clone, Debug)]
+struct MediaItem {
+    path: PathBuf,
+    uri: String,
+}
+
+#[derive(Debug)]
+struct PlaybackSequence {
+    items: Vec<MediaItem>,
+    timeline: Option<Timeline>,
+    looping: bool,
+    from_playlist: bool,
+}
+
+impl PlaybackSequence {
+    fn prepare(args: &PlaybackArgs) -> Result<Self> {
+        if let Some(playlist_path) = &args.playlist {
+            let config = PlaylistConfig::load(playlist_path)
+                .with_context(|| format!("failed to load playlist {}", playlist_path.display()))?;
+            return Self::prepare_playlist(config);
+        }
+
+        let path = args
+            .media
+            .as_ref()
+            .ok_or_else(|| anyhow!("either --media or --playlist is required"))?;
+        let uri = media_uri(path)?;
+        Ok(Self {
+            items: vec![MediaItem {
+                path: path.clone(),
+                uri,
+            }],
+            timeline: None,
+            looping: args.r#loop,
+            from_playlist: false,
+        })
+    }
+
+    fn prepare_playlist(config: PlaylistConfig) -> Result<Self> {
+        let discoverer = gst_pbutils::Discoverer::new(to_clock_time(PREROLL_TIMEOUT)?)
+            .context("failed to create GStreamer media discoverer")?;
+        // Startup discovery must reflect the files as they exist now. Do not
+        // let GstDiscoverer reuse persistent results from an earlier run.
+        discoverer.set_property("use-cache", false);
+
+        let mut items = Vec::with_capacity(config.videos.len());
+        let mut durations = Vec::with_capacity(config.videos.len());
+        for (index, path) in config.videos.into_iter().enumerate() {
+            let uri = media_uri(&path)
+                .with_context(|| format!("playlist item {index} is unavailable"))?;
+            let info = discoverer.discover_uri(&uri).with_context(|| {
+                format!(
+                    "failed to discover playlist item {index}: {}",
+                    path.display()
+                )
+            })?;
+            if info.result() != gst_pbutils::DiscovererResult::Ok {
+                bail!(
+                    "playlist item {index} could not be discovered (result {:?}): {}",
+                    info.result(),
+                    path.display()
+                );
+            }
+            let duration_ns = info
+                .duration()
+                .map(gst::ClockTime::nseconds)
+                .filter(|duration| *duration > 0)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "playlist item {index} has no known non-zero duration: {}",
+                        path.display()
+                    )
+                })?;
+            info!(item_index = index, media = %path.display(), duration_ns, "playlist item discovered");
+            items.push(MediaItem { path, uri });
+            durations.push(duration_ns);
+        }
+        let timeline = Timeline::new(durations, config.looping)
+            .context("invalid playlist sequence duration")?;
+        Ok(Self {
+            items,
+            timeline: Some(timeline),
+            looping: config.looping,
+            from_playlist: true,
+        })
+    }
+
+    fn locate(&self, position_ns: u64) -> Result<ItemPosition> {
+        match &self.timeline {
+            Some(timeline) => timeline
+                .locate(position_ns)
+                .context("invalid sequence position")?
+                .ok_or_else(|| {
+                    anyhow!("sequence position is at the end of a non-looping playlist")
+                }),
+            None => Ok(ItemPosition {
+                index: 0,
+                local_ns: position_ns,
+            }),
+        }
+    }
+
+    fn project(&self, position_ns: u64, lead_ns: u64) -> Result<u64> {
+        match &self.timeline {
+            Some(timeline) => timeline
+                .project(position_ns, lead_ns)
+                .context("cannot schedule a join beyond the end of the media sequence"),
+            None => Ok(position_ns.saturating_add(lead_ns)),
+        }
+    }
+}
+
 struct Player {
     pipeline: gst::Pipeline,
+    sequence: PlaybackSequence,
+    cursor: Arc<Mutex<PlaylistCursor>>,
     clock: Mutex<gst::Clock>,
     plan: Mutex<Option<ReleasePlan>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
-    loop_duration_ns: Option<u64>,
 }
 
 struct ScheduledRelease {
@@ -449,24 +578,35 @@ fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<b
 
 impl Player {
     fn new(args: &PlaybackArgs, forced_clock: Option<&gst::Clock>) -> Result<Self> {
-        let uri = media_uri(&args.media)?;
+        let mut sequence = PlaybackSequence::prepare(args)?;
+        let first_uri = sequence.items[0].uri.clone();
         let element = gst::ElementFactory::make("playbin3")
-            .property("uri", &uri)
+            .property("uri", &first_uri)
             .property("mute", args.mute)
             .build()
             .context("playbin3 is unavailable")?;
-        if args.r#loop {
-            let weak_element = element.downgrade();
-            let loop_uri = uri.clone();
-            element.connect("about-to-finish", false, move |_| {
-                if let Some(element) = weak_element.upgrade() {
-                    // Supplying the next URI before EOS lets playbin3 prepare
-                    // it and carry the running timeline across the boundary.
-                    element.set_property("uri", &loop_uri);
-                }
-                None
-            });
-        }
+        let cursor = Arc::new(Mutex::new(PlaylistCursor::new(
+            sequence.items.len(),
+            sequence.looping,
+            0,
+        )));
+        let weak_element = element.downgrade();
+        let callback_cursor = cursor.clone();
+        let uris: Vec<String> = sequence.items.iter().map(|item| item.uri.clone()).collect();
+        element.connect("about-to-finish", false, move |_| {
+            let next = callback_cursor
+                .lock()
+                .ok()
+                .and_then(|mut cursor| cursor.queue_next());
+            if let (Some(index), Some(element)) = (next, weak_element.upgrade()) {
+                debug!(next_item_index = index, next_uri = %uris[index], "queueing gapless playlist item");
+                // Supplying the next URI before EOS lets playbin3 prepare it
+                // and carry the running timeline across the boundary.
+                element.set_property("uri", &uris[index]);
+                debug!(next_item_index = index, "gapless playlist item queued");
+            }
+            None
+        });
         if let Some(name) = &args.video_sink {
             let sink = make_element(name, "video sink")?;
             force_clock_sync(&sink, "video sink")?;
@@ -509,23 +649,32 @@ impl Player {
             "playback clock selected"
         );
         let duration = pipeline.query_duration::<gst::ClockTime>();
-        let loop_duration_ns = if args.r#loop {
+        if args.r#loop {
             let duration_ns = duration
                 .map(gst::ClockTime::nseconds)
                 .filter(|duration_ns| *duration_ns > 0)
                 .ok_or_else(|| anyhow!("--loop requires media with a known, non-zero duration"))?;
-            Some(duration_ns)
-        } else {
-            None
-        };
-        info!(media = %args.media.display(), duration_ns = duration.map(gst::ClockTime::nseconds), mute = args.mute, looped = args.r#loop, "media prerolled");
+            sequence.timeline = Some(
+                Timeline::new(vec![duration_ns], true).context("invalid looping media duration")?,
+            );
+        }
+        info!(
+            media = %sequence.items[0].path.display(),
+            item_count = sequence.items.len(),
+            duration_ns = duration.map(gst::ClockTime::nseconds),
+            mute = args.mute,
+            looped = sequence.looping,
+            playlist = sequence.from_playlist,
+            "media sequence prerolled"
+        );
         Ok(Self {
             pipeline,
+            sequence,
+            cursor,
             clock: Mutex::new(clock),
             plan: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
-            loop_duration_ns,
         })
     }
 
@@ -546,32 +695,56 @@ impl Player {
 
     fn resynchronize(&self, clock: &gst::Clock, plan: ReleasePlan) -> Result<()> {
         self.cancel_scheduled_release()?;
+        let item_position = self.sequence.locate(plan.media_position.get())?;
+        debug!(
+            item_index = item_position.index,
+            item_local_ns = item_position.local_ns,
+            "resetting pipeline for synchronization"
+        );
         self.pipeline
-            .set_state(gst::State::Paused)
-            .context("failed to pause for synchronization")?;
+            .set_state(gst::State::Null)
+            .context("failed to reset media for synchronization")?;
         wait_for_state(
             &self.pipeline,
             PREROLL_TIMEOUT,
-            "media did not pause before synchronization timeout",
+            "media did not stop before synchronization timeout",
         )?;
+        debug!(
+            item_index = item_position.index,
+            "pipeline stopped for synchronization item"
+        );
+        self.cursor
+            .lock()
+            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+            .reset(item_position.index);
+        self.pipeline
+            .set_property("uri", &self.sequence.items[item_position.index].uri);
         self.pipeline.use_clock(Some(clock));
         *self
             .clock
             .lock()
             .map_err(|_| anyhow!("clock lock poisoned"))? = clock.clone();
-
-        let media_position = self.normalize(plan.media_position);
         self.pipeline
-            .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::ClockTime::from_nseconds(media_position.get()),
-            )
-            .context("failed to seek to synchronization position")?;
+            .set_state(gst::State::Paused)
+            .context("failed to preroll synchronization item")?;
         wait_for_state(
             &self.pipeline,
             PREROLL_TIMEOUT,
-            "synchronization seek did not preroll before timeout",
+            "synchronization item did not preroll before timeout",
         )?;
+        if item_position.local_ns > 0 {
+            self.pipeline
+                .seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    gst::ClockTime::from_nseconds(item_position.local_ns),
+                )
+                .context("failed to seek to synchronization position")?;
+            wait_for_state(
+                &self.pipeline,
+                PREROLL_TIMEOUT,
+                "synchronization seek did not preroll before timeout",
+            )?;
+        }
         self.schedule_playing(plan)
     }
 
@@ -651,10 +824,9 @@ impl Player {
         Ok(ReleasePlan {
             generation,
             operation: Operation::Goto,
-            media_position: projected_position(
-                current_plan.media_position.get(),
-                elapsed,
-                self.loop_duration_ns,
+            media_position: MediaPositionNs::new(
+                self.sequence
+                    .project(current_plan.media_position.get(), elapsed)?,
             ),
             release_at,
         })
@@ -684,9 +856,23 @@ impl Player {
                         ));
                     }
                     gst::MessageView::Eos(..) => {
-                        if self.loop_duration_ns.is_some() {
+                        if self.sequence.looping {
                             break Err(anyhow!(
                                 "looping pipeline reached EOS instead of performing a gapless handoff"
+                            ));
+                        }
+                        let current = self
+                            .cursor
+                            .lock()
+                            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+                            .current();
+                        let current_uri = self.pipeline.property::<Option<String>>("current-uri");
+                        let final_uri = self.sequence.items.last().map(|item| item.uri.as_str());
+                        if current + 1 < self.sequence.items.len()
+                            || current_uri.as_deref() != final_uri
+                        {
+                            break Err(anyhow!(
+                                "media sequence reached EOS before its final item (cursor item {current}, current URI {current_uri:?})"
                             ));
                         }
                         info!("end of stream");
@@ -730,29 +916,29 @@ impl Player {
             return;
         };
         let clock_now = clock.time().nseconds();
-        let expected = clock_now
-            .saturating_sub(plan.release_at.get())
-            .saturating_add(plan.media_position.get());
+        let elapsed_ns = clock_now.saturating_sub(plan.release_at.get());
+        let Ok(sequence_position_ns) = self.sequence.project(plan.media_position.get(), elapsed_ns)
+        else {
+            return;
+        };
         if let Some(actual) = self.pipeline.query_position::<gst::ClockTime>() {
-            let expected = self.normalize(MediaPositionNs::new(expected));
-            let actual = self.normalize(MediaPositionNs::new(actual.nseconds()));
-            let error_ns = self.loop_duration_ns.map_or_else(
-                || actual - expected,
-                |duration_ns| actual.circular_error(expected, duration_ns),
-            );
+            let Ok(item_position) = self.sequence.locate(sequence_position_ns) else {
+                return;
+            };
+            let actual_local_ns = actual.nseconds();
+            let error_ns = i128::from(actual_local_ns) - i128::from(item_position.local_ns);
+            let current_uri = self.pipeline.property::<Option<String>>("current-uri");
             debug!(
                 clock_ns = clock_now,
-                expected_ns = expected.get(),
-                actual_ns = actual.get(),
+                sequence_position_ns,
+                expected_item_index = item_position.index,
+                expected_item_local_ns = item_position.local_ns,
+                current_uri,
+                actual_item_local_ns = actual_local_ns,
                 error_ns,
                 "position telemetry"
             );
         }
-    }
-
-    fn normalize(&self, position: MediaPositionNs) -> MediaPositionNs {
-        self.loop_duration_ns
-            .map_or(position, |duration_ns| position.modulo(duration_ns))
     }
 
     fn clock(&self) -> Result<gst::Clock> {
@@ -768,15 +954,6 @@ fn record_release_error(release_error: &Mutex<Option<String>>, message: String) 
     if let Ok(mut release_error) = release_error.lock() {
         *release_error = Some(message);
     }
-}
-
-fn projected_position(
-    position_ns: u64,
-    lead_ns: u64,
-    loop_duration_ns: Option<u64>,
-) -> MediaPositionNs {
-    let projected = MediaPositionNs::new(position_ns.saturating_add(lead_ns));
-    loop_duration_ns.map_or(projected, |duration_ns| projected.modulo(duration_ns))
 }
 
 fn can_join_startup(release_at: ClockNs, now: ClockNs, minimum_lead_ns: u64) -> bool {
@@ -900,16 +1077,33 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClockNs, can_join_startup, non_negative_seconds, projected_position};
+    use super::{Cli, ClockNs, Command, can_join_startup, non_negative_seconds};
+    use clap::Parser;
 
     #[test]
-    fn late_join_position_accounts_for_release_lead_time() {
-        assert_eq!(projected_position(12_000, 5_000, None).get(), 17_000);
+    fn command_line_requires_exactly_one_playback_input() {
+        assert!(Cli::try_parse_from(["syncplayer", "master"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "syncplayer",
+                "master",
+                "--media",
+                "a.mp4",
+                "--playlist",
+                "show.toml"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from(["syncplayer", "master", "--playlist", "show.toml"]).unwrap();
+        assert!(matches!(cli.command, Command::Master(_)));
     }
 
     #[test]
-    fn late_join_position_wraps_across_a_loop_boundary() {
-        assert_eq!(projected_position(58_000, 5_000, Some(60_000)).get(), 3_000);
+    fn command_line_rejects_loop_with_playlist() {
+        assert!(
+            Cli::try_parse_from(["syncplayer", "master", "--playlist", "show.toml", "--loop"])
+                .is_err()
+        );
     }
 
     #[test]

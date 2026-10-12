@@ -43,6 +43,7 @@ impl FromStr for Operation {
 pub struct ReleasePlan {
     pub generation: u64,
     pub operation: Operation,
+    /// Absolute position from the beginning of the complete media sequence.
     pub media_position: MediaPositionNs,
     pub release_at: ClockNs,
 }

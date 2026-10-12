@@ -79,6 +79,7 @@ find_missing_apt_packages() {
             add_package libgstreamer1.0-dev
         fi
         if ! pkg-config --atleast-version=1.20 gstreamer-base-1.0 \
+            || ! pkg-config --atleast-version=1.20 gstreamer-pbutils-1.0 \
             || ! pkg-config --atleast-version=1.20 gstreamer-net-1.0; then
             add_package libgstreamer-plugins-base1.0-dev
         fi
@@ -121,6 +122,8 @@ verify_build_dependencies() {
             || missing+=('GStreamer 1.20+ development files')
         pkg-config --atleast-version=1.20 gstreamer-base-1.0 \
             || missing+=('GStreamer base 1.20+ development files')
+        pkg-config --atleast-version=1.20 gstreamer-pbutils-1.0 \
+            || missing+=('GStreamer pbutils 1.20+ development files')
         pkg-config --atleast-version=1.20 gstreamer-net-1.0 \
             || missing+=('GStreamer network 1.20+ development files')
     fi

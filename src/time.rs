@@ -34,7 +34,7 @@ impl fmt::Display for ClockNs {
     }
 }
 
-/// A position relative to the start of one local media item.
+/// An absolute position relative to the start of a complete media sequence.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MediaPositionNs(u64);
 

@@ -16,7 +16,7 @@ the final playback engine or protocol.
 ## Prerequisites
 
 - Rust 1.95 (selected by `rust-toolchain.toml`)
-- GStreamer 1.20 or newer, including base/playback and network libraries
+- GStreamer 1.20 or newer, including base/playback, pbutils, and network libraries
 - GStreamer plugins needed to decode the chosen test media and drive the selected sinks
 
 On Ubuntu, development packages typically include `libgstreamer1.0-dev` and
@@ -69,8 +69,8 @@ cargo clippy --all-targets -- -D warnings
 Syncplayer has two subcommands:
 
 ```text
-syncplayer master [OPTIONS] --media <PATH>
-syncplayer slave  [OPTIONS] --media <PATH> --master <IP:PORT>
+syncplayer master [OPTIONS] <--media <PATH>|--playlist <PATH>>
+syncplayer slave  [OPTIONS] <--media <PATH>|--playlist <PATH>> --master <IP:PORT>
 ```
 
 Run `syncplayer --help`, `syncplayer master --help`, or `syncplayer slave --help` for the help
@@ -82,11 +82,39 @@ These options are accepted by both `master` and `slave`:
 
 | Option | Required | Description |
 | --- | :---: | --- |
-| `--media <PATH>` | Yes | Local media file to play. Master and Slave paths may differ, but the files should represent the same content and have matching durations. |
+| `--media <PATH>` | One of these | Local media file to play. Master and Slave paths may differ, but the files should represent the same content and have matching durations. |
+| `--playlist <PATH>` | One of these | Version 1 TOML playlist. The ordered entries and durations must correspond across hosts. |
 | `--mute` | No | Silence the selected audio stream. The audio pipeline remains active, so its timing behavior is preserved. |
-| `--loop` | No | Repeat continuously using `playbin3`'s gapless handoff. The media must have a known, non-zero duration. Use this option consistently across participating hosts. |
+| `--loop` | No | Repeat a single `--media` file continuously using `playbin3`'s gapless handoff. Playlist looping is configured in TOML. |
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
+
+`--media` and `--playlist` are mutually exclusive. The initial playlist schema is:
+
+```toml
+version = 1
+
+[playlist]
+loop = true
+videos = [
+  "video-01-${HOSTNAME}.mp4",
+  "video-02-${HOSTNAME}.mp4",
+]
+```
+
+A playlist must contain at least one video; repeated entries are allowed. Relative entries resolve
+against the directory containing the playlist file. Each host expands `$NAME` and `${NAME}` from
+its own process environment; `$$` writes a literal dollar sign. Undefined variables and malformed
+expansions are errors. Unknown TOML fields and unsupported versions are rejected.
+
+At every startup Syncplayer checks that every playlist file exists and uses GStreamer's synchronous
+discoverer, with its persistent cache disabled, to obtain a non-zero duration. The cumulative
+duration must fit in an unsigned 64-bit nanosecond value. No playlist metadata is cached by
+Syncplayer, so file or playlist changes take effect after a restart.
+
+This deliberately small schema is a prototype. Its parser and runtime sequence abstraction can
+later be replaced by the complete logical program model described in
+[`docs/BLUEPRINT.md`](docs/BLUEPRINT.md).
 
 ### Master options
 
@@ -144,6 +172,12 @@ Pass `--loop` to both Master and Slave to repeat their local media continuously.
 `playbin3`'s gapless next-item handoff and treats synchronized positions modulo each file's probed
 duration, including initial positions beyond the first iteration. Looping therefore requires media
 with a known, non-zero duration. Host-specific renditions should have matching durations.
+
+To run a playlist instead, create a corresponding TOML file on each host and replace the media
+option with `--playlist /path/to/playlist.toml`. Playlist items are handed to `playbin3` before the
+current item finishes for gapless transitions. Compatible codecs, dimensions, frame rates, and
+audio formats give the best transition behavior. The control protocol continues to send only one
+absolute position in the whole sequence; local paths and item numbers never cross the network.
 
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.

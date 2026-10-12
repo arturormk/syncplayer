@@ -3,5 +3,6 @@
 //! This is deliberately not the eventual product protocol. The types make
 //! clock-domain mistakes and malformed laboratory control messages explicit.
 
+pub mod playlist;
 pub mod protocol;
 pub mod time;
