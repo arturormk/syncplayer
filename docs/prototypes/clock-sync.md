@@ -2,13 +2,15 @@
 
 ## Purpose
 
-This prototype validates ADR 0004 and the release primitive from ADR 0010 on two physical Linux
-hosts. It is not the production Syncplayer protocol, configuration model, or playlist engine.
+This prototype validates ADR 0004, the release primitive from ADR 0010, and basic multi-Slave
+joining and reconnection on physical Linux hosts. It is not the production Syncplayer protocol,
+configuration model, or playlist engine.
 
 The Master forces a monotonic `GstSystemClock` onto its pipeline and exposes that same clock through
-`GstNetTimeProvider`. The Slave calibrates a `GstNetClientClock`, forces it onto its pipeline, and
-reports readiness only after its local file is prerolled. Both pipelines use the same future
-absolute clock timestamp as their base time.
+`GstNetTimeProvider`. The Master starts without waiting for a Slave. Each Slave calibrates a
+`GstNetClientClock`, forces it onto its pipeline, and reports readiness after its local file is
+prerolled. The Master then supplies its projected media position at a future absolute clock
+timestamp. This lets a late Slave join without interrupting existing playback.
 
 ## Test asset
 
@@ -31,14 +33,16 @@ of the test matrix and generated binaries do not belong in the repository.
 
 1. Record the host models, Linux versions, GStreamer versions, display refresh rates, connection
    type, media checksum, and complete commands.
-2. Run Master and Slave with `RUST_LOG=syncplayer=debug` and capture their logs separately.
+2. Run the Master alone and verify that it starts immediately. Start the Slaves later with
+   `RUST_LOG=syncplayer=debug` and capture every host's logs separately.
 3. Film both displays in one high-frame-rate camera view. Do not infer display synchronization only
    from queried GStreamer positions.
 4. Repeat ten cold starts and record the largest observed frame separation.
 5. Run continuously for sixty minutes and inspect the initial and final numbered frames together.
-6. Disconnect the TCP control path after release and verify playback continues. The implementation
-   already closes this connection normally; firewall or cable testing additionally exercises the
-   clock's behavior when its UDP samples disappear.
+6. Disconnect the Master or its network after release and verify that every Slave continues. Bring
+   the Master back and verify that Slaves reconnect, pause, seek, and rejoin its new timeline.
+7. Repeat with several Slaves, removing and restarting one at a time, and verify that neither the
+   Master nor the other Slaves are interrupted.
 
 ## Acceptance criteria
 
@@ -48,10 +52,13 @@ of the test matrix and generated binaries do not belong in the repository.
   starting unsynchronized playback.
 - A malformed, oversized, truncated, incompatible, stale, or non-future control message is rejected.
 - Loss of the control connection after release does not stop playback.
+- A late or restarted Slave joins without pausing the Master or other Slaves.
+- Slaves free-run through Master loss and resynchronize when it returns.
 
-Pause, resume, goto, gapless transitions, playlist loops, correction policy, and Master reconnection
-are explicitly subsequent experiments. `ReleasePlan` already distinguishes start, resume, and goto
-so those experiments can reuse the clock-domain model without treating this lab protocol as stable.
+Operator-driven pause, resume and goto, correction thresholds, and session identity are explicitly
+subsequent experiments. Reconnection currently always performs an authoritative pause/seek/rejoin.
+`ReleasePlan` distinguishes start, resume, and goto so later experiments can reuse the clock-domain
+model without treating this lab protocol as stable.
 
 ## Results
 

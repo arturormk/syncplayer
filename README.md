@@ -90,9 +90,15 @@ with a known, non-zero duration. Host-specific renditions should have matching d
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.
 
-The Master waits until the Slave network clock is calibrated and its media is prerolled, then both
-pipelines enter `PLAYING` against a release timestamp five seconds in the future. Closing the
-control connection after release is intentional: playback must not depend on a live command stream.
+The Master starts playing immediately and behaves like an ordinary local player even when no
+Slaves are present. It accepts any number of Slaves while it plays. Each new Slave calibrates its
+network clock and receives the Master's current position plus a future release timestamp, allowing
+it to join without interrupting the Master or already-connected players.
+
+After joining, a Slave keeps playing from its disciplined local clock if the Master or control
+network disappears. It reconnects in the background. When the Master returns, the Slave may pause,
+seek to the newly authoritative position, and resume at the supplied timestamp; this deliberate
+interruption prevents especially noticeable audio divergence after an outage.
 
 See [`docs/prototypes/clock-sync.md`](docs/prototypes/clock-sync.md) for the measurement procedure,
 acceptance criteria, and known boundaries.
