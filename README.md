@@ -72,7 +72,8 @@ Start the Master first:
 
 ```sh
 RUST_LOG=syncplayer=debug cargo run --release -- \
-  master --media /path/to/test.mp4 --bind 0.0.0.0:46000 --clock-port 46001
+  master --media /path/to/test.mp4 --bind 0.0.0.0:46000 --clock-port 46001 \
+  --startup-delay 30
 ```
 
 Then start the Slave, replacing the address with the Master's LAN address:
@@ -90,10 +91,17 @@ with a known, non-zero duration. Host-specific renditions should have matching d
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.
 
-The Master starts playing immediately and behaves like an ordinary local player even when no
-Slaves are present. It accepts any number of Slaves while it plays. Each new Slave calibrates its
-network clock and receives the Master's current position plus a future release timestamp, allowing
-it to join without interrupting the Master or already-connected players.
+By default, the Master starts playing immediately and behaves like an ordinary local player even
+when no Slaves are present. The optional `--startup-delay SECONDS` shown above instead holds the
+prerolled first frame until one shared Master-clock deadline. Slaves ready during that grace period
+receive the same deadline and start with the Master. Set the startup delay longer than
+`--release-delay` (five seconds by default), since a Slave needs that final preparation window.
+This is best effort: the Master starts at the deadline even if no Slaves are ready, and late Slaves
+catch up through the normal join process.
+
+The Master accepts any number of Slaves while it plays. Each new Slave calibrates its network clock
+and receives the Master's current position plus a future release timestamp, allowing it to join
+without interrupting the Master or already-connected players.
 
 After joining, a Slave keeps playing from its disciplined local clock if the Master or control
 network disappears. It reconnects in the background. When the Master returns, the Slave may pause,

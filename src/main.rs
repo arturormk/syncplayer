@@ -50,6 +50,10 @@ struct MasterArgs {
     /// Seconds between sending a release plan and its clock deadline.
     #[arg(long, default_value_t = 5.0, value_parser = positive_seconds)]
     release_delay: f64,
+
+    /// Best-effort startup grace period in seconds; should exceed `--release-delay`.
+    #[arg(long, default_value_t = 0.0, value_parser = non_negative_seconds)]
+    startup_delay: f64,
 }
 
 #[derive(Debug, Args)]
@@ -120,19 +124,32 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         .port()
         .try_into()
         .context("invalid provider port")?;
-    let initial_plan = player.start_now()?;
-    info!(
-        control = %listener.local_addr()?,
-        clock_port,
-        "Master playback started; ready to welcome Slaves"
-    );
+    let startup_delay = Duration::from_secs_f64(args.startup_delay);
+    let release_delay = Duration::from_secs_f64(args.release_delay);
+    let initial_plan = player.schedule_start(startup_delay)?;
+    if startup_delay.is_zero() {
+        info!(
+            control = %listener.local_addr()?,
+            clock_port,
+            "Master playback started; ready to welcome Slaves"
+        );
+    } else {
+        info!(
+            control = %listener.local_addr()?,
+            clock_port,
+            release_at_ns = initial_plan.release_at.get(),
+            startup_delay_s = args.startup_delay,
+            "Master prerolled on the first frame; synchronized startup scheduled"
+        );
+    }
 
     serve_slaves(
         listener,
         player.clone(),
         clock.clone().upcast(),
         clock_port,
-        Duration::from_secs_f64(args.release_delay),
+        release_delay,
+        initial_plan,
     );
     player.monitor(initial_plan)
 }
@@ -157,9 +174,17 @@ fn serve_slaves(
     clock: gst::Clock,
     clock_port: u16,
     release_delay: Duration,
+    startup_plan: ReleasePlan,
 ) {
     thread::spawn(move || {
-        let generation = Arc::new(AtomicU64::new(1));
+        let server = Arc::new(SlaveServer {
+            player,
+            clock,
+            clock_port,
+            release_delay,
+            startup_plan,
+            generation: AtomicU64::new(1),
+        });
         for accepted in listener.incoming() {
             let stream = match accepted {
                 Ok(connection) => connection,
@@ -176,19 +201,9 @@ fn serve_slaves(
                 }
             };
             info!(%peer, "Slave connected; sending synchronization welcome");
-            let player = player.clone();
-            let clock = clock.clone();
-            let generation = generation.clone();
+            let server = server.clone();
             thread::spawn(move || {
-                if let Err(error) = welcome_slave(
-                    stream,
-                    peer,
-                    &player,
-                    &clock,
-                    clock_port,
-                    release_delay,
-                    &generation,
-                ) {
+                if let Err(error) = welcome_slave(stream, peer, &server) {
                     warn!(%peer, %error, "Slave synchronization session ended");
                 }
             });
@@ -196,32 +211,44 @@ fn serve_slaves(
     });
 }
 
-fn welcome_slave(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    player: &Player,
-    clock: &gst::Clock,
+struct SlaveServer {
+    player: Arc<Player>,
+    clock: gst::Clock,
     clock_port: u16,
     release_delay: Duration,
-    generation: &AtomicU64,
-) -> Result<()> {
+    startup_plan: ReleasePlan,
+    generation: AtomicU64,
+}
+
+fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) -> Result<()> {
     configure_stream(&stream)?;
-    write_message(&mut stream, &Message::Clock { port: clock_port })?;
+    write_message(
+        &mut stream,
+        &Message::Clock {
+            port: server.clock_port,
+        },
+    )?;
     match read_message(&mut stream).context("failed to read Slave readiness")? {
         Message::Ready => info!(%peer, "Slave clock is synchronized and ready to rejoin"),
         Message::Error(message) => bail!("Slave rejected preparation: {message}"),
         other => bail!("expected READY from Slave, received {other:?}"),
     }
 
-    let now = ClockNs::new(clock.time().nseconds());
-    let release_at = now
-        .checked_add(release_delay)
-        .ok_or_else(|| anyhow!("release timestamp overflow"))?;
-    let plan = player.join_plan(
-        generation.fetch_add(1, Ordering::Relaxed) + 1,
-        now,
-        release_at,
-    )?;
+    let now = ClockNs::new(server.clock.time().nseconds());
+    let minimum_lead_ns = u64::try_from(server.release_delay.as_nanos())
+        .context("release delay is too large for the clock")?;
+    let plan = if can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns) {
+        info!(%peer, "Slave is ready for the shared startup deadline");
+        server.startup_plan
+    } else {
+        let release_at = now
+            .checked_add(server.release_delay)
+            .ok_or_else(|| anyhow!("release timestamp overflow"))?;
+        server.player.join_plan(
+            server.generation.fetch_add(1, Ordering::Relaxed) + 1,
+            release_at,
+        )?
+    };
     write_message(&mut stream, &Message::Release(plan))
         .context("failed to send synchronization state")?;
     info!(
@@ -383,8 +410,11 @@ impl Player {
         })
     }
 
-    fn start_now(&self) -> Result<ReleasePlan> {
-        let release_at = ClockNs::new(self.clock()?.time().nseconds());
+    fn schedule_start(&self, delay: Duration) -> Result<ReleasePlan> {
+        let now = ClockNs::new(self.clock()?.time().nseconds());
+        let release_at = now
+            .checked_add(delay)
+            .ok_or_else(|| anyhow!("startup timestamp overflow"))?;
         let plan = ReleasePlan {
             generation: 1,
             operation: Operation::Start,
@@ -439,16 +469,23 @@ impl Player {
         Ok(())
     }
 
-    fn join_plan(&self, generation: u64, now: ClockNs, release_at: ClockNs) -> Result<ReleasePlan> {
-        let position = self
-            .pipeline
-            .query_position::<gst::ClockTime>()
-            .ok_or_else(|| anyhow!("cannot query current Master position"))?;
-        let lead = release_at.get().saturating_sub(now.get());
+    fn join_plan(&self, generation: u64, release_at: ClockNs) -> Result<ReleasePlan> {
+        let current_plan = self
+            .plan
+            .lock()
+            .map_err(|_| anyhow!("plan lock poisoned"))?
+            .ok_or_else(|| anyhow!("Master playback has no authoritative plan"))?;
+        let elapsed = release_at
+            .get()
+            .saturating_sub(current_plan.release_at.get());
         Ok(ReleasePlan {
             generation,
             operation: Operation::Goto,
-            media_position: projected_position(position.nseconds(), lead, self.loop_duration_ns),
+            media_position: projected_position(
+                current_plan.media_position.get(),
+                elapsed,
+                self.loop_duration_ns,
+            ),
             release_at,
         })
     }
@@ -557,6 +594,10 @@ fn projected_position(
     loop_duration_ns.map_or(projected, |duration_ns| projected.modulo(duration_ns))
 }
 
+fn can_join_startup(release_at: ClockNs, now: ClockNs, minimum_lead_ns: u64) -> bool {
+    release_at.get().saturating_sub(now.get()) >= minimum_lead_ns
+}
+
 impl Drop for Player {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
@@ -624,9 +665,18 @@ fn positive_seconds(value: &str) -> Result<f64, String> {
     }
 }
 
+fn non_negative_seconds(value: &str) -> Result<f64, String> {
+    let seconds: f64 = value.parse().map_err(|_| "must be a number".to_owned())?;
+    if seconds.is_finite() && seconds >= 0.0 {
+        Ok(seconds)
+    } else {
+        Err("must be a finite non-negative number".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::projected_position;
+    use super::{ClockNs, can_join_startup, non_negative_seconds, projected_position};
 
     #[test]
     fn late_join_position_accounts_for_release_lead_time() {
@@ -636,5 +686,21 @@ mod tests {
     #[test]
     fn late_join_position_wraps_across_a_loop_boundary() {
         assert_eq!(projected_position(58_000, 5_000, Some(60_000)).get(), 3_000);
+    }
+
+    #[test]
+    fn startup_delay_accepts_zero_and_positive_finite_values() {
+        assert_eq!(non_negative_seconds("0"), Ok(0.0));
+        assert_eq!(non_negative_seconds("30"), Ok(30.0));
+        assert!(non_negative_seconds("-1").is_err());
+        assert!(non_negative_seconds("inf").is_err());
+    }
+
+    #[test]
+    fn startup_join_requires_the_release_preparation_window() {
+        let release_at = ClockNs::new(30_000);
+        assert!(can_join_startup(release_at, ClockNs::new(20_000), 5_000));
+        assert!(can_join_startup(release_at, ClockNs::new(25_000), 5_000));
+        assert!(!can_join_startup(release_at, ClockNs::new(25_001), 5_000));
     }
 }

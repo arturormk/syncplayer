@@ -43,6 +43,9 @@ of the test matrix and generated binaries do not belong in the repository.
    the Master back and verify that Slaves reconnect, pause, seek, and rejoin its new timeline.
 7. Repeat with several Slaves, removing and restarting one at a time, and verify that neither the
    Master nor the other Slaves are interrupted.
+8. Start the Master with `--startup-delay 30`, start several Slaves during that grace period, and
+   verify that all ready players leave their prerolled first frame together. Start another Slave too
+   late and verify that the deadline is not postponed and that it catches up afterward.
 
 ## Acceptance criteria
 
@@ -54,6 +57,7 @@ of the test matrix and generated binaries do not belong in the repository.
 - Loss of the control connection after release does not stop playback.
 - A late or restarted Slave joins without pausing the Master or other Slaves.
 - Slaves free-run through Master loss and resynchronize when it returns.
+- A configured startup delay uses one shared deadline and never waits beyond it for missing Slaves.
 
 Operator-driven pause, resume and goto, correction thresholds, and session identity are explicitly
 subsequent experiments. Reconnection currently always performs an authoritative pause/seek/rejoin.
