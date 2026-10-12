@@ -105,8 +105,11 @@ fn main() -> Result<()> {
 }
 
 fn run_master(args: &MasterArgs) -> Result<()> {
-    let clock = gst::SystemClock::obtain();
-    let player = Arc::new(Player::new(&args.playback, &clock)?);
+    // Let the pipeline choose its natural clock. With a real audio sink this
+    // is normally the device-backed audio clock, so the Master does not have
+    // to slave its own output to an unrelated system clock.
+    let player = Arc::new(Player::new(&args.playback, None)?);
+    let clock = player.clock()?;
     let bind_ip = match args.bind.ip() {
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => ip.to_string(),
@@ -146,7 +149,7 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     serve_slaves(
         listener,
         player.clone(),
-        clock.clone().upcast(),
+        clock,
         clock_port,
         release_delay,
         initial_plan,
@@ -156,7 +159,7 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
     let (mut stream, clock) = connect_to_master(args.master)?;
-    let player = Arc::new(Player::new(&args.playback, &clock)?);
+    let player = Arc::new(Player::new(&args.playback, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock)?;
     player.resynchronize(&clock, plan)?;
     info!(
@@ -346,11 +349,88 @@ struct Player {
     pipeline: gst::Pipeline,
     clock: Mutex<gst::Clock>,
     plan: Mutex<Option<ReleasePlan>>,
+    scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
+    release_error: Arc<Mutex<Option<String>>>,
     loop_duration_ns: Option<u64>,
 }
 
+struct ScheduledRelease {
+    release_id: gst::SingleShotClockId,
+}
+
+impl ScheduledRelease {
+    fn unschedule(self) {
+        self.release_id.unschedule();
+    }
+}
+
+struct ReleaseWorker {
+    pipeline: gst::Pipeline,
+    clock: gst::Clock,
+    plan: ReleasePlan,
+    release_id: gst::SingleShotClockId,
+    scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
+    release_error: Arc<Mutex<Option<String>>>,
+}
+
+impl ReleaseWorker {
+    fn run(self) {
+        if let Err(error) = self.run_inner() {
+            self.release_id.unschedule();
+            record_release_error(&self.release_error, error.to_string());
+        }
+    }
+
+    fn run_inner(&self) -> Result<()> {
+        if !wait_for_clock_id(&self.release_id, "shared-clock release")? {
+            return Ok(());
+        }
+
+        // Hold this lock through set_state so cancellation cannot pause and
+        // then lose a race to an obsolete release worker.
+        let mut scheduled = self
+            .scheduled_release
+            .lock()
+            .map_err(|_| anyhow!("scheduled release lock poisoned"))?;
+        if !release_is_active(scheduled.as_ref(), &self.release_id) {
+            return Ok(());
+        }
+        scheduled.take();
+
+        let fired_at_ns = self.clock.time().nseconds();
+        debug!(
+            release_at_ns = self.plan.release_at.get(),
+            fired_at_ns,
+            lateness_ns = i128::from(fired_at_ns) - i128::from(self.plan.release_at.get()),
+            "shared-clock release fired"
+        );
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .context("failed to request PLAYING at release")?;
+        Ok(())
+    }
+}
+
+fn release_is_active(
+    scheduled: Option<&ScheduledRelease>,
+    release_id: &gst::SingleShotClockId,
+) -> bool {
+    scheduled.is_some_and(|scheduled| scheduled.release_id == *release_id)
+}
+
+fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<bool> {
+    let (result, _) = id.wait();
+    match result {
+        Ok(_) | Err(gst::ClockError::Early) => Ok(true),
+        Err(gst::ClockError::Unscheduled) => Ok(false),
+        Err(error) => {
+            Err(anyhow!(error)).with_context(|| format!("failed to wait for {description}"))
+        }
+    }
+}
+
 impl Player {
-    fn new(args: &PlaybackArgs, clock: &impl IsA<gst::Clock>) -> Result<Self> {
+    fn new(args: &PlaybackArgs, forced_clock: Option<&gst::Clock>) -> Result<Self> {
         let uri = media_uri(&args.media)?;
         let element = gst::ElementFactory::make("playbin3")
             .property("uri", &uri)
@@ -382,7 +462,9 @@ impl Player {
         let pipeline = element
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("playbin3 did not create a GstPipeline"))?;
-        pipeline.use_clock(Some(clock));
+        if let Some(clock) = forced_clock {
+            pipeline.use_clock(Some(clock));
+        }
         pipeline
             .set_state(gst::State::Paused)
             .context("failed to request PAUSED")?;
@@ -391,6 +473,23 @@ impl Player {
             PREROLL_TIMEOUT,
             "media did not preroll before timeout",
         )?;
+        if forced_clock.is_some() {
+            configure_external_clock_audio_slaving(&pipeline)?;
+        }
+        let clock = forced_clock.cloned().unwrap_or_else(|| {
+            pipeline
+                .provide_clock()
+                .unwrap_or_else(|| gst::SystemClock::obtain().upcast())
+        });
+        // Pin the clock selected during preroll so the one exported by the
+        // Master is exactly the one used once the pipeline starts playing.
+        pipeline.use_clock(Some(&clock));
+        info!(
+            clock = %clock.name(),
+            clock_type = %clock.type_().name(),
+            externally_driven = forced_clock.is_some(),
+            "playback clock selected"
+        );
         let duration = pipeline.query_duration::<gst::ClockTime>();
         let loop_duration_ns = if args.r#loop {
             let duration_ns = duration
@@ -404,8 +503,10 @@ impl Player {
         info!(media = %args.media.display(), duration_ns = duration.map(gst::ClockTime::nseconds), mute = args.mute, looped = args.r#loop, "media prerolled");
         Ok(Self {
             pipeline,
-            clock: Mutex::new(clock.clone().upcast()),
+            clock: Mutex::new(clock),
             plan: Mutex::new(None),
+            scheduled_release: Arc::new(Mutex::new(None)),
+            release_error: Arc::new(Mutex::new(None)),
             loop_duration_ns,
         })
     }
@@ -421,11 +522,12 @@ impl Player {
             media_position: MediaPositionNs::new(0),
             release_at,
         };
-        self.start_playing(plan)?;
+        self.schedule_playing(plan)?;
         Ok(plan)
     }
 
     fn resynchronize(&self, clock: &gst::Clock, plan: ReleasePlan) -> Result<()> {
+        self.cancel_scheduled_release()?;
         self.pipeline
             .set_state(gst::State::Paused)
             .context("failed to pause for synchronization")?;
@@ -452,20 +554,70 @@ impl Player {
             PREROLL_TIMEOUT,
             "synchronization seek did not preroll before timeout",
         )?;
-        self.start_playing(plan)
+        self.schedule_playing(plan)
     }
 
-    fn start_playing(&self, plan: ReleasePlan) -> Result<()> {
-        self.pipeline.set_start_time(gst::ClockTime::NONE);
-        self.pipeline
-            .set_base_time(gst::ClockTime::from_nseconds(plan.release_at.get()));
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .context("failed to request PLAYING")?;
+    fn schedule_playing(&self, plan: ReleasePlan) -> Result<()> {
+        self.cancel_scheduled_release()?;
+        *self
+            .release_error
+            .lock()
+            .map_err(|_| anyhow!("release error lock poisoned"))? = None;
         *self
             .plan
             .lock()
             .map_err(|_| anyhow!("plan lock poisoned"))? = Some(plan);
+
+        let clock = self.clock()?;
+        let now = ClockNs::new(clock.time().nseconds());
+        if plan.release_at <= now {
+            return self.begin_playing();
+        }
+
+        let release_id =
+            clock.new_single_shot_id(gst::ClockTime::from_nseconds(plan.release_at.get()));
+        *self
+            .scheduled_release
+            .lock()
+            .map_err(|_| anyhow!("scheduled release lock poisoned"))? = Some(ScheduledRelease {
+            release_id: release_id.clone(),
+        });
+
+        let release_worker = ReleaseWorker {
+            pipeline: self.pipeline.clone(),
+            clock,
+            plan,
+            release_id,
+            scheduled_release: self.scheduled_release.clone(),
+            release_error: self.release_error.clone(),
+        };
+        let worker = thread::Builder::new()
+            .name("syncplayer-release".to_owned())
+            .spawn(move || release_worker.run());
+        if let Err(error) = worker {
+            self.cancel_scheduled_release()?;
+            return Err(error).context("failed to spawn release worker");
+        }
+
+        Ok(())
+    }
+
+    fn begin_playing(&self) -> Result<()> {
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .context("failed to request PLAYING")?;
+        Ok(())
+    }
+
+    fn cancel_scheduled_release(&self) -> Result<()> {
+        let scheduled = self
+            .scheduled_release
+            .lock()
+            .map_err(|_| anyhow!("scheduled release lock poisoned"))?
+            .take();
+        if let Some(scheduled) = scheduled {
+            scheduled.unschedule();
+        }
         Ok(())
     }
 
@@ -534,6 +686,14 @@ impl Player {
                 self.log_telemetry(initial_plan);
                 next_telemetry = Instant::now() + Duration::from_secs(1);
             }
+            if let Some(error) = self
+                .release_error
+                .lock()
+                .map_err(|_| anyhow!("release error lock poisoned"))?
+                .take()
+            {
+                break Err(anyhow!(error));
+            }
         };
         self.pipeline
             .set_state(gst::State::Null)
@@ -585,6 +745,13 @@ impl Player {
     }
 }
 
+fn record_release_error(release_error: &Mutex<Option<String>>, message: String) {
+    error!(error = %message, "scheduled release failed");
+    if let Ok(mut release_error) = release_error.lock() {
+        *release_error = Some(message);
+    }
+}
+
 fn projected_position(
     position_ns: u64,
     lead_ns: u64,
@@ -600,6 +767,14 @@ fn can_join_startup(release_at: ClockNs, now: ClockNs, minimum_lead_ns: u64) -> 
 
 impl Drop for Player {
     fn drop(&mut self) {
+        let scheduled = self
+            .scheduled_release
+            .lock()
+            .ok()
+            .and_then(|mut scheduled| scheduled.take());
+        if let Some(scheduled) = scheduled {
+            scheduled.unschedule();
+        }
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
@@ -630,6 +805,37 @@ fn force_clock_sync(element: &gst::Element, description: &str) -> Result<()> {
         );
     }
     element.set_property("sync", true);
+    Ok(())
+}
+
+fn configure_external_clock_audio_slaving(pipeline: &gst::Pipeline) -> Result<()> {
+    let mut configured = 0_u32;
+    for result in pipeline.iterate_recurse() {
+        let element = result.context("pipeline changed while locating the audio sink")?;
+        let Some(klass) = element.metadata(gst::ELEMENT_METADATA_KLASS) else {
+            continue;
+        };
+        let is_audio_sink = klass.split('/').any(|part| part == "Audio")
+            && klass.split('/').any(|part| part == "Sink");
+        if !is_audio_sink || element.find_property("slave-method").is_none() {
+            continue;
+        }
+
+        // AudioBaseSink's default `skew` mode corrects drift by moving the
+        // playout pointer. That can produce a visible pipeline stall after a
+        // long preroll. Resampling instead makes the hardware clock follow an
+        // externally supplied pipeline clock continuously.
+        element.set_property_from_str("slave-method", "resample");
+        configured += 1;
+        debug!(
+            element = %element.name(),
+            factory_class = klass,
+            "configured audio sink for external clock resampling"
+        );
+    }
+    if configured == 0 {
+        debug!("no resampling-capable audio sink found during preroll");
+    }
     Ok(())
 }
 
