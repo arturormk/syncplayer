@@ -40,20 +40,27 @@ Builds are native because Syncplayer links to platform-specific GStreamer librar
 does not cross-compile or support 32-bit ARM. GStreamer runtime plugins for codecs, hardware
 decoding, video output, and audio output remain dependent on the chosen media and machine.
 
-## Prepare media for Raspberry Pi players
+## Prepare playlist media
 
-If any player is a Raspberry Pi, recompress every video intended for that player with the provided
-compatibility tool before deploying it:
+Normalize every video in a playlist before deploying it. For Linux PCs, run:
+
+```sh
+./tools/prepare-video-for-pc.sh -o video-pc.mp4 video.mov
+```
+
+For Raspberry Pi players, use the hardware-decoder-compatible profile:
 
 ```sh
 ./tools/prepare-video-for-rpi.sh -o video-rpi.mp4 video.mov
 ```
 
-Add `--audio` when audio is required; the default output is video-only. The tool produces a
-conservative H.264/MP4 rendition for Raspberry Pi hardware decoding and tone-maps HDR sources to
-SDR Rec.709. This avoids GStreamer falling back to software decoding when a Pi decoder rejects HDR
-color caps. See [`docs/media-preparation.md`](docs/media-preparation.md) for requirements and the
-workflow for keeping host-specific renditions synchronized.
+Both tools default to an exact 1920x1080 canvas at 25 fps and 48 kHz stereo AAC. They preserve and
+normalize an existing audio stream or insert silence when the input has no audio, keeping the
+Master's audio-driven clock available across playlist transitions. Aspect ratio is preserved with
+black padding. The Raspberry Pi profile also enforces conservative H.264 decoder limits. Both
+profiles tone-map HDR sources to SDR Rec.709. See
+[`docs/media-preparation.md`](docs/media-preparation.md) for options and the workflow for keeping
+host-specific renditions synchronized.
 
 ## Build and test
 
