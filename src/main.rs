@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use syncplayer::playlist::{ItemPosition, PlaylistConfig, PlaylistCursor, Timeline};
+use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
+use syncplayer::program::{ProgramConfig, ResolvedProgram};
 use syncplayer::protocol::{
     MAX_LINE_BYTES, MasterSession, Message, Operation, ReleasePlan, StateSnapshot, TransportState,
     read_message, write_message,
 };
 use syncplayer::time::{ClockNs, MediaPositionNs};
+use syncplayer::validation::{DiagnosticLevel, GstMediaProbe, validate_program};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -47,6 +49,8 @@ enum Command {
     Master(MasterArgs),
     /// Discipline a local pipeline to a Master's clock.
     Slave(SlaveArgs),
+    /// Validate a shared program for the selected local player.
+    Validate(ValidateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -83,31 +87,17 @@ struct SlaveArgs {
 
 #[derive(Debug, Args)]
 struct PlaybackArgs {
-    /// Local media file. Master and Slave paths may differ.
-    #[arg(
-        long,
-        value_name = "PATH",
-        required_unless_present = "playlist",
-        conflicts_with = "playlist"
-    )]
-    media: Option<PathBuf>,
+    /// Versioned shared program definition.
+    #[arg(value_name = "PROGRAM")]
+    program: PathBuf,
 
-    /// Versioned TOML playlist. Entries are local to each host.
-    #[arg(
-        long,
-        value_name = "PATH",
-        required_unless_present = "media",
-        conflicts_with = "media"
-    )]
-    playlist: Option<PathBuf>,
+    /// Logical player identity. Defaults to the hostname, with alias lookup.
+    #[arg(long)]
+    player_id: Option<String>,
 
     /// Silence the selected audio stream.
     #[arg(long)]
     mute: bool,
-
-    /// Repeat `--media` continuously. Playlist looping is configured in TOML.
-    #[arg(long, requires = "media", conflicts_with = "playlist")]
-    r#loop: bool,
 
     /// Override `GStreamer`'s automatically selected video sink.
     #[arg(long)]
@@ -116,6 +106,17 @@ struct PlaybackArgs {
     /// Override `GStreamer`'s automatically selected audio sink.
     #[arg(long)]
     audio_sink: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ValidateArgs {
+    /// Versioned shared program definition.
+    #[arg(value_name = "PROGRAM")]
+    program: PathBuf,
+
+    /// Logical player identity. Defaults to the hostname, with alias lookup.
+    #[arg(long)]
+    player_id: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -130,6 +131,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Master(args) => run_master(&args),
         Command::Slave(args) => run_slave(&args),
+        Command::Validate(args) => run_validate(&args),
     }
 }
 
@@ -137,7 +139,8 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     // Let the pipeline choose its natural clock. With a real audio sink this
     // is normally the device-backed audio clock, so the Master does not have
     // to slave its own output to an unrelated system clock.
-    let player = Arc::new(Player::new(&args.playback, None)?);
+    let program = load_runtime_program(&args.playback)?;
+    let player = Arc::new(Player::new(&args.playback, program, None)?);
     let clock = player.clock()?;
     let bind_ip = match args.bind.ip() {
         IpAddr::V4(ip) => ip.to_string(),
@@ -197,8 +200,9 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
+    let program = load_runtime_program(&args.playback)?;
     let (mut stream, clock, authority) = wait_for_master(args.master);
-    let player = Arc::new(Player::new(&args.playback, Some(&clock))?);
+    let player = Arc::new(Player::new(&args.playback, program, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock, authority)?;
     player.resynchronize(&clock, plan, "initial-join")?;
     report_prepared(&mut stream, authority)?;
@@ -209,6 +213,76 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
 
     monitor_master(stream, args.master, authority, player.clone());
     player.monitor(plan)
+}
+
+fn load_runtime_program(args: &PlaybackArgs) -> Result<ResolvedProgram> {
+    let config = ProgramConfig::load(&args.program)
+        .with_context(|| format!("failed to load program {}", args.program.display()))?;
+    let program = config.resolve_player(args.player_id.as_deref())?;
+    program.ensure_runtime_supported()?;
+    info!(
+        program = %program.program_id,
+        program_hash = %program.hash,
+        player = %program.player_id,
+        cue_count = program.cues.len(),
+        "shared program resolved"
+    );
+    Ok(program)
+}
+
+fn run_validate(args: &ValidateArgs) -> Result<()> {
+    let config = ProgramConfig::load(&args.program)
+        .with_context(|| format!("failed to load program {}", args.program.display()))?;
+    let program = config.resolve_player(args.player_id.as_deref())?;
+    let probe = GstMediaProbe::new()?;
+    let report = validate_program(&program, &probe);
+
+    println!("Program: {}", report.program_id);
+    println!("Hash:    {}", report.program_hash);
+    println!("Player:  {}", report.player_id);
+    println!();
+    println!("Cues:");
+    for cue in &report.cues {
+        let duration = cue.duration_ns.map_or_else(
+            || "unavailable".to_owned(),
+            |value| {
+                format!(
+                    "{}.{:03} s",
+                    value / 1_000_000_000,
+                    value % 1_000_000_000 / 1_000_000
+                )
+            },
+        );
+        println!("  {:<20} {:<12} {}", cue.id, duration, cue.video.display());
+        if let Some(audio) = &cue.audio {
+            println!("  {:<20} {:<12} {}", "external audio", "", audio.display());
+        }
+        if cue.event_count > 0 {
+            println!("  {:<20} {} event(s)", "events", cue.event_count);
+        }
+    }
+    if !report.diagnostics.is_empty() {
+        println!();
+        println!("Diagnostics:");
+        for diagnostic in &report.diagnostics {
+            let cue = diagnostic
+                .cue_id
+                .as_deref()
+                .map_or_else(String::new, |cue| format!(" [{cue}]"));
+            println!("  {}{cue}: {}", diagnostic.level, diagnostic.message);
+        }
+    }
+    if report.has_errors() {
+        bail!("program validation failed");
+    }
+    let warnings = report
+        .diagnostics
+        .iter()
+        .filter(|item| item.level == DiagnosticLevel::Warning)
+        .count();
+    println!();
+    println!("Validation succeeded with {warnings} warning(s).");
+    Ok(())
 }
 
 fn wait_for_master(master: SocketAddr) -> (TcpStream, gst::Clock, Authority) {
@@ -663,50 +737,26 @@ struct PlaybackSequence {
 }
 
 impl PlaybackSequence {
-    fn prepare(args: &PlaybackArgs) -> Result<Self> {
-        if let Some(playlist_path) = &args.playlist {
-            let config = PlaylistConfig::load(playlist_path)
-                .with_context(|| format!("failed to load playlist {}", playlist_path.display()))?;
-            return Self::prepare_playlist(config);
-        }
-
-        let path = args
-            .media
-            .as_ref()
-            .ok_or_else(|| anyhow!("either --media or --playlist is required"))?;
-        let uri = media_uri(path)?;
-        Ok(Self {
-            items: vec![MediaItem {
-                path: path.clone(),
-                uri,
-            }],
-            timeline: None,
-            looping: args.r#loop,
-            from_playlist: false,
-        })
-    }
-
-    fn prepare_playlist(config: PlaylistConfig) -> Result<Self> {
+    fn prepare(program: ResolvedProgram) -> Result<Self> {
         let discoverer = gst_pbutils::Discoverer::new(to_clock_time(PREROLL_TIMEOUT)?)
             .context("failed to create GStreamer media discoverer")?;
         // Startup discovery must reflect the files as they exist now. Do not
         // let GstDiscoverer reuse persistent results from an earlier run.
         discoverer.set_property("use-cache", false);
 
-        let mut items = Vec::with_capacity(config.videos.len());
-        let mut durations = Vec::with_capacity(config.videos.len());
-        for (index, path) in config.videos.into_iter().enumerate() {
-            let uri = media_uri(&path)
-                .with_context(|| format!("playlist item {index} is unavailable"))?;
+        let mut items = Vec::with_capacity(program.cues.len());
+        let mut durations = Vec::with_capacity(program.cues.len());
+        for (index, cue) in program.cues.into_iter().enumerate() {
+            let path = cue.video;
+            let uri =
+                media_uri(&path).with_context(|| format!("cue '{}' is unavailable", cue.id))?;
             let info = discoverer.discover_uri(&uri).with_context(|| {
-                format!(
-                    "failed to discover playlist item {index}: {}",
-                    path.display()
-                )
+                format!("failed to discover cue '{}' at {}", cue.id, path.display())
             })?;
             if info.result() != gst_pbutils::DiscovererResult::Ok {
                 bail!(
-                    "playlist item {index} could not be discovered (result {:?}): {}",
+                    "cue '{}' could not be discovered (result {:?}): {}",
+                    cue.id,
                     info.result(),
                     path.display()
                 );
@@ -717,21 +767,23 @@ impl PlaybackSequence {
                 .filter(|duration| *duration > 0)
                 .ok_or_else(|| {
                     anyhow!(
-                        "playlist item {index} has no known non-zero duration: {}",
+                        "cue '{}' has no known non-zero duration: {}",
+                        cue.id,
                         path.display()
                     )
                 })?;
-            info!(item_index = index, media = %path.display(), duration_ns, "playlist item discovered");
+            info!(item_index = index, cue = %cue.id, media = %path.display(), duration_ns, "program cue discovered");
             items.push(MediaItem { path, uri });
             durations.push(duration_ns);
         }
-        let timeline = Timeline::new(durations, config.looping)
-            .context("invalid playlist sequence duration")?;
+        let timeline = Timeline::new(durations, program.looping)
+            .context("invalid program sequence duration")?;
+        let from_playlist = items.len() > 1;
         Ok(Self {
             items,
             timeline: Some(timeline),
-            looping: config.looping,
-            from_playlist: true,
+            looping: program.looping,
+            from_playlist,
         })
     }
 
@@ -1023,8 +1075,12 @@ fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<b
 }
 
 impl Player {
-    fn new(args: &PlaybackArgs, forced_clock: Option<&gst::Clock>) -> Result<Self> {
-        let mut sequence = PlaybackSequence::prepare(args)?;
+    fn new(
+        args: &PlaybackArgs,
+        program: ResolvedProgram,
+        forced_clock: Option<&gst::Clock>,
+    ) -> Result<Self> {
+        let sequence = PlaybackSequence::prepare(program)?;
         let first_uri = sequence.items[0].uri.clone();
         let element = gst::ElementFactory::make("playbin3")
             .property("uri", &first_uri)
@@ -1095,15 +1151,6 @@ impl Player {
             "playback clock selected"
         );
         let duration = pipeline.query_duration::<gst::ClockTime>();
-        if args.r#loop {
-            let duration_ns = duration
-                .map(gst::ClockTime::nseconds)
-                .filter(|duration_ns| *duration_ns > 0)
-                .ok_or_else(|| anyhow!("--loop requires media with a known, non-zero duration"))?;
-            sequence.timeline = Some(
-                Timeline::new(vec![duration_ns], true).context("invalid looping media duration")?,
-            );
-        }
         info!(
             media = %sequence.items[0].path.display(),
             item_count = sequence.items.len(),
@@ -1913,29 +1960,18 @@ mod tests {
     }
 
     #[test]
-    fn command_line_requires_exactly_one_playback_input() {
+    fn command_line_requires_a_program_and_supports_player_identity() {
         assert!(Cli::try_parse_from(["syncplayer", "master"]).is_err());
-        assert!(
-            Cli::try_parse_from([
-                "syncplayer",
-                "master",
-                "--media",
-                "a.mp4",
-                "--playlist",
-                "show.toml"
-            ])
-            .is_err()
-        );
-        let cli = Cli::try_parse_from(["syncplayer", "master", "--playlist", "show.toml"]).unwrap();
+        let cli = Cli::try_parse_from(["syncplayer", "master", "show.toml", "--player-id", "left"])
+            .unwrap();
         assert!(matches!(cli.command, Command::Master(_)));
     }
 
     #[test]
-    fn command_line_rejects_loop_with_playlist() {
-        assert!(
-            Cli::try_parse_from(["syncplayer", "master", "--playlist", "show.toml", "--loop"])
-                .is_err()
-        );
+    fn command_line_supports_validate_and_rejects_prototype_inputs() {
+        assert!(Cli::try_parse_from(["syncplayer", "validate", "show.toml"]).is_ok());
+        assert!(Cli::try_parse_from(["syncplayer", "master", "--media", "a.mp4"]).is_err());
+        assert!(Cli::try_parse_from(["syncplayer", "master", "show.toml", "--loop"]).is_err());
     }
 
     #[test]

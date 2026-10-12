@@ -4,5 +4,7 @@
 //! clock-domain mistakes and malformed laboratory control messages explicit.
 
 pub mod playlist;
+pub mod program;
 pub mod protocol;
 pub mod time;
+pub mod validation;

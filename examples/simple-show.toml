@@ -1,0 +1,17 @@
+version = 1
+
+[program]
+id = "simple-show"
+loop = true
+
+[[program.cue]]
+id = "intro"
+
+[[program.cue]]
+id = "main"
+
+[players.default.intro]
+video = "media/intro.mp4"
+
+[players.default.main]
+video = "media/main.mp4"
