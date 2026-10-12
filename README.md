@@ -154,7 +154,7 @@ continues playing from its last disciplined clock estimate, and attempts to reco
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 3 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 4 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
 ### Logging
@@ -193,9 +193,9 @@ To run a playlist instead, create a corresponding TOML file on each host and rep
 option with `--playlist /path/to/playlist.toml`. Playlist items are handed to `playbin3` before the
 current item finishes for gapless transitions. Compatible codecs, dimensions, frame rates, and
 audio formats give the best transition behavior. The control protocol continues to send only one
-absolute position in the whole sequence. Snapshots also carry the logical item index and playlist
-iteration so repeated cues and loop boundaries are unambiguous; local paths never cross the
-network.
+absolute position in the whole sequence. Snapshots also carry the logical item index, item-local
+position, and playlist iteration so every host can map the authoritative cue onto its own rendition
+durations without becoming ambiguous at a loop boundary; local paths never cross the network.
 
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.

@@ -14,7 +14,7 @@ pipeline, receives the Master's projected media position at a future absolute cl
 acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
 interrupting existing playback.
 
-The bounded, newline-delimited protocol is currently version 3. A Master session UUID identifies
+The bounded, newline-delimited protocol is currently version 4. A Master session UUID identifies
 one process run; the transport generation remains stable when Slaves join and changes only for a
 future discontinuous authoritative timeline change. Master and Slave binaries must have the same
 protocol version.
@@ -28,8 +28,10 @@ protocol version.
 - Playback free-runs during the outage. Reconnection retries once per second, creates a new network
   clock, calibrates it, and uses the normal prepared pause/seek/future-release path.
 - Snapshots contain session context, transport generation and state, operation, sequence-position
-  and clock anchors, logical item index, and playlist iteration. Unchanged state does not seek;
-  stale state is ignored; a newer generation requires a prepared rejoin.
+  and clock anchors, logical item index, item-local position, and playlist iteration. Each host maps
+  that cue-local anchor through its own rendition durations, avoiding false identity failures at
+  playlist boundaries. Unchanged state does not seek; stale state is ignored; a newer generation
+  requires a prepared rejoin.
 - Snapshots come from the Master's logical plan and authoritative clock, not its renderer's queried
   position. A Master renderer stall is therefore repaired locally instead of being published as a
   timeline for Slaves to chase.

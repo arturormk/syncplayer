@@ -449,6 +449,7 @@ fn monitor_master_session(
             snapshot_anchor_clock_ns = state.anchor_clock.get(),
             snapshot_position_ns = state.media_position.get(),
             snapshot_item_index = state.item_index,
+            snapshot_item_position_ns = state.item_position.get(),
             snapshot_playlist_iteration = state.playlist_iteration,
             last_heartbeat_age_ms = last_heartbeat_at.elapsed().as_millis(),
             "Master heartbeat received"
@@ -764,6 +765,26 @@ impl PlaybackSequence {
             timeline.playlist_iteration(absolute_position_ns)
         });
         Ok((item, iteration))
+    }
+
+    fn position_for_cue(
+        &self,
+        item: ItemPosition,
+        playlist_iteration: u64,
+    ) -> Result<MediaPositionNs> {
+        match &self.timeline {
+            Some(timeline) => timeline
+                .absolute_position(item, playlist_iteration)
+                .map(MediaPositionNs::new)
+                .context("invalid authoritative cue position"),
+            None if item.index == 0 && playlist_iteration == 0 => {
+                Ok(MediaPositionNs::new(item.local_ns))
+            }
+            None => bail!(
+                "single-media playback cannot map item {} in iteration {playlist_iteration}",
+                item.index
+            ),
+        }
     }
 
     fn sequence_position(&self, position: ItemPosition) -> Result<MediaPositionNs> {
@@ -1359,6 +1380,7 @@ impl Player {
             media_position,
             anchor_clock,
             item_index: u64::try_from(item.index).context("item index exceeds u64")?,
+            item_position: MediaPositionNs::new(item.local_ns),
             playlist_iteration,
         })
     }
@@ -1376,24 +1398,20 @@ impl Player {
             );
             return Ok(());
         }
-        let (item, playlist_iteration) =
-            self.sequence.cue_identity(snapshot.media_position.get())?;
         let item_index = usize::try_from(snapshot.item_index)
             .context("snapshot item index does not fit this host")?;
-        if item.index != item_index || playlist_iteration != snapshot.playlist_iteration {
-            bail!(
-                "snapshot cue identity is inconsistent: position maps to item {}, iteration {}; snapshot says item {}, iteration {}",
-                item.index,
-                playlist_iteration,
-                snapshot.item_index,
-                snapshot.playlist_iteration
-            );
-        }
+        let local_media_position = self.sequence.position_for_cue(
+            ItemPosition {
+                index: item_index,
+                local_ns: snapshot.item_position.get(),
+            },
+            snapshot.playlist_iteration,
+        )?;
 
         let refreshed = ReleasePlan {
             generation: snapshot.generation,
             operation: snapshot.operation,
-            media_position: snapshot.media_position,
+            media_position: local_media_position,
             release_at: snapshot.anchor_clock,
         };
         let mut plan = self
@@ -1404,7 +1422,11 @@ impl Player {
             debug!(
                 transport_generation = snapshot.generation,
                 anchor_clock_ns = snapshot.anchor_clock.get(),
-                anchor_position_ns = snapshot.media_position.get(),
+                authoritative_position_ns = snapshot.media_position.get(),
+                local_anchor_position_ns = local_media_position.get(),
+                item_index,
+                item_position_ns = snapshot.item_position.get(),
+                playlist_iteration = snapshot.playlist_iteration,
                 "authoritative state snapshot refreshed without seeking"
             );
             *plan = Some(refreshed);
@@ -1885,6 +1907,7 @@ mod tests {
             media_position: MediaPositionNs::new(0),
             anchor_clock: ClockNs::new(100),
             item_index: 0,
+            item_position: MediaPositionNs::new(0),
             playlist_iteration: 0,
         }
     }
@@ -2050,6 +2073,50 @@ mod tests {
                     local_ns: 1,
                 },
                 1,
+            )
+        );
+    }
+
+    #[test]
+    fn authoritative_cue_maps_through_local_playlist_durations() {
+        let sequence = PlaybackSequence {
+            items: vec![
+                MediaItem {
+                    path: PathBuf::from("a"),
+                    uri: "file:///a".to_owned(),
+                },
+                MediaItem {
+                    path: PathBuf::from("b"),
+                    uri: "file:///b".to_owned(),
+                },
+            ],
+            timeline: Some(Timeline::new(vec![2, 27], true).unwrap()),
+            looping: true,
+            from_playlist: true,
+        };
+
+        // Master position 181 on a [10, 20] timeline is iteration 6,
+        // item 0, local position 1. Interpreting 181 against this host's
+        // durations incorrectly selects item 1 in the same iteration.
+        assert_eq!(sequence.cue_identity(181).unwrap().0.index, 1);
+        let translated = sequence
+            .position_for_cue(
+                syncplayer::playlist::ItemPosition {
+                    index: 0,
+                    local_ns: 1,
+                },
+                6,
+            )
+            .unwrap();
+        assert_eq!(translated, MediaPositionNs::new(175));
+        assert_eq!(
+            sequence.cue_identity(translated.get()).unwrap(),
+            (
+                syncplayer::playlist::ItemPosition {
+                    index: 0,
+                    local_ns: 1,
+                },
+                6,
             )
         );
     }

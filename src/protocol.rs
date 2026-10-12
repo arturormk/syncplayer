@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_LINE_BYTES: usize = 256;
 const PREFIX: &str = "SYNCPLAYER-LAB";
 
@@ -121,6 +121,7 @@ pub struct StateSnapshot {
     pub media_position: MediaPositionNs,
     pub anchor_clock: ClockNs,
     pub item_index: u64,
+    pub item_position: MediaPositionNs,
     pub playlist_iteration: u64,
 }
 
@@ -198,13 +199,14 @@ impl Message {
                 master_clock,
                 state,
             } => format!(
-                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {}",
+                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {} {}",
                 state.generation,
                 state.transport_state,
                 state.operation,
                 state.media_position,
                 state.anchor_clock,
                 state.item_index,
+                state.item_position,
                 state.playlist_iteration
             ),
             Self::Alive { session, sequence } => {
@@ -262,6 +264,10 @@ impl Message {
                     media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
                     anchor_clock: ClockNs::new(parse(next(&mut fields)?, "anchor clock")?),
                     item_index: parse(next(&mut fields)?, "item index")?,
+                    item_position: MediaPositionNs::new(parse(
+                        next(&mut fields)?,
+                        "item position",
+                    )?),
                     playlist_iteration: parse(next(&mut fields)?, "playlist iteration")?,
                 },
             },
@@ -431,6 +437,7 @@ mod tests {
                     media_position: MediaPositionNs::new(3_000),
                     anchor_clock: ClockNs::new(8_000),
                     item_index: 2,
+                    item_position: MediaPositionNs::new(400),
                     playlist_iteration: 4,
                 },
             },
@@ -446,11 +453,13 @@ mod tests {
     #[test]
     fn rejects_malformed_session_and_heartbeat() {
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 3 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7"),
+            Message::decode(
+                "SYNCPLAYER-LAB 4 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7 8"
+            ),
             Err(ParseError::InvalidSession)
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 3 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
+            Message::decode("SYNCPLAYER-LAB 4 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -468,6 +477,7 @@ mod tests {
                 media_position: MediaPositionNs::new(u64::MAX),
                 anchor_clock: ClockNs::new(u64::MAX),
                 item_index: u64::MAX,
+                item_position: MediaPositionNs::new(u64::MAX),
                 playlist_iteration: u64::MAX,
             },
         };
@@ -481,7 +491,7 @@ mod tests {
             Err(ParseError::UnsupportedVersion(99))
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 3 READY surprise"),
+            Message::decode("SYNCPLAYER-LAB 4 READY surprise"),
             Err(ParseError::TrailingFields)
         );
     }

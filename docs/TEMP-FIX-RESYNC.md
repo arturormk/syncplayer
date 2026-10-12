@@ -2,7 +2,7 @@
 
 ## Status
 
-Phases 1–3 are implemented in protocol version 3 and await loopback/physical-host verification.
+Phases 1–3 are implemented in protocol version 4 and await loopback/physical-host verification.
 This is not an architecture decision record and should be removed or replaced with durable
 documentation once the behavior has been verified.
 
@@ -16,7 +16,8 @@ Implemented on 2026-10-12:
   the authoritative logical plan;
 - serialized recovery attempts with obsolete scheduled-release rejection; and
 - complete state snapshots carried by heartbeats, including transport state, operation, sequence
-  and clock anchors, cue index, and playlist iteration.
+  and clock anchors, cue index, cue-local position, and playlist iteration. Cue-local anchors are
+  translated through each host's durations so rendition differences do not invalidate loop state.
 
 Still pending:
 

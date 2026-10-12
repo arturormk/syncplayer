@@ -366,6 +366,30 @@ impl Timeline {
             0
         }
     }
+
+    /// Maps an authoritative cue occurrence onto this host's local timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the item-local position is invalid, a non-looping
+    /// timeline is given a non-zero occurrence, or arithmetic overflows.
+    pub fn absolute_position(
+        &self,
+        position: ItemPosition,
+        playlist_iteration: u64,
+    ) -> Result<u64, TimelineError> {
+        let position_in_iteration = self.sequence_position(position)?;
+        if !self.looping {
+            if playlist_iteration != 0 {
+                return Err(TimelineError::UnexpectedIteration(playlist_iteration));
+            }
+            return Ok(position_in_iteration);
+        }
+        playlist_iteration
+            .checked_mul(self.total_ns)
+            .and_then(|offset| offset.checked_add(position_in_iteration))
+            .ok_or(TimelineError::DurationOverflow)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,6 +398,7 @@ pub enum TimelineError {
     ZeroDuration(usize),
     DurationOverflow,
     UnknownItem(usize),
+    UnexpectedIteration(u64),
     PastItemEnd {
         index: usize,
         local_ns: u64,
@@ -394,6 +419,10 @@ impl fmt::Display for TimelineError {
                 formatter.write_str("media sequence duration exceeds u64 nanoseconds")
             }
             Self::UnknownItem(index) => write!(formatter, "media item {index} does not exist"),
+            Self::UnexpectedIteration(iteration) => write!(
+                formatter,
+                "non-looping timeline cannot use playlist iteration {iteration}"
+            ),
             Self::PastItemEnd {
                 index,
                 local_ns,
@@ -595,6 +624,18 @@ videos = ["a.mp4", "${HOST}/b.mp4", "price-$$5.mp4", "a.mp4"]
                 local_ns: 0,
             }),
             Err(TimelineError::UnknownItem(2))
+        );
+        assert_eq!(
+            timeline
+                .absolute_position(
+                    ItemPosition {
+                        index: 1,
+                        local_ns: 3,
+                    },
+                    2,
+                )
+                .unwrap(),
+            73
         );
     }
 
