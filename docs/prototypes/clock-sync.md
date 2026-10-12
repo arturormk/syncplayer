@@ -2,15 +2,46 @@
 
 ## Purpose
 
-This prototype validates ADR 0004, the release primitive from ADR 0010, and basic multi-Slave
-joining and reconnection on physical Linux hosts. It is not the production Syncplayer protocol,
-configuration model, or playlist engine.
+This prototype validates ADR 0004, the release primitive from ADR 0010, application-level
+liveness, periodic authoritative state, sustained-drift recovery, and multi-Slave reconnection on
+physical Linux hosts. It is not the production Syncplayer protocol, configuration model, or
+playlist engine.
 
-The Master forces a monotonic `GstSystemClock` onto its pipeline and exposes that same clock through
-`GstNetTimeProvider`. The Master starts without waiting for a Slave. Each Slave calibrates a
-`GstNetClientClock`, forces it onto its pipeline, and reports readiness after its local file is
-prerolled. The Master then supplies its projected media position at a future absolute clock
-timestamp. This lets a late Slave join without interrupting existing playback.
+The Master lets its pipeline select its natural monotonic clock—normally an audio-device clock when
+real audio is active—and exposes that same clock through `GstNetTimeProvider`. The Master starts
+without waiting for a Slave. Each Slave calibrates a fresh `GstNetClientClock`, forces it onto its
+pipeline, receives the Master's projected media position at a future absolute clock timestamp, and
+acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
+interrupting existing playback.
+
+The bounded, newline-delimited protocol is currently version 3. A Master session UUID identifies
+one process run; the transport generation remains stable when Slaves join and changes only for a
+future discontinuous authoritative timeline change. Master and Slave binaries must have the same
+protocol version.
+
+## Runtime recovery behavior
+
+- The Master sends a heartbeat to each Slave every two seconds. Each heartbeat carries a complete
+  authoritative state snapshot and requires a matching acknowledgement.
+- The Slave measures liveness with its local monotonic clock. Eight seconds without a complete,
+  valid heartbeat closes the old socket even if TCP still reports it as established.
+- Playback free-runs during the outage. Reconnection retries once per second, creates a new network
+  clock, calibrates it, and uses the normal prepared pause/seek/future-release path.
+- Snapshots contain session context, transport generation and state, operation, sequence-position
+  and clock anchors, logical item index, and playlist iteration. Unchanged state does not seek;
+  stale state is ignored; a newer generation requires a prepared rejoin.
+- Snapshots come from the Master's logical plan and authoritative clock, not its renderer's queried
+  position. A Master renderer stall is therefore repaired locally instead of being published as a
+  timeline for Slaves to chase.
+- Every player samples drift once per second. Three valid samples above 100 ms produce a warning;
+  three valid samples above 250 ms perform one prepared local repair. A repair starts a ten-second
+  cooldown.
+- Drift samples are suppressed during pause, preroll, seek, scheduled release, ambiguous playlist
+  handoff, recovery, or unhealthy-clock periods. Loop and cue-boundary errors use sequence-aware
+  positions, including absolute playlist occurrence.
+- Reconnect and local-drift recovery share one serialized coordinator. Starting a newer recovery
+  cancels its predecessor's scheduled release, and attempt IDs prevent late workers from starting
+  playback.
 
 ## Test asset
 
@@ -39,13 +70,24 @@ of the test matrix and generated binaries do not belong in the repository.
    from queried GStreamer positions.
 4. Repeat ten cold starts and record the largest observed frame separation.
 5. Run continuously for sixty minutes and inspect the initial and final numbered frames together.
-6. Disconnect the Master or its network after release and verify that every Slave continues. Bring
-   the Master back and verify that Slaves reconnect, pause, seek, and rejoin its new timeline.
+6. Disconnect the Master or its network after release and verify that every Slave detects missing
+   heartbeats within eight seconds and continues. Bring the Master back and verify that Slaves
+   create a new network clock, pause, seek, and rejoin its timeline once.
 7. Repeat with several Slaves, removing and restarting one at a time, and verify that neither the
    Master nor the other Slaves are interrupted.
 8. Start the Master with `--startup-delay 30`, start several Slaves during that grace period, and
    verify that all ready players leave their prerolled first frame together. Start another Slave too
    late and verify that the deadline is not postponed and that it catches up afterward.
+9. Suspend the Master for longer than eight seconds without first closing its sockets. On resume,
+   verify that the stale connection is not reused and every Slave performs one prepared rejoin.
+10. Temporarily block TCP control traffic while leaving UDP clock traffic available, then reverse
+    the test. Record the different free-running and clock-calibration behavior.
+11. Apply CPU and I/O pressure to the Master. Verify that a stalled Master renderer repairs locally
+    and does not make healthy Slaves jump backward.
+12. Inject or otherwise reproduce more than 250 ms of sustained local position error. Verify that
+    three valid samples trigger one correction and that cooldown prevents one seek per second.
+13. Lock the Master desktop without suspend and run for at least 30 minutes. Then run the complete
+    system for 60 minutes with real audio and video sinks.
 
 ## Acceptance criteria
 
@@ -54,15 +96,24 @@ of the test matrix and generated binaries do not belong in the repository.
 - Failure to synchronize the clock or preroll within the configured timeout exits clearly without
   starting unsynchronized playback.
 - A malformed, oversized, truncated, incompatible, stale, or non-future control message is rejected.
-- Loss of the control connection after release does not stop playback.
+- Loss of application heartbeat is detected within eight seconds and does not immediately stop or
+  blank Slave playback.
 - A late or restarted Slave joins without pausing the Master or other Slaves.
-- Slaves free-run through Master loss and resynchronize when it returns.
+- Slaves free-run through Master loss, close the stale connection, replace the network clock during
+  reconnection, and perform at most one visible prepared correction when the Master returns.
 - A configured startup delay uses one shared deadline and never waits beyond it for missing Slaves.
+- Adding another Slave does not change the transport generation seen by existing Slaves.
+- Routine authoritative snapshots do not seek or interrupt playback.
+- After recovery, filmed numbered frames return to no more than one frame of separation.
+- A healthy 60-minute run performs no drift-triggered correction.
+- A stalled Master renderer is corrected locally without forcing healthy Slaves backward.
 
-Operator-driven pause, resume and goto, correction thresholds, and session identity are explicitly
-subsequent experiments. Reconnection currently always performs an authoritative pause/seek/rejoin.
+Operator-driven pause, resume and goto remain subsequent experiments. The current correction
+thresholds are provisional until this procedure has been completed on physical hosts.
 `ReleasePlan` distinguishes start, resume, and goto so later experiments can reuse the clock-domain
-model without treating this lab protocol as stable.
+model without treating this lab protocol as stable. Automatic Master `CLOCK_LOST` recovery also
+remains pending a focused physical-audio-sink experiment; the current implementation marks the
+clock unhealthy and reports an explicit unrecovered fault.
 
 ## Results
 

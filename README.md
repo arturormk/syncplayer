@@ -8,10 +8,11 @@ decodes independent local media against one Master-derived timeline. The accepte
 recorded in [`docs/adr/`](docs/adr/); [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) provides the broader
 design context.
 
-The repository currently contains the first risk-reduction prototype, not the production player.
-It proves that two Linux pipelines can use one exported monotonic clock and a future clock release
-timestamp. `playbin3` and the newline control messages are experimental and are not commitments for
-the final playback engine or protocol.
+The repository currently contains a risk-reduction prototype, not the production player. It proves
+that Linux pipelines can use one exported monotonic clock, join at a future clock release, detect a
+stalled Master control process, refresh authoritative transport state, and repair sustained local
+drift. `playbin3` and the newline control messages are experimental and are not commitments for the
+final playback engine or protocol.
 
 ## Prerequisites
 
@@ -146,15 +147,22 @@ startup deadline for a slow or absent Slave.
 | `--master <IP:PORT>` | Yes | Master's reachable TCP control address, matching its `--bind` port. The Master supplies the separate UDP clock port during the connection handshake. |
 
 The Slave retries the initial Master connection once per second until the Master is available, then
-calibrates a network-derived clock before accepting a release plan. If the control connection
-later disappears, it continues playing from its disciplined local clock and attempts to reconnect
-in the background.
+calibrates a network-derived clock before accepting a release plan. The Master sends application
+heartbeats every two seconds and requires matching acknowledgements. If no valid heartbeat arrives
+for eight seconds—even when TCP still appears connected—the Slave closes the stale connection,
+continues playing from its last disciplined clock estimate, and attempts to reconnect in the
+background. A successful reconnect always creates and calibrates a new network clock before a
+prepared pause/seek/release.
+
+Protocol version 3 is intentionally incompatible with older prototype binaries. Deploy the same
+Syncplayer build to the Master and every Slave.
 
 ### Logging
 
 Set `RUST_LOG` to control diagnostic output. Normal operation defaults to informational messages;
 `RUST_LOG=syncplayer=debug` additionally emits clock release and expected-versus-actual position
-telemetry.
+telemetry, heartbeat round-trip times, authoritative snapshots, recovery attempts, and cooldown
+decisions. Routine heartbeats are not logged at info level.
 
 ## Two-host experiment
 
@@ -177,14 +185,17 @@ RUST_LOG=syncplayer=debug cargo run --release -- \
 
 Pass `--loop` to both Master and Slave to repeat their local media continuously. Looping uses
 `playbin3`'s gapless next-item handoff and treats synchronized positions modulo each file's probed
-duration, including initial positions beyond the first iteration. Looping therefore requires media
-with a known, non-zero duration. Host-specific renditions should have matching durations.
+duration for error measurement while retaining an absolute loop occurrence in authoritative state.
+Looping therefore requires media with a known, non-zero duration. Host-specific renditions should
+have matching durations.
 
 To run a playlist instead, create a corresponding TOML file on each host and replace the media
 option with `--playlist /path/to/playlist.toml`. Playlist items are handed to `playbin3` before the
 current item finishes for gapless transitions. Compatible codecs, dimensions, frame rates, and
 audio formats give the best transition behavior. The control protocol continues to send only one
-absolute position in the whole sequence; local paths and item numbers never cross the network.
+absolute position in the whole sequence. Snapshots also carry the logical item index and playlist
+iteration so repeated cues and loop boundaries are unambiguous; local paths never cross the
+network.
 
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.
@@ -202,9 +213,22 @@ and receives the Master's current position plus a future release timestamp, allo
 without interrupting the Master or already-connected players.
 
 After joining, a Slave keeps playing from its disciplined local clock if the Master or control
-network disappears. It reconnects in the background. When the Master returns, the Slave may pause,
-seek to the newly authoritative position, and resume at the supplied timestamp; this deliberate
+network disappears. It reconnects in the background. When the Master returns, the Slave pauses,
+seeks to the newly authoritative position, and resumes at the supplied timestamp; this deliberate
 interruption prevents especially noticeable audio divergence after an outage.
+
+While connected, every heartbeat contains a complete authoritative state snapshot. Normal
+snapshots refresh the Slave's expected timeline without seeking. A new Master session or transport
+generation uses the prepared reconnect path; stale state is ignored. The Master's snapshots are
+derived from its logical plan and playback clock rather than its renderer's queried position, so a
+local Master rendering stall does not pull healthy Slaves backward.
+
+Each player samples expected versus actual sequence position once per second. Samples are ignored
+while paused, preparing, seeking, waiting for release, crossing an ambiguous playlist handoff, or
+using an unhealthy clock. Syncplayer warns after error exceeds 100 ms for three valid samples and
+performs one local prepared repair after error exceeds 250 ms for three valid samples. Repairs have
+a ten-second cooldown. These conservative prototype thresholds are intended to recover obvious
+stalls; the physical-host experiment must determine whether they should change.
 
 See [`docs/prototypes/clock-sync.md`](docs/prototypes/clock-sync.md) for the measurement procedure,
 acceptance criteria, and known boundaries.

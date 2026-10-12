@@ -254,6 +254,31 @@ impl Timeline {
         self.offsets_ns[index]
     }
 
+    /// Converts an item-local position into the canonical sequence position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown item or a local position at/beyond that
+    /// item's duration. Exact endpoints cannot reliably identify which side
+    /// of a playlist handoff is currently rendering.
+    pub fn sequence_position(&self, position: ItemPosition) -> Result<u64, TimelineError> {
+        let duration_ns = self
+            .durations_ns
+            .get(position.index)
+            .copied()
+            .ok_or(TimelineError::UnknownItem(position.index))?;
+        if position.local_ns >= duration_ns {
+            return Err(TimelineError::PastItemEnd {
+                index: position.index,
+                local_ns: position.local_ns,
+                duration_ns,
+            });
+        }
+        self.offsets_ns[position.index]
+            .checked_add(position.local_ns)
+            .ok_or(TimelineError::DurationOverflow)
+    }
+
     /// Maps an absolute sequence position to an item-local position.
     /// The exact final endpoint is `None` for a non-looping sequence.
     ///
@@ -309,6 +334,38 @@ impl Timeline {
             }
         }
     }
+
+    /// Advances an absolute sequence position while preserving loop occurrence.
+    ///
+    /// Unlike [`Self::project`], a looping result is not reduced modulo the
+    /// playlist duration. This makes repeated cues distinguishable in state
+    /// snapshots and release plans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on arithmetic overflow or when a non-looping sequence
+    /// reaches its endpoint.
+    pub fn project_absolute(&self, position_ns: u64, lead_ns: u64) -> Result<u64, TimelineError> {
+        let projected = position_ns
+            .checked_add(lead_ns)
+            .ok_or(TimelineError::DurationOverflow)?;
+        if !self.looping && projected >= self.total_ns {
+            return Err(TimelineError::PastEnd {
+                position_ns: projected,
+                total_ns: self.total_ns,
+            });
+        }
+        Ok(projected)
+    }
+
+    #[must_use]
+    pub const fn playlist_iteration(&self, absolute_position_ns: u64) -> u64 {
+        if self.looping {
+            absolute_position_ns / self.total_ns
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,7 +373,16 @@ pub enum TimelineError {
     Empty,
     ZeroDuration(usize),
     DurationOverflow,
-    PastEnd { position_ns: u64, total_ns: u64 },
+    UnknownItem(usize),
+    PastItemEnd {
+        index: usize,
+        local_ns: u64,
+        duration_ns: u64,
+    },
+    PastEnd {
+        position_ns: u64,
+        total_ns: u64,
+    },
 }
 
 impl fmt::Display for TimelineError {
@@ -327,6 +393,15 @@ impl fmt::Display for TimelineError {
             Self::DurationOverflow => {
                 formatter.write_str("media sequence duration exceeds u64 nanoseconds")
             }
+            Self::UnknownItem(index) => write!(formatter, "media item {index} does not exist"),
+            Self::PastItemEnd {
+                index,
+                local_ns,
+                duration_ns,
+            } => write!(
+                formatter,
+                "item {index} position {local_ns} is at or beyond duration {duration_ns}"
+            ),
             Self::PastEnd {
                 position_ns,
                 total_ns,
@@ -491,6 +566,36 @@ videos = ["a.mp4", "${HOST}/b.mp4", "price-$$5.mp4", "a.mp4"]
             })
         );
         assert_eq!(timeline.project(29, u64::MAX).unwrap(), 14);
+        assert_eq!(timeline.project_absolute(29, 2).unwrap(), 31);
+        assert_eq!(timeline.playlist_iteration(61), 2);
+    }
+
+    #[test]
+    fn timeline_converts_item_positions_and_rejects_ambiguous_endpoints() {
+        let timeline = Timeline::new(vec![10, 20], true).unwrap();
+        assert_eq!(
+            timeline
+                .sequence_position(ItemPosition {
+                    index: 1,
+                    local_ns: 3,
+                })
+                .unwrap(),
+            13
+        );
+        assert!(matches!(
+            timeline.sequence_position(ItemPosition {
+                index: 0,
+                local_ns: 10,
+            }),
+            Err(TimelineError::PastItemEnd { .. })
+        ));
+        assert_eq!(
+            timeline.sequence_position(ItemPosition {
+                index: 2,
+                local_ns: 0,
+            }),
+            Err(TimelineError::UnknownItem(2))
+        );
     }
 
     #[test]

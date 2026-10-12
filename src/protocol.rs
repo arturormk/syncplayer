@@ -5,9 +5,47 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_LINE_BYTES: usize = 256;
 const PREFIX: &str = "SYNCPLAYER-LAB";
+
+/// Identifies one run of the authoritative Master process.
+///
+/// This is deliberately independent of the transport generation: accepting a
+/// new Slave does not create a new timeline.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MasterSession(u128);
+
+impl MasterSession {
+    #[must_use]
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+impl fmt::Display for MasterSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:032x}", self.0)
+    }
+}
+
+impl FromStr for MasterSession {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ParseError::InvalidSession);
+        }
+        u128::from_str_radix(value, 16)
+            .map(Self)
+            .map_err(|_| ParseError::InvalidSession)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
@@ -40,12 +78,50 @@ impl FromStr for Operation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportState {
+    Waiting,
+    Playing,
+}
+
+impl fmt::Display for TransportState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Waiting => "WAITING",
+            Self::Playing => "PLAYING",
+        })
+    }
+}
+
+impl FromStr for TransportState {
+    type Err = ParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "WAITING" => Ok(Self::Waiting),
+            "PLAYING" => Ok(Self::Playing),
+            _ => Err(ParseError::UnknownTransportState(value.to_owned())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReleasePlan {
     pub generation: u64,
     pub operation: Operation,
     /// Absolute position from the beginning of the complete media sequence.
     pub media_position: MediaPositionNs,
     pub release_at: ClockNs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateSnapshot {
+    pub generation: u64,
+    pub transport_state: TransportState,
+    pub operation: Operation,
+    pub media_position: MediaPositionNs,
+    pub anchor_clock: ClockNs,
+    pub item_index: u64,
+    pub playlist_iteration: u64,
 }
 
 impl ReleasePlan {
@@ -59,7 +135,7 @@ impl ReleasePlan {
         now: ClockNs,
         previous_generation: Option<u64>,
     ) -> Result<Self, ParseError> {
-        if previous_generation.is_some_and(|previous| self.generation <= previous) {
+        if previous_generation.is_some_and(|previous| self.generation < previous) {
             return Err(ParseError::StaleGeneration {
                 received: self.generation,
                 previous: previous_generation.unwrap_or_default(),
@@ -74,9 +150,27 @@ impl ReleasePlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
-    Clock { port: u16 },
+    Clock {
+        session: MasterSession,
+        generation: u64,
+        port: u16,
+    },
     Ready,
     Release(ReleasePlan),
+    Prepared {
+        session: MasterSession,
+        generation: u64,
+    },
+    Heartbeat {
+        session: MasterSession,
+        sequence: u64,
+        master_clock: ClockNs,
+        state: StateSnapshot,
+    },
+    Alive {
+        session: MasterSession,
+        sequence: u64,
+    },
     Error(String),
 }
 
@@ -84,12 +178,38 @@ impl Message {
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
-            Self::Clock { port } => format!("{PREFIX} {PROTOCOL_VERSION} CLOCK {port}"),
+            Self::Clock {
+                session,
+                generation,
+                port,
+            } => format!("{PREFIX} {PROTOCOL_VERSION} CLOCK {session} {generation} {port}"),
             Self::Ready => format!("{PREFIX} {PROTOCOL_VERSION} READY"),
             Self::Release(plan) => format!(
                 "{PREFIX} {PROTOCOL_VERSION} RELEASE {} {} {} {}",
                 plan.generation, plan.operation, plan.media_position, plan.release_at
             ),
+            Self::Prepared {
+                session,
+                generation,
+            } => format!("{PREFIX} {PROTOCOL_VERSION} PREPARED {session} {generation}"),
+            Self::Heartbeat {
+                session,
+                sequence,
+                master_clock,
+                state,
+            } => format!(
+                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {}",
+                state.generation,
+                state.transport_state,
+                state.operation,
+                state.media_position,
+                state.anchor_clock,
+                state.item_index,
+                state.playlist_iteration
+            ),
+            Self::Alive { session, sequence } => {
+                format!("{PREFIX} {PROTOCOL_VERSION} ALIVE {session} {sequence}")
+            }
             Self::Error(message) => {
                 let safe = message.replace(['\r', '\n'], " ");
                 format!("{PREFIX} {PROTOCOL_VERSION} ERROR {safe}")
@@ -116,6 +236,8 @@ impl Message {
         let kind = next(&mut fields)?;
         let message = match kind {
             "CLOCK" => Self::Clock {
+                session: next(&mut fields)?.parse()?,
+                generation: parse(next(&mut fields)?, "generation")?,
                 port: parse(next(&mut fields)?, "clock port")?,
             },
             "READY" => Self::Ready,
@@ -125,6 +247,28 @@ impl Message {
                 media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
                 release_at: ClockNs::new(parse(next(&mut fields)?, "release timestamp")?),
             }),
+            "PREPARED" => Self::Prepared {
+                session: next(&mut fields)?.parse()?,
+                generation: parse(next(&mut fields)?, "generation")?,
+            },
+            "HEARTBEAT" => Self::Heartbeat {
+                session: next(&mut fields)?.parse()?,
+                sequence: parse(next(&mut fields)?, "heartbeat sequence")?,
+                master_clock: ClockNs::new(parse(next(&mut fields)?, "Master clock")?),
+                state: StateSnapshot {
+                    generation: parse(next(&mut fields)?, "generation")?,
+                    transport_state: next(&mut fields)?.parse()?,
+                    operation: next(&mut fields)?.parse()?,
+                    media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
+                    anchor_clock: ClockNs::new(parse(next(&mut fields)?, "anchor clock")?),
+                    item_index: parse(next(&mut fields)?, "item index")?,
+                    playlist_iteration: parse(next(&mut fields)?, "playlist iteration")?,
+                },
+            },
+            "ALIVE" => Self::Alive {
+                session: next(&mut fields)?.parse()?,
+                sequence: parse(next(&mut fields)?, "heartbeat sequence")?,
+            },
             "ERROR" => return Ok(Self::Error(fields.collect::<Vec<_>>().join(" "))),
             _ => return Err(ParseError::UnknownMessage(kind.to_owned())),
         };
@@ -181,9 +325,11 @@ pub enum ParseError {
         actual: String,
     },
     InvalidNumber(&'static str),
+    InvalidSession,
     UnsupportedVersion(u16),
     UnknownMessage(String),
     UnknownOperation(String),
+    UnknownTransportState(String),
     TrailingFields,
     TooLong,
     StaleGeneration {
@@ -256,11 +402,76 @@ mod tests {
         })
     }
 
+    fn session() -> MasterSession {
+        MasterSession::new(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+    }
+
     #[test]
     fn messages_round_trip() {
-        for message in [Message::Clock { port: 4_601 }, Message::Ready, release()] {
+        for message in [
+            Message::Clock {
+                session: session(),
+                generation: 7,
+                port: 4_601,
+            },
+            Message::Ready,
+            release(),
+            Message::Prepared {
+                session: session(),
+                generation: 7,
+            },
+            Message::Heartbeat {
+                session: session(),
+                sequence: 42,
+                master_clock: ClockNs::new(9_000),
+                state: StateSnapshot {
+                    generation: 7,
+                    transport_state: TransportState::Playing,
+                    operation: Operation::Start,
+                    media_position: MediaPositionNs::new(3_000),
+                    anchor_clock: ClockNs::new(8_000),
+                    item_index: 2,
+                    playlist_iteration: 4,
+                },
+            },
+            Message::Alive {
+                session: session(),
+                sequence: 42,
+            },
+        ] {
             assert_eq!(Message::decode(&message.encode()), Ok(message));
         }
+    }
+
+    #[test]
+    fn rejects_malformed_session_and_heartbeat() {
+        assert_eq!(
+            Message::decode("SYNCPLAYER-LAB 3 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7"),
+            Err(ParseError::InvalidSession)
+        );
+        assert_eq!(
+            Message::decode("SYNCPLAYER-LAB 3 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
+            Err(ParseError::TrailingFields)
+        );
+    }
+
+    #[test]
+    fn maximum_snapshot_heartbeat_remains_bounded() {
+        let message = Message::Heartbeat {
+            session: MasterSession::new(u128::MAX),
+            sequence: u64::MAX,
+            master_clock: ClockNs::new(u64::MAX),
+            state: StateSnapshot {
+                generation: u64::MAX,
+                transport_state: TransportState::Playing,
+                operation: Operation::Resume,
+                media_position: MediaPositionNs::new(u64::MAX),
+                anchor_clock: ClockNs::new(u64::MAX),
+                item_index: u64::MAX,
+                playlist_iteration: u64::MAX,
+            },
+        };
+        assert!(message.encode().len() <= MAX_LINE_BYTES);
     }
 
     #[test]
@@ -270,7 +481,7 @@ mod tests {
             Err(ParseError::UnsupportedVersion(99))
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 1 READY surprise"),
+            Message::decode("SYNCPLAYER-LAB 3 READY surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -294,8 +505,9 @@ mod tests {
             unreachable!()
         };
         assert!(plan.validate(ClockNs::new(4_000), Some(1)).is_ok());
+        assert!(plan.validate(ClockNs::new(4_000), Some(2)).is_ok());
         assert!(matches!(
-            plan.validate(ClockNs::new(4_000), Some(2)),
+            plan.validate(ClockNs::new(4_000), Some(3)),
             Err(ParseError::StaleGeneration { .. })
         ));
         assert_eq!(
