@@ -68,6 +68,10 @@ struct PlaybackArgs {
     #[arg(long)]
     mute: bool,
 
+    /// Repeat the media continuously using playbin3's gapless handoff.
+    #[arg(long)]
+    r#loop: bool,
+
     /// Override `GStreamer`'s automatically selected video sink.
     #[arg(long)]
     video_sink: Option<String>,
@@ -201,6 +205,7 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
 struct Player {
     pipeline: gst::Pipeline,
     clock: gst::Clock,
+    loop_duration_ns: Option<u64>,
 }
 
 impl Player {
@@ -211,6 +216,18 @@ impl Player {
             .property("mute", args.mute)
             .build()
             .context("playbin3 is unavailable")?;
+        if args.r#loop {
+            let weak_element = element.downgrade();
+            let loop_uri = uri.clone();
+            element.connect("about-to-finish", false, move |_| {
+                if let Some(element) = weak_element.upgrade() {
+                    // Supplying the next URI before EOS lets playbin3 prepare
+                    // it and carry the running timeline across the boundary.
+                    element.set_property("uri", &loop_uri);
+                }
+                None
+            });
+        }
         if let Some(name) = &args.video_sink {
             let sink = make_element(name, "video sink")?;
             force_clock_sync(&sink, "video sink")?;
@@ -234,19 +251,30 @@ impl Player {
             "media did not preroll before timeout",
         )?;
         let duration = pipeline.query_duration::<gst::ClockTime>();
-        info!(media = %args.media.display(), duration_ns = duration.map(gst::ClockTime::nseconds), mute = args.mute, "media prerolled");
+        let loop_duration_ns = if args.r#loop {
+            let duration_ns = duration
+                .map(gst::ClockTime::nseconds)
+                .filter(|duration_ns| *duration_ns > 0)
+                .ok_or_else(|| anyhow!("--loop requires media with a known, non-zero duration"))?;
+            Some(duration_ns)
+        } else {
+            None
+        };
+        info!(media = %args.media.display(), duration_ns = duration.map(gst::ClockTime::nseconds), mute = args.mute, looped = args.r#loop, "media prerolled");
         Ok(Self {
             pipeline,
             clock: clock.clone().upcast(),
+            loop_duration_ns,
         })
     }
 
     fn release(&self, plan: ReleasePlan) -> Result<()> {
-        if plan.media_position.get() != 0 {
+        let media_position = self.normalize(plan.media_position);
+        if media_position.get() != 0 {
             self.pipeline
                 .seek_simple(
                     gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                    gst::ClockTime::from_nseconds(plan.media_position.get()),
+                    gst::ClockTime::from_nseconds(media_position.get()),
                 )
                 .context("failed to seek to release position")?;
             wait_for_state(
@@ -288,6 +316,11 @@ impl Player {
                         ));
                     }
                     gst::MessageView::Eos(..) => {
+                        if self.loop_duration_ns.is_some() {
+                            break Err(anyhow!(
+                                "looping pipeline reached EOS instead of performing a gapless handoff"
+                            ));
+                        }
                         info!("end of stream");
                         break Ok(());
                     }
@@ -315,15 +348,25 @@ impl Player {
             .saturating_sub(plan.release_at.get())
             .saturating_add(plan.media_position.get());
         if let Some(actual) = self.pipeline.query_position::<gst::ClockTime>() {
-            let error_ns = i128::from(actual.nseconds()) - i128::from(expected);
+            let expected = self.normalize(MediaPositionNs::new(expected));
+            let actual = self.normalize(MediaPositionNs::new(actual.nseconds()));
+            let error_ns = self.loop_duration_ns.map_or_else(
+                || actual - expected,
+                |duration_ns| actual.circular_error(expected, duration_ns),
+            );
             debug!(
                 clock_ns = clock_now,
-                expected_ns = expected,
-                actual_ns = actual.nseconds(),
+                expected_ns = expected.get(),
+                actual_ns = actual.get(),
                 error_ns,
                 "position telemetry"
             );
         }
+    }
+
+    fn normalize(&self, position: MediaPositionNs) -> MediaPositionNs {
+        self.loop_duration_ns
+            .map_or(position, |duration_ns| position.modulo(duration_ns))
     }
 }
 

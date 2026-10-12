@@ -82,6 +82,11 @@ RUST_LOG=syncplayer=debug cargo run --release -- \
   slave --media /different/local/path/test.mp4 --master 192.168.1.40:46000 --mute
 ```
 
+Pass `--loop` to both Master and Slave to repeat their local media continuously. Looping uses
+`playbin3`'s gapless next-item handoff and treats synchronized positions modulo each file's probed
+duration, including initial positions beyond the first iteration. Looping therefore requires media
+with a known, non-zero duration. Host-specific renditions should have matching durations.
+
 Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.
 

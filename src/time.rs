@@ -48,6 +48,37 @@ impl MediaPositionNs {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    /// Wraps this position onto a repeating media timeline.
+    ///
+    /// A zero duration is left unchanged because it cannot define a loop.
+    #[must_use]
+    pub const fn modulo(self, duration_ns: u64) -> Self {
+        if duration_ns == 0 {
+            self
+        } else {
+            Self(self.0 % duration_ns)
+        }
+    }
+
+    /// Returns the shortest signed distance from `expected` on a loop.
+    ///
+    /// This avoids reporting almost a whole media item's worth of error when
+    /// two positions straddle the loop boundary.
+    #[must_use]
+    pub fn circular_error(self, expected: Self, duration_ns: u64) -> i128 {
+        if duration_ns == 0 {
+            return self - expected;
+        }
+
+        let duration = i128::from(duration_ns);
+        let forward = (i128::from(self.0) - i128::from(expected.0)).rem_euclid(duration);
+        if forward > duration / 2 {
+            forward - duration
+        } else {
+            forward
+        }
+    }
 }
 
 impl fmt::Display for MediaPositionNs {
@@ -87,5 +118,23 @@ mod tests {
     #[test]
     fn position_difference_is_signed_without_overflow() {
         assert_eq!(MediaPositionNs::new(2) - MediaPositionNs::new(5), -3);
+    }
+
+    #[test]
+    fn loop_position_wraps_at_duration() {
+        assert_eq!(MediaPositionNs::new(14).modulo(10), MediaPositionNs::new(4));
+        assert_eq!(MediaPositionNs::new(10).modulo(10), MediaPositionNs::new(0));
+    }
+
+    #[test]
+    fn circular_error_takes_short_path_across_loop_boundary() {
+        assert_eq!(
+            MediaPositionNs::new(1).circular_error(MediaPositionNs::new(9), 10),
+            2
+        );
+        assert_eq!(
+            MediaPositionNs::new(9).circular_error(MediaPositionNs::new(1), 10),
+            -2
+        );
     }
 }
