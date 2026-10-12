@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 const PREROLL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const MASTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Syncplayer two-host shared-clock experiment")]
@@ -158,7 +159,7 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
-    let (mut stream, clock) = connect_to_master(args.master)?;
+    let (mut stream, clock) = wait_for_master(args.master);
     let player = Arc::new(Player::new(&args.playback, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock)?;
     player.resynchronize(&clock, plan)?;
@@ -169,6 +170,23 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
 
     monitor_master(stream, args.master, player.clone());
     player.monitor(plan)
+}
+
+fn wait_for_master(master: SocketAddr) -> (TcpStream, gst::Clock) {
+    loop {
+        match connect_to_master(master) {
+            Ok(connection) => return connection,
+            Err(error) => {
+                warn!(
+                    %master,
+                    %error,
+                    retry_in_s = MASTER_RETRY_INTERVAL.as_secs(),
+                    "Master connection attempt failed; retrying"
+                );
+                thread::sleep(MASTER_RETRY_INTERVAL);
+            }
+        }
+    }
 }
 
 fn serve_slaves(
@@ -337,7 +355,7 @@ fn monitor_master(mut stream: TcpStream, master: SocketAddr, player: Arc<Player>
                     }
                     Err(error) => {
                         warn!(%master, %error, "Master reconnect attempt failed; still free-running");
-                        thread::sleep(Duration::from_secs(1));
+                        thread::sleep(MASTER_RETRY_INTERVAL);
                     }
                 }
             }

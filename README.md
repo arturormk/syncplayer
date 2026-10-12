@@ -110,9 +110,10 @@ startup deadline for a slow or absent Slave.
 | --- | :---: | --- |
 | `--master <IP:PORT>` | Yes | Master's reachable TCP control address, matching its `--bind` port. The Master supplies the separate UDP clock port during the connection handshake. |
 
-The Slave calibrates a network-derived clock before accepting a release plan. If the control
-connection disappears, it continues playing from its disciplined local clock and attempts to
-reconnect in the background.
+The Slave retries the initial Master connection once per second until the Master is available, then
+calibrates a network-derived clock before accepting a release plan. If the control connection
+later disappears, it continues playing from its disciplined local clock and attempts to reconnect
+in the background.
 
 ### Logging
 
