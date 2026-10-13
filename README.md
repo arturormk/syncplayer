@@ -11,8 +11,8 @@ design context.
 The repository currently contains a risk-reduction prototype, not the production player. It proves
 that Linux pipelines can use one exported monotonic clock, join at a future clock release, detect a
 stalled Master control process, refresh authoritative transport state, and repair sustained local
-drift. `playbin3` and the newline control messages are experimental and are not commitments for the
-final playback engine or protocol.
+drift. The production state protocol now separates bounded binary TCP control, UDP snapshots, and
+clock synchronization; `playbin3` remains an experimental playback-engine choice.
 
 ## Prerequisites
 
@@ -145,6 +145,9 @@ control connections.
 | Option | Default | Description |
 | --- | --- | --- |
 | `--bind <IP:PORT>` | `0.0.0.0:46000` | TCP address on which to accept Slave control connections. Use a specific interface address to restrict access. |
+| `--state-bind <IP:PORT>` | `0.0.0.0:0` | Local UDP source address for state fan-out. Port zero selects an ephemeral source port. |
+| `--state-rate-hz <HZ>` | `10` | Complete UDP snapshots per second, from 1 through 100. |
+| `--keepalive-timeout <SECONDS>` | `8` | Remove a subscriber whose reliable control keepalive is absent for this long. |
 | `--clock-port <PORT>` | `46001` | UDP port on which `GstNetTimeProvider` exposes the Master's playback clock. |
 | `--release-delay <SECONDS>` | `5` | Positive preparation interval between sending a late-joining or reconnecting Slave a release plan and executing it. |
 | `--startup-delay <SECONDS>` | `0` | Non-negative best-effort grace period during which the Master remains prerolled on its first frame so ready Slaves can share the initial release deadline. Use a value greater than `--release-delay`. |
@@ -160,28 +163,31 @@ startup deadline for a slow or absent Slave.
 | Option | Required | Description |
 | --- | :---: | --- |
 | `--master <IP:PORT>` | Yes | Master's reachable TCP control address, matching its `--bind` port. The Master supplies the separate UDP clock port during the connection handshake. |
+| `--state-bind <IP:PORT>` | No | Local UDP snapshot receive address. The default `0.0.0.0:0` selects an available port and advertises it during subscription. |
+| `--keepalive-interval <SECONDS>` | No | Control keepalive cadence; defaults to 2 seconds. |
+| `--keepalive-timeout <SECONDS>` | No | Time to wait for a keepalive acknowledgement before reconnecting; defaults to 8 seconds. |
 
 The Slave retries the initial Master connection once per second until the Master is available. It
 first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
-control-channel state endpoint, and probed cue durations. The Master rejects program mismatches,
+UDP state endpoint, and probed cue durations. The Master rejects program mismatches,
 missing capabilities, duplicate active player IDs, and duration mismatches outside its configured
 policy before the Slave calibrates a network-derived clock and accepts a release plan. The Master
-sends application
-heartbeats every two seconds and requires matching acknowledgements. If no valid heartbeat arrives
-for eight seconds—even when TCP still appears connected—the Slave closes the stale connection,
+receives Slave-originated keepalives on the reliable control channel and acknowledges them. If an
+acknowledgement does not arrive before the configured timeout—even when TCP still appears
+connected—the Slave closes the stale connection,
 continues playing from its last disciplined clock estimate, and attempts to reconnect in the
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 6 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 7 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
 ### Logging
 
 Set `RUST_LOG` to control diagnostic output. Normal operation defaults to informational messages;
 `RUST_LOG=syncplayer=debug` additionally emits clock release and expected-versus-actual position
-telemetry, heartbeat round-trip times, authoritative snapshots, recovery attempts, and cooldown
-decisions. Routine heartbeats are not logged at info level.
+telemetry, keepalive round-trip times, authoritative snapshots, recovery attempts, and cooldown
+decisions. Routine keepalives and state packets are not logged at info level.
 
 ## Two-host experiment
 
@@ -210,7 +216,8 @@ audio formats give the best transition behavior. The control protocol continues 
 absolute sequence position plus logical cue index, cue-local position, and program iteration; local
 paths never cross the network.
 
-Allow TCP port 46000 and UDP port 46001 through host firewalls. For a headless loopback smoke test,
+Allow TCP port 46000, UDP port 46001, and each Slave's selected UDP state port through host
+firewalls. For a headless loopback smoke test,
 pass `--video-sink fakesink --audio-sink fakesink` to both processes.
 
 By default, the Master starts playing immediately and behaves like an ordinary local player even
@@ -230,8 +237,9 @@ network disappears. It reconnects in the background. When the Master returns, th
 seeks to the newly authoritative position, and resumes at the supplied timestamp; this deliberate
 interruption prevents especially noticeable audio divergence after an outage.
 
-While connected, every heartbeat contains a complete authoritative state snapshot. Normal
-snapshots refresh the Slave's expected timeline without seeking. A new Master session or transport
+While connected, the Master sends independent complete UDP state snapshots at 10 Hz by default.
+Normal snapshots refresh the Slave's expected timeline without seeking. Lost packets are replaced
+by the next snapshot; duplicate and reordered packets are ignored. A new Master session or transport
 generation uses the prepared reconnect path; stale state is ignored. The Master's snapshots are
 derived from its logical plan and playback clock rather than its renderer's queried position, so a
 local Master rendering stall does not pull healthy Slaves backward.

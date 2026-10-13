@@ -1,4 +1,4 @@
-//! Bounded control protocol for subscription and the shared-clock prototype.
+//! Versioned, bounded binary control and state protocols.
 
 use crate::program::ProgramHash;
 use crate::time::{ClockNs, MediaPositionNs};
@@ -6,12 +6,16 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 6;
-pub const MAX_LINE_BYTES: usize = 4_096;
+pub const PROTOCOL_VERSION: u16 = 7;
+pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 16_384;
+pub const MAX_STATE_PACKET_BYTES: usize = 1_024;
 pub const MAX_SUBSCRIPTION_CUES: usize = 128;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_SOFTWARE_VERSION_BYTES: usize = 64;
-const PREFIX: &str = "SYNCPLAYER-LAB";
+const MAX_ERROR_BYTES: usize = 1_024;
+const MAGIC: [u8; 4] = *b"SYNP";
+const HEADER_BYTES: usize = 12;
+const STATE_KIND: u8 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Capabilities(u64);
@@ -19,25 +23,22 @@ pub struct Capabilities(u64);
 impl Capabilities {
     pub const NETWORK_CLOCK: u64 = 1 << 0;
     pub const PREPARED_RELEASE: u64 = 1 << 1;
-    pub const STATE_OVER_CONTROL: u64 = 1 << 2;
+    pub const STATE_DATAGRAM: u64 = 1 << 2;
+    pub const BINARY_CONTROL: u64 = 1 << 3;
     pub const REQUIRED: u64 =
-        Self::NETWORK_CLOCK | Self::PREPARED_RELEASE | Self::STATE_OVER_CONTROL;
-
+        Self::NETWORK_CLOCK | Self::PREPARED_RELEASE | Self::STATE_DATAGRAM | Self::BINARY_CONTROL;
     #[must_use]
     pub const fn current() -> Self {
         Self(Self::REQUIRED)
     }
-
     #[must_use]
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
-
     #[must_use]
     pub const fn bits(self) -> u64 {
         self.0
     }
-
     #[must_use]
     pub const fn contains(self, required: u64) -> bool {
         self.0 & required == required
@@ -51,46 +52,36 @@ pub struct Subscription {
     pub program_hash: ProgramHash,
     pub software_version: String,
     pub capabilities: Capabilities,
-    /// UDP state port. Zero means state snapshots use this control connection.
     pub state_port: u16,
     pub cue_durations_ns: Vec<u64>,
 }
 
-/// Identifies one run of the authoritative Master process.
-///
-/// This is deliberately independent of the transport generation: accepting a
-/// new Slave does not create a new timeline.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct MasterSession(u128);
-
 impl MasterSession {
     #[must_use]
     pub const fn new(value: u128) -> Self {
         Self(value)
     }
-
     #[must_use]
     pub const fn get(self) -> u128 {
         self.0
     }
 }
-
 impl fmt::Display for MasterSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:032x}", self.0)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
     }
 }
-
 impl FromStr for MasterSession {
     type Err = ParseError;
-
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ParseError::InvalidSession);
+            return Err(ParseError::InvalidValue("session"));
         }
         u128::from_str_radix(value, 16)
             .map(Self)
-            .map_err(|_| ParseError::InvalidSession)
+            .map_err(|_| ParseError::InvalidValue("session"))
     }
 }
 
@@ -105,36 +96,30 @@ pub enum Operation {
     Unloop,
     Load,
 }
-
-impl fmt::Display for Operation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Start => "START",
-            Self::Resume => "RESUME",
-            Self::Goto => "GOTO",
-            Self::Pause => "PAUSE",
-            Self::Stop => "STOP",
-            Self::Loop => "LOOP",
-            Self::Unloop => "UNLOOP",
-            Self::Load => "LOAD",
-        })
+impl Operation {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Start => 0,
+            Self::Resume => 1,
+            Self::Goto => 2,
+            Self::Pause => 3,
+            Self::Stop => 4,
+            Self::Loop => 5,
+            Self::Unloop => 6,
+            Self::Load => 7,
+        }
     }
-}
-
-impl FromStr for Operation {
-    type Err = ParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn decode(value: u8) -> Result<Self, ParseError> {
         match value {
-            "START" => Ok(Self::Start),
-            "RESUME" => Ok(Self::Resume),
-            "GOTO" => Ok(Self::Goto),
-            "PAUSE" => Ok(Self::Pause),
-            "STOP" => Ok(Self::Stop),
-            "LOOP" => Ok(Self::Loop),
-            "UNLOOP" => Ok(Self::Unloop),
-            "LOAD" => Ok(Self::Load),
-            _ => Err(ParseError::UnknownOperation(value.to_owned())),
+            0 => Ok(Self::Start),
+            1 => Ok(Self::Resume),
+            2 => Ok(Self::Goto),
+            3 => Ok(Self::Pause),
+            4 => Ok(Self::Stop),
+            5 => Ok(Self::Loop),
+            6 => Ok(Self::Unloop),
+            7 => Ok(Self::Load),
+            _ => Err(ParseError::InvalidValue("operation")),
         }
     }
 }
@@ -145,26 +130,20 @@ pub enum TransportState {
     Paused,
     Playing,
 }
-
-impl fmt::Display for TransportState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Waiting => "WAITING",
-            Self::Paused => "PAUSED",
-            Self::Playing => "PLAYING",
-        })
+impl TransportState {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Waiting => 0,
+            Self::Paused => 1,
+            Self::Playing => 2,
+        }
     }
-}
-
-impl FromStr for TransportState {
-    type Err = ParseError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn decode(value: u8) -> Result<Self, ParseError> {
         match value {
-            "WAITING" => Ok(Self::Waiting),
-            "PAUSED" => Ok(Self::Paused),
-            "PLAYING" => Ok(Self::Playing),
-            _ => Err(ParseError::UnknownTransportState(value.to_owned())),
+            0 => Ok(Self::Waiting),
+            1 => Ok(Self::Paused),
+            2 => Ok(Self::Playing),
+            _ => Err(ParseError::InvalidValue("transport state")),
         }
     }
 }
@@ -173,7 +152,6 @@ impl FromStr for TransportState {
 pub struct ReleasePlan {
     pub generation: u64,
     pub operation: Operation,
-    /// Absolute position from the beginning of the complete media sequence.
     pub media_position: MediaPositionNs,
     pub release_at: ClockNs,
 }
@@ -203,21 +181,25 @@ pub struct StateSnapshot {
     pub debug_loop: Option<DebugLoopState>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateDatagram {
+    pub session: MasterSession,
+    pub sequence: u64,
+    pub master_clock: ClockNs,
+    pub state: StateSnapshot,
+}
+
 impl ReleasePlan {
-    /// Checks ordering and ensures the release deadline has not elapsed.
+    /// Rejects stale generations and release deadlines that have already elapsed.
     ///
     /// # Errors
     ///
-    /// Returns an error for a stale generation or a deadline at/before `now`.
-    pub fn validate(
-        self,
-        now: ClockNs,
-        previous_generation: Option<u64>,
-    ) -> Result<Self, ParseError> {
-        if previous_generation.is_some_and(|previous| self.generation < previous) {
+    /// Returns [`ParseError::StaleGeneration`] or [`ParseError::ReleaseNotFuture`].
+    pub fn validate(self, now: ClockNs, previous: Option<u64>) -> Result<Self, ParseError> {
+        if previous.is_some_and(|value| self.generation < value) {
             return Err(ParseError::StaleGeneration {
                 received: self.generation,
-                previous: previous_generation.unwrap_or_default(),
+                previous: previous.unwrap_or_default(),
             });
         }
         if self.release_at <= now {
@@ -234,6 +216,7 @@ pub enum Message {
         session: MasterSession,
         generation: u64,
         clock_port: u16,
+        state_interval_ms: u32,
         master_cue_durations_ns: Vec<u64>,
     },
     Ready,
@@ -242,13 +225,11 @@ pub enum Message {
         session: MasterSession,
         generation: u64,
     },
-    Heartbeat {
+    Keepalive {
         session: MasterSession,
         sequence: u64,
-        master_clock: ClockNs,
-        state: StateSnapshot,
     },
-    Alive {
+    KeepaliveAck {
         session: MasterSession,
         sequence: u64,
     },
@@ -256,559 +237,541 @@ pub enum Message {
 }
 
 impl Message {
-    #[must_use]
-    pub fn encode(&self) -> String {
+    const fn kind(&self) -> u8 {
         match self {
-            Self::Subscribe(subscription) => format!(
-                "{PREFIX} {PROTOCOL_VERSION} SUBSCRIBE {} {} {} {} {:016x} {} {}",
-                encode_text(&subscription.player_id),
-                encode_text(&subscription.program_id),
-                subscription.program_hash,
-                encode_text(&subscription.software_version),
-                subscription.capabilities.bits(),
-                subscription.state_port,
-                encode_durations(&subscription.cue_durations_ns)
-            ),
+            Self::Subscribe(_) => 1,
+            Self::Subscribed { .. } => 2,
+            Self::Ready => 3,
+            Self::Release(_) => 4,
+            Self::Prepared { .. } => 5,
+            Self::Keepalive { .. } => 6,
+            Self::KeepaliveAck { .. } => 7,
+            Self::Error(_) => 255,
+        }
+    }
+    fn payload(&self) -> Result<Vec<u8>, ParseError> {
+        let mut out = Vec::new();
+        match self {
+            Self::Subscribe(v) => {
+                string(&mut out, &v.player_id, MAX_ID_BYTES)?;
+                string(&mut out, &v.program_id, MAX_ID_BYTES)?;
+                out.extend_from_slice(v.program_hash.as_bytes());
+                string(&mut out, &v.software_version, MAX_SOFTWARE_VERSION_BYTES)?;
+                u64v(&mut out, v.capabilities.bits());
+                u16v(&mut out, v.state_port);
+                durations(&mut out, &v.cue_durations_ns)?;
+            }
             Self::Subscribed {
                 session,
                 generation,
                 clock_port,
+                state_interval_ms,
                 master_cue_durations_ns,
-            } => format!(
-                "{PREFIX} {PROTOCOL_VERSION} SUBSCRIBED {session} {generation} {clock_port} {}",
-                encode_durations(master_cue_durations_ns)
-            ),
-            Self::Ready => format!("{PREFIX} {PROTOCOL_VERSION} READY"),
-            Self::Release(plan) => format!(
-                "{PREFIX} {PROTOCOL_VERSION} RELEASE {} {} {} {}",
-                plan.generation, plan.operation, plan.media_position, plan.release_at
-            ),
+            } => {
+                u128v(&mut out, session.get());
+                u64v(&mut out, *generation);
+                u16v(&mut out, *clock_port);
+                u32v(&mut out, *state_interval_ms);
+                durations(&mut out, master_cue_durations_ns)?;
+            }
+            Self::Ready => {}
+            Self::Release(v) => {
+                u64v(&mut out, v.generation);
+                out.push(v.operation.code());
+                u64v(&mut out, v.media_position.get());
+                u64v(&mut out, v.release_at.get());
+            }
             Self::Prepared {
                 session,
                 generation,
-            } => format!("{PREFIX} {PROTOCOL_VERSION} PREPARED {session} {generation}"),
-            Self::Heartbeat {
-                session,
-                sequence,
-                master_clock,
-                state,
-            } => format!(
-                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-                state.generation,
-                encode_text(&state.program_id),
-                state.program_hash,
-                state.transport_state,
-                state.operation,
-                state.media_position,
-                state.anchor_clock,
-                state.item_index,
-                encode_text(&state.cue_id),
-                state.cue_occurrence,
-                state.item_position,
-                state.cue_duration,
-                state.playlist_iteration,
-                encode_debug_loop(state.debug_loop)
-            ),
-            Self::Alive { session, sequence } => {
-                format!("{PREFIX} {PROTOCOL_VERSION} ALIVE {session} {sequence}")
+            } => {
+                u128v(&mut out, session.get());
+                u64v(&mut out, *generation);
             }
-            Self::Error(message) => {
-                let safe = message.replace(['\r', '\n'], " ");
-                format!("{PREFIX} {PROTOCOL_VERSION} ERROR {safe}")
+            Self::Keepalive { session, sequence } | Self::KeepaliveAck { session, sequence } => {
+                u128v(&mut out, session.get());
+                u64v(&mut out, *sequence);
             }
+            Self::Error(value) => string(&mut out, value, MAX_ERROR_BYTES)?,
+        }
+        if out.len() > MAX_CONTROL_PAYLOAD_BYTES {
+            Err(ParseError::TooLong)
+        } else {
+            Ok(out)
         }
     }
-
-    /// Parses one protocol line without its newline terminator.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the message is oversized, malformed, unsupported,
-    /// or contains fields not defined for its message type.
-    pub fn decode(line: &str) -> Result<Self, ParseError> {
-        if line.len() > MAX_LINE_BYTES {
-            return Err(ParseError::TooLong);
-        }
-        let mut fields = line.split_ascii_whitespace();
-        expect(&mut fields, PREFIX)?;
-        let version = parse::<u16>(next(&mut fields)?, "version")?;
-        if version != PROTOCOL_VERSION {
-            return Err(ParseError::UnsupportedVersion(version));
-        }
-        let kind = next(&mut fields)?;
-        let message = match kind {
-            "SUBSCRIBE" => Self::Subscribe(Subscription {
-                player_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
-                program_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
-                program_hash: next(&mut fields)?
-                    .parse()
-                    .map_err(|_| ParseError::InvalidProgramHash)?,
-                software_version: decode_text(next(&mut fields)?, MAX_SOFTWARE_VERSION_BYTES)?,
-                capabilities: Capabilities::from_bits(
-                    u64::from_str_radix(next(&mut fields)?, 16)
-                        .map_err(|_| ParseError::InvalidCapabilities)?,
-                ),
-                state_port: parse(next(&mut fields)?, "state port")?,
-                cue_durations_ns: parse_durations(next(&mut fields)?)?,
+    fn from_payload(kind: u8, payload: &[u8]) -> Result<Self, ParseError> {
+        let mut d = Decoder::new(payload);
+        let value = match kind {
+            1 => Self::Subscribe(Subscription {
+                player_id: d.string(MAX_ID_BYTES)?,
+                program_id: d.string(MAX_ID_BYTES)?,
+                program_hash: ProgramHash::from_bytes(d.array()?),
+                software_version: d.string(MAX_SOFTWARE_VERSION_BYTES)?,
+                capabilities: Capabilities::from_bits(d.u64()?),
+                state_port: d.u16()?,
+                cue_durations_ns: d.durations()?,
             }),
-            "SUBSCRIBED" => Self::Subscribed {
-                session: next(&mut fields)?.parse()?,
-                generation: parse(next(&mut fields)?, "generation")?,
-                clock_port: parse(next(&mut fields)?, "clock port")?,
-                master_cue_durations_ns: parse_durations(next(&mut fields)?)?,
+            2 => Self::Subscribed {
+                session: MasterSession::new(d.u128()?),
+                generation: d.u64()?,
+                clock_port: d.u16()?,
+                state_interval_ms: d.u32()?,
+                master_cue_durations_ns: d.durations()?,
             },
-            "READY" => Self::Ready,
-            "RELEASE" => Self::Release(ReleasePlan {
-                generation: parse(next(&mut fields)?, "generation")?,
-                operation: next(&mut fields)?.parse()?,
-                media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
-                release_at: ClockNs::new(parse(next(&mut fields)?, "release timestamp")?),
+            3 => Self::Ready,
+            4 => Self::Release(ReleasePlan {
+                generation: d.u64()?,
+                operation: Operation::decode(d.u8()?)?,
+                media_position: MediaPositionNs::new(d.u64()?),
+                release_at: ClockNs::new(d.u64()?),
             }),
-            "PREPARED" => Self::Prepared {
-                session: next(&mut fields)?.parse()?,
-                generation: parse(next(&mut fields)?, "generation")?,
+            5 => Self::Prepared {
+                session: MasterSession::new(d.u128()?),
+                generation: d.u64()?,
             },
-            "HEARTBEAT" => Self::Heartbeat {
-                session: next(&mut fields)?.parse()?,
-                sequence: parse(next(&mut fields)?, "heartbeat sequence")?,
-                master_clock: ClockNs::new(parse(next(&mut fields)?, "Master clock")?),
-                state: StateSnapshot {
-                    generation: parse(next(&mut fields)?, "generation")?,
-                    program_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
-                    program_hash: next(&mut fields)?
-                        .parse()
-                        .map_err(|_| ParseError::InvalidProgramHash)?,
-                    transport_state: next(&mut fields)?.parse()?,
-                    operation: next(&mut fields)?.parse()?,
-                    media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
-                    anchor_clock: ClockNs::new(parse(next(&mut fields)?, "anchor clock")?),
-                    item_index: parse(next(&mut fields)?, "item index")?,
-                    cue_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
-                    cue_occurrence: parse(next(&mut fields)?, "cue occurrence")?,
-                    item_position: MediaPositionNs::new(parse(
-                        next(&mut fields)?,
-                        "item position",
-                    )?),
-                    cue_duration: MediaPositionNs::new(parse(next(&mut fields)?, "cue duration")?),
-                    playlist_iteration: parse(next(&mut fields)?, "playlist iteration")?,
-                    debug_loop: parse_debug_loop(next(&mut fields)?)?,
-                },
+            6 => Self::Keepalive {
+                session: MasterSession::new(d.u128()?),
+                sequence: d.u64()?,
             },
-            "ALIVE" => Self::Alive {
-                session: next(&mut fields)?.parse()?,
-                sequence: parse(next(&mut fields)?, "heartbeat sequence")?,
+            7 => Self::KeepaliveAck {
+                session: MasterSession::new(d.u128()?),
+                sequence: d.u64()?,
             },
-            "ERROR" => return Ok(Self::Error(fields.collect::<Vec<_>>().join(" "))),
-            _ => return Err(ParseError::UnknownMessage(kind.to_owned())),
+            255 => Self::Error(d.string(MAX_ERROR_BYTES)?),
+            _ => return Err(ParseError::UnknownMessage(kind)),
         };
-        if fields.next().is_some() {
-            return Err(ParseError::TrailingFields);
-        }
-        Ok(message)
+        d.finish()?;
+        Ok(value)
     }
 }
 
-/// Writes and flushes one newline-delimited message.
+/// Writes one length-delimited binary control frame.
 ///
 /// # Errors
 ///
-/// Propagates errors from the underlying writer.
+/// Returns an I/O error if encoding or writing the bounded frame fails.
 pub fn write_message(writer: &mut impl Write, message: &Message) -> io::Result<()> {
-    let encoded = message.encode();
-    if encoded.len() > MAX_LINE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("protocol message exceeds {MAX_LINE_BYTES} bytes"),
-        ));
-    }
-    writer.write_all(encoded.as_bytes())?;
-    writer.write_all(b"\n")?;
+    let payload = message.payload().map_err(invalid)?;
+    let length = u32::try_from(payload.len()).map_err(|_| invalid(ParseError::TooLong))?;
+    writer.write_all(&header(message.kind(), length))?;
+    writer.write_all(&payload)?;
     writer.flush()
 }
-
-/// Reads one bounded newline-delimited message.
+/// Reads and validates one length-delimited binary control frame.
 ///
 /// # Errors
 ///
-/// Returns an error for I/O failure, EOF, truncation, invalid UTF-8, an
-/// oversized line, or a malformed message.
+/// Returns an I/O or parse error for incomplete, oversized, or malformed input.
 pub fn read_message(reader: &mut impl Read) -> Result<Message, ReadError> {
-    let mut bytes = Vec::with_capacity(64);
-    let mut byte = [0_u8; 1];
-    loop {
-        match reader.read(&mut byte) {
-            Ok(0) if bytes.is_empty() => return Err(ReadError::Eof),
-            Ok(0) => return Err(ReadError::Truncated),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => {
-                if bytes.len() == MAX_LINE_BYTES {
-                    return Err(ReadError::TooLong);
-                }
-                bytes.push(byte[0]);
-            }
-            Err(error) => return Err(ReadError::Io(error)),
+    let mut h = [0; HEADER_BYTES];
+    reader.read_exact(&mut h).map_err(ReadError::Io)?;
+    let (kind, length) = parse_header(&h).map_err(ReadError::Parse)?;
+    if length > MAX_CONTROL_PAYLOAD_BYTES {
+        return Err(ReadError::Parse(ParseError::TooLong));
+    }
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).map_err(ReadError::Io)?;
+    Message::from_payload(kind, &payload).map_err(ReadError::Parse)
+}
+
+/// Encodes one complete bounded UDP state snapshot.
+///
+/// # Errors
+///
+/// Returns a parse error when a field or the complete packet exceeds its bound.
+pub fn encode_state_datagram(packet: &StateDatagram) -> Result<Vec<u8>, ParseError> {
+    let mut out = Vec::with_capacity(256);
+    u128v(&mut out, packet.session.get());
+    u64v(&mut out, packet.sequence);
+    u64v(&mut out, packet.master_clock.get());
+    let s = &packet.state;
+    u64v(&mut out, s.generation);
+    string(&mut out, &s.program_id, MAX_ID_BYTES)?;
+    out.extend_from_slice(s.program_hash.as_bytes());
+    out.push(s.transport_state.code());
+    out.push(s.operation.code());
+    u64v(&mut out, s.media_position.get());
+    u64v(&mut out, s.anchor_clock.get());
+    u64v(&mut out, s.item_index);
+    string(&mut out, &s.cue_id, MAX_ID_BYTES)?;
+    u64v(&mut out, s.cue_occurrence);
+    u64v(&mut out, s.item_position.get());
+    u64v(&mut out, s.cue_duration.get());
+    u64v(&mut out, s.playlist_iteration);
+    match s.debug_loop {
+        None => out.push(0),
+        Some(v) => {
+            out.push(1);
+            u64v(&mut out, v.start.get());
+            u64v(&mut out, v.end.get());
+            out.push(u8::from(v.events_enabled));
         }
     }
-    let line = std::str::from_utf8(&bytes).map_err(|_| ReadError::NotUtf8)?;
-    Message::decode(line.trim_end_matches('\r')).map_err(ReadError::Parse)
+    if HEADER_BYTES + out.len() > MAX_STATE_PACKET_BYTES {
+        return Err(ParseError::TooLong);
+    }
+    let mut packet = Vec::with_capacity(HEADER_BYTES + out.len());
+    let payload_len = u32::try_from(out.len()).map_err(|_| ParseError::TooLong)?;
+    packet.extend_from_slice(&header(STATE_KIND, payload_len));
+    packet.extend_from_slice(&out);
+    Ok(packet)
+}
+
+/// Decodes and fully validates one UDP state snapshot.
+///
+/// # Errors
+///
+/// Returns a parse error for incompatible, oversized, truncated, or malformed input.
+pub fn decode_state_datagram(packet: &[u8]) -> Result<StateDatagram, ParseError> {
+    if packet.len() < HEADER_BYTES || packet.len() > MAX_STATE_PACKET_BYTES {
+        return Err(ParseError::InvalidLength);
+    }
+    let h: &[u8; HEADER_BYTES] = packet[..HEADER_BYTES]
+        .try_into()
+        .map_err(|_| ParseError::InvalidLength)?;
+    let (kind, length) = parse_header(h)?;
+    if kind != STATE_KIND || length != packet.len() - HEADER_BYTES {
+        return Err(ParseError::InvalidLength);
+    }
+    let mut d = Decoder::new(&packet[HEADER_BYTES..]);
+    let session = MasterSession::new(d.u128()?);
+    let sequence = d.u64()?;
+    let master_clock = ClockNs::new(d.u64()?);
+    let generation = d.u64()?;
+    let program_id = d.string(MAX_ID_BYTES)?;
+    let program_hash = ProgramHash::from_bytes(d.array()?);
+    let transport_state = TransportState::decode(d.u8()?)?;
+    let operation = Operation::decode(d.u8()?)?;
+    let media_position = MediaPositionNs::new(d.u64()?);
+    let anchor_clock = ClockNs::new(d.u64()?);
+    let item_index = d.u64()?;
+    let cue_id = d.string(MAX_ID_BYTES)?;
+    let cue_occurrence = d.u64()?;
+    let item_position = MediaPositionNs::new(d.u64()?);
+    let cue_duration = MediaPositionNs::new(d.u64()?);
+    let playlist_iteration = d.u64()?;
+    let debug_loop = match d.u8()? {
+        0 => None,
+        1 => {
+            let start = MediaPositionNs::new(d.u64()?);
+            let end = MediaPositionNs::new(d.u64()?);
+            let events_enabled = match d.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(ParseError::InvalidValue("debug events")),
+            };
+            if start >= end {
+                return Err(ParseError::InvalidValue("debug loop"));
+            }
+            Some(DebugLoopState {
+                start,
+                end,
+                events_enabled,
+            })
+        }
+        _ => return Err(ParseError::InvalidValue("debug loop presence")),
+    };
+    d.finish()?;
+    Ok(StateDatagram {
+        session,
+        sequence,
+        master_clock,
+        state: StateSnapshot {
+            generation,
+            program_id,
+            program_hash,
+            transport_state,
+            operation,
+            media_position,
+            anchor_clock,
+            item_index,
+            cue_id,
+            cue_occurrence,
+            item_position,
+            cue_duration,
+            playlist_iteration,
+            debug_loop,
+        },
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ParseError {
-    MissingField,
-    UnexpectedField {
-        expected: &'static str,
-        actual: String,
-    },
-    InvalidNumber(&'static str),
-    InvalidSession,
-    InvalidProgramHash,
-    InvalidCapabilities,
-    InvalidHex,
+    InvalidMagic,
+    UnsupportedVersion(u16),
+    UnknownMessage(u8),
+    InvalidLength,
+    InvalidValue(&'static str),
     InvalidUtf8,
     TextTooLong,
-    InvalidCueDurations,
-    InvalidDebugLoop,
     TooManyCues,
-    UnsupportedVersion(u16),
-    UnknownMessage(String),
-    UnknownOperation(String),
-    UnknownTransportState(String),
-    TrailingFields,
     TooLong,
-    StaleGeneration {
-        received: u64,
-        previous: u64,
-    },
+    TrailingBytes,
+    StaleGeneration { received: u64, previous: u64 },
     ReleaseNotFuture,
 }
-
 impl fmt::Display for ParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
     }
 }
-
 impl std::error::Error for ParseError {}
-
 #[derive(Debug)]
 pub enum ReadError {
-    Eof,
-    Truncated,
-    TooLong,
-    NotUtf8,
     Io(io::Error),
     Parse(ParseError),
 }
-
 impl fmt::Display for ReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
     }
 }
-
 impl std::error::Error for ReadError {}
 
-fn next<'a>(fields: &mut impl Iterator<Item = &'a str>) -> Result<&'a str, ParseError> {
-    fields.next().ok_or(ParseError::MissingField)
+fn header(kind: u8, length: u32) -> [u8; HEADER_BYTES] {
+    let mut h = [0; HEADER_BYTES];
+    h[..4].copy_from_slice(&MAGIC);
+    h[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    h[6] = kind;
+    h[8..12].copy_from_slice(&length.to_be_bytes());
+    h
 }
-
-fn expect<'a>(
-    fields: &mut impl Iterator<Item = &'a str>,
-    expected: &'static str,
-) -> Result<(), ParseError> {
-    let actual = next(fields)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(ParseError::UnexpectedField {
-            expected,
-            actual: actual.to_owned(),
-        })
+fn parse_header(h: &[u8; HEADER_BYTES]) -> Result<(u8, usize), ParseError> {
+    if h[..4] != MAGIC {
+        return Err(ParseError::InvalidMagic);
     }
-}
-
-fn parse<T: FromStr>(value: &str, name: &'static str) -> Result<T, ParseError> {
-    value.parse().map_err(|_| ParseError::InvalidNumber(name))
-}
-
-fn encode_text(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len() * 2);
-    for byte in value.as_bytes() {
-        use std::fmt::Write as _;
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    let version = u16::from_be_bytes([h[4], h[5]]);
+    if version != PROTOCOL_VERSION {
+        return Err(ParseError::UnsupportedVersion(version));
     }
-    encoded
-}
-
-fn decode_text(value: &str, max_bytes: usize) -> Result<String, ParseError> {
-    if value.is_empty() || value.len() & 1 == 1 {
-        return Err(ParseError::InvalidHex);
+    if h[7] != 0 {
+        return Err(ParseError::InvalidValue("header flags"));
     }
-    let byte_count = value.len() / 2;
-    if byte_count > max_bytes {
+    Ok((
+        h[6],
+        u32::from_be_bytes(h[8..12].try_into().unwrap()) as usize,
+    ))
+}
+fn u16v(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn u32v(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn u64v(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn u128v(out: &mut Vec<u8>, v: u128) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+fn string(out: &mut Vec<u8>, v: &str, max: usize) -> Result<(), ParseError> {
+    if v.len() > max {
         return Err(ParseError::TextTooLong);
     }
-    let bytes = (0..value.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| ParseError::InvalidHex)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    String::from_utf8(bytes).map_err(|_| ParseError::InvalidUtf8)
+    u16v(
+        out,
+        u16::try_from(v.len()).map_err(|_| ParseError::TextTooLong)?,
+    );
+    out.extend_from_slice(v.as_bytes());
+    Ok(())
 }
-
-fn encode_durations(durations: &[u64]) -> String {
-    durations
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+fn durations(out: &mut Vec<u8>, v: &[u64]) -> Result<(), ParseError> {
+    if v.is_empty() || v.len() > MAX_SUBSCRIPTION_CUES || v.contains(&0) {
+        return Err(ParseError::InvalidValue("cue durations"));
+    }
+    u16v(
+        out,
+        u16::try_from(v.len()).map_err(|_| ParseError::TooManyCues)?,
+    );
+    for n in v {
+        u64v(out, *n);
+    }
+    Ok(())
 }
-
-fn parse_durations(value: &str) -> Result<Vec<u64>, ParseError> {
-    if value.is_empty() {
-        return Err(ParseError::InvalidCueDurations);
-    }
-    let durations = value
-        .split(',')
-        .map(|duration| {
-            duration
-                .parse::<u64>()
-                .ok()
-                .filter(|duration| *duration > 0)
-                .ok_or(ParseError::InvalidCueDurations)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if durations.len() > MAX_SUBSCRIPTION_CUES {
-        return Err(ParseError::TooManyCues);
-    }
-    Ok(durations)
+struct Decoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
 }
-
-fn encode_debug_loop(debug_loop: Option<DebugLoopState>) -> String {
-    debug_loop.map_or_else(
-        || "-".to_owned(),
-        |value| {
-            format!(
-                "{},{},{}",
-                value.start.get(),
-                value.end.get(),
-                u8::from(value.events_enabled)
-            )
-        },
-    )
+impl<'a> Decoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(ParseError::InvalidLength)?;
+        let v = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(ParseError::InvalidLength)?;
+        self.offset = end;
+        Ok(v)
+    }
+    fn u8(&mut self) -> Result<u8, ParseError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, ParseError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> Result<u32, ParseError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, ParseError> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn u128(&mut self) -> Result<u128, ParseError> {
+        Ok(u128::from_be_bytes(self.take(16)?.try_into().unwrap()))
+    }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ParseError> {
+        Ok(self.take(N)?.try_into().unwrap())
+    }
+    fn string(&mut self, max: usize) -> Result<String, ParseError> {
+        let n = usize::from(self.u16()?);
+        if n > max {
+            return Err(ParseError::TextTooLong);
+        }
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| ParseError::InvalidUtf8)
+    }
+    fn durations(&mut self) -> Result<Vec<u64>, ParseError> {
+        let n = usize::from(self.u16()?);
+        if n == 0 {
+            return Err(ParseError::InvalidValue("cue durations"));
+        }
+        if n > MAX_SUBSCRIPTION_CUES {
+            return Err(ParseError::TooManyCues);
+        }
+        (0..n)
+            .map(|_| {
+                let v = self.u64()?;
+                if v == 0 {
+                    Err(ParseError::InvalidValue("cue duration"))
+                } else {
+                    Ok(v)
+                }
+            })
+            .collect()
+    }
+    fn finish(self) -> Result<(), ParseError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(ParseError::TrailingBytes)
+        }
+    }
 }
-
-fn parse_debug_loop(value: &str) -> Result<Option<DebugLoopState>, ParseError> {
-    if value == "-" {
-        return Ok(None);
-    }
-    let mut fields = value.split(',');
-    let start = parse(
-        fields.next().ok_or(ParseError::InvalidDebugLoop)?,
-        "loop start",
-    )?;
-    let end = parse(
-        fields.next().ok_or(ParseError::InvalidDebugLoop)?,
-        "loop end",
-    )?;
-    let events_enabled = match fields.next() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => return Err(ParseError::InvalidDebugLoop),
-    };
-    if fields.next().is_some() || start >= end {
-        return Err(ParseError::InvalidDebugLoop);
-    }
-    Ok(Some(DebugLoopState {
-        start: MediaPositionNs::new(start),
-        end: MediaPositionNs::new(end),
-        events_enabled,
-    }))
+fn invalid(e: ParseError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
-
-    fn release() -> Message {
-        Message::Release(ReleasePlan {
-            generation: 2,
-            operation: Operation::Goto,
-            media_position: MediaPositionNs::new(3_000),
-            release_at: ClockNs::new(5_000),
-        })
-    }
-
     fn session() -> MasterSession {
-        MasterSession::new(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+        MasterSession::new(1)
     }
-
+    fn snapshot() -> StateSnapshot {
+        StateSnapshot {
+            generation: 7,
+            program_id: "show".into(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
+            transport_state: TransportState::Playing,
+            operation: Operation::Start,
+            media_position: MediaPositionNs::new(3),
+            anchor_clock: ClockNs::new(2),
+            item_index: 0,
+            cue_id: "first".into(),
+            cue_occurrence: 0,
+            item_position: MediaPositionNs::new(3),
+            cue_duration: MediaPositionNs::new(10),
+            playlist_iteration: 0,
+            debug_loop: None,
+        }
+    }
     #[test]
-    fn messages_round_trip() {
-        for message in [
+    fn control_round_trip() {
+        let values = [
             Message::Subscribe(Subscription {
-                player_id: "wall left".to_owned(),
-                program_id: "museum show".to_owned(),
-                program_hash: ProgramHash::from_bytes([0xab; 32]),
-                software_version: "0.1.0-dev".to_owned(),
+                player_id: "left".into(),
+                program_id: "show".into(),
+                program_hash: ProgramHash::from_bytes([1; 32]),
+                software_version: "0.1".into(),
                 capabilities: Capabilities::current(),
-                state_port: 0,
-                cue_durations_ns: vec![1, 2, u64::MAX],
+                state_port: 46002,
+                cue_durations_ns: vec![10],
             }),
             Message::Subscribed {
                 session: session(),
                 generation: 7,
-                clock_port: 4_601,
-                master_cue_durations_ns: vec![1, 2, u64::MAX],
+                clock_port: 46001,
+                state_interval_ms: 100,
+                master_cue_durations_ns: vec![10],
             },
             Message::Ready,
-            release(),
+            Message::Release(ReleasePlan {
+                generation: 7,
+                operation: Operation::Start,
+                media_position: MediaPositionNs::new(0),
+                release_at: ClockNs::new(10),
+            }),
             Message::Prepared {
                 session: session(),
                 generation: 7,
             },
-            Message::Heartbeat {
+            Message::Keepalive {
                 session: session(),
-                sequence: 42,
-                master_clock: ClockNs::new(9_000),
-                state: StateSnapshot {
-                    generation: 7,
-                    program_id: "museum show".to_owned(),
-                    program_hash: ProgramHash::from_bytes([0xab; 32]),
-                    transport_state: TransportState::Playing,
-                    operation: Operation::Start,
-                    media_position: MediaPositionNs::new(3_000),
-                    anchor_clock: ClockNs::new(8_000),
-                    item_index: 2,
-                    cue_id: "main".to_owned(),
-                    cue_occurrence: 14,
-                    item_position: MediaPositionNs::new(400),
-                    cue_duration: MediaPositionNs::new(5_000),
-                    playlist_iteration: 4,
-                    debug_loop: Some(DebugLoopState {
-                        start: MediaPositionNs::new(100),
-                        end: MediaPositionNs::new(200),
-                        events_enabled: false,
-                    }),
-                },
+                sequence: 1,
             },
-            Message::Alive {
+            Message::KeepaliveAck {
                 session: session(),
-                sequence: 42,
+                sequence: 1,
             },
-            Message::Error("program mismatch".to_owned()),
-        ] {
-            assert_eq!(Message::decode(&message.encode()), Ok(message));
+            Message::Error("bad".into()),
+        ];
+        for value in values {
+            let mut bytes = Vec::new();
+            write_message(&mut bytes, &value).unwrap();
+            assert_eq!(read_message(&mut Cursor::new(bytes)).unwrap(), value);
         }
     }
-
     #[test]
-    fn rejects_malformed_session_and_heartbeat() {
-        assert_eq!(
-            Message::decode(
-                "SYNCPLAYER-LAB 6 HEARTBEAT not-a-session 1 2 3 4 5 PLAYING START 6 7 8 9 10 11 12 13 -"
-            ),
-            Err(ParseError::InvalidSession)
-        );
-        assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 6 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
-            Err(ParseError::TrailingFields)
-        );
-    }
-
-    #[test]
-    fn maximum_snapshot_heartbeat_remains_bounded() {
-        let message = Message::Heartbeat {
-            session: MasterSession::new(u128::MAX),
-            sequence: u64::MAX,
-            master_clock: ClockNs::new(u64::MAX),
-            state: StateSnapshot {
-                generation: u64::MAX,
-                program_id: "p".repeat(MAX_ID_BYTES),
-                program_hash: ProgramHash::from_bytes([0xff; 32]),
-                transport_state: TransportState::Playing,
-                operation: Operation::Resume,
-                media_position: MediaPositionNs::new(u64::MAX),
-                anchor_clock: ClockNs::new(u64::MAX),
-                item_index: u64::MAX,
-                cue_id: "c".repeat(MAX_ID_BYTES),
-                cue_occurrence: u64::MAX,
-                item_position: MediaPositionNs::new(u64::MAX),
-                cue_duration: MediaPositionNs::new(u64::MAX),
-                playlist_iteration: u64::MAX,
-                debug_loop: Some(DebugLoopState {
-                    start: MediaPositionNs::new(u64::MAX - 1),
-                    end: MediaPositionNs::new(u64::MAX),
-                    events_enabled: true,
-                }),
-            },
+    fn state_round_trip() {
+        let value = StateDatagram {
+            session: session(),
+            sequence: 4,
+            master_clock: ClockNs::new(9),
+            state: snapshot(),
         };
-        assert!(message.encode().len() <= MAX_LINE_BYTES);
+        let bytes = encode_state_datagram(&value).unwrap();
+        assert!(bytes.len() <= MAX_STATE_PACKET_BYTES);
+        assert_eq!(decode_state_datagram(&bytes), Ok(value));
     }
-
     #[test]
-    fn rejects_unknown_version_and_trailing_data() {
-        assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 99 READY"),
-            Err(ParseError::UnsupportedVersion(99))
-        );
-        assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 6 READY surprise"),
-            Err(ParseError::TrailingFields)
-        );
-    }
-
-    #[test]
-    fn bounded_reader_rejects_oversized_and_truncated_lines() {
-        let oversized = vec![b'x'; MAX_LINE_BYTES + 2];
-        assert!(matches!(
-            read_message(&mut Cursor::new(oversized)),
-            Err(ReadError::TooLong)
-        ));
-        assert!(matches!(
-            read_message(&mut Cursor::new(b"SYNCPLAYER-LAB 1 READY")),
-            Err(ReadError::Truncated)
-        ));
-    }
-
-    #[test]
-    fn release_must_be_new_and_in_the_future() {
-        let Message::Release(plan) = release() else {
-            unreachable!()
+    fn rejects_bad_packet() {
+        let value = StateDatagram {
+            session: session(),
+            sequence: 4,
+            master_clock: ClockNs::new(9),
+            state: snapshot(),
         };
-        assert!(plan.validate(ClockNs::new(4_000), Some(1)).is_ok());
-        assert!(plan.validate(ClockNs::new(4_000), Some(2)).is_ok());
-        assert!(matches!(
-            plan.validate(ClockNs::new(4_000), Some(3)),
-            Err(ParseError::StaleGeneration { .. })
-        ));
-        assert_eq!(
-            plan.validate(ClockNs::new(5_000), None),
-            Err(ParseError::ReleaseNotFuture)
-        );
-    }
+        let mut bytes = encode_state_datagram(&value).unwrap();
+        bytes[0] = 0;
+        assert_eq!(decode_state_datagram(&bytes), Err(ParseError::InvalidMagic));
 
-    #[test]
-    fn subscription_rejects_invalid_and_excessive_fields() {
-        let hash = ProgramHash::from_bytes([0; 32]);
-        let prefix = format!(
-            "SYNCPLAYER-LAB {PROTOCOL_VERSION} SUBSCRIBE 61 62 {hash} 63 0000000000000007 0 "
-        );
+        let mut bytes = encode_state_datagram(&value).unwrap();
+        bytes[4..6].copy_from_slice(&(PROTOCOL_VERSION + 1).to_be_bytes());
         assert_eq!(
-            Message::decode(&format!("{prefix}0")),
-            Err(ParseError::InvalidCueDurations)
+            decode_state_datagram(&bytes),
+            Err(ParseError::UnsupportedVersion(PROTOCOL_VERSION + 1))
         );
+
+        let mut bytes = encode_state_datagram(&value).unwrap();
+        bytes.pop();
         assert_eq!(
-            Message::decode(&format!("{prefix}1,not-a-duration")),
-            Err(ParseError::InvalidCueDurations)
-        );
-        let too_many = vec!["1"; MAX_SUBSCRIPTION_CUES + 1].join(",");
-        assert_eq!(
-            Message::decode(&format!("{prefix}{too_many}")),
-            Err(ParseError::TooManyCues)
+            decode_state_datagram(&bytes),
+            Err(ParseError::InvalidLength)
         );
     }
 }

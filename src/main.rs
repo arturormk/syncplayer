@@ -4,8 +4,7 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_net as gst_net;
 use gstreamer_pbutils as gst_pbutils;
-use std::io::Read;
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,11 +13,11 @@ use std::time::{Duration, Instant};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
 use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
-    Capabilities, DebugLoopState, MAX_LINE_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession, Message,
-    Operation, ReleasePlan, StateSnapshot, Subscription, TransportState, read_message,
-    write_message,
+    Capabilities, DebugLoopState, MAX_STATE_PACKET_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession,
+    Message, Operation, ReleasePlan, StateDatagram, StateSnapshot, Subscription, TransportState,
+    decode_state_datagram, encode_state_datagram, read_message, write_message,
 };
-use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, StateEndpoint};
+use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, Readiness, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
 use syncplayer::transport::{EosDecision, RuntimeState, TransportController};
 use syncplayer::validation::{DiagnosticLevel, GstMediaProbe, validate_program};
@@ -29,8 +28,6 @@ const PREROLL_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MASTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const LIVENESS_TIMEOUT: Duration = Duration::from_secs(8);
 const REJOIN_PREPARATION_TIMEOUT: Duration = Duration::from_secs(95);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 const DRIFT_WARN_THRESHOLD_NS: u128 = 100_000_000;
@@ -64,6 +61,18 @@ struct MasterArgs {
     /// TCP address for the experimental control connection.
     #[arg(long, default_value = "0.0.0.0:46000")]
     bind: SocketAddr,
+
+    /// UDP address used to send independent state snapshots.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    state_bind: SocketAddr,
+
+    /// Complete state snapshots sent per second (1-100).
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
+    state_rate_hz: u16,
+
+    /// Drop a participant after this many seconds without a control keepalive.
+    #[arg(long, default_value_t = 8.0, value_parser = positive_seconds)]
+    keepalive_timeout: f64,
 
     /// UDP port used by `GstNetTimeProvider`.
     #[arg(long, default_value_t = 46_001)]
@@ -100,6 +109,18 @@ struct SlaveArgs {
     /// Master's experimental TCP control address.
     #[arg(long)]
     master: SocketAddr,
+
+    /// UDP address on which to receive independent state snapshots.
+    #[arg(long, default_value = "0.0.0.0:0")]
+    state_bind: SocketAddr,
+
+    /// Seconds between reliable control-channel keepalives.
+    #[arg(long, default_value_t = 2.0, value_parser = positive_seconds)]
+    keepalive_interval: f64,
+
+    /// Seconds to wait for a keepalive acknowledgement before reconnecting.
+    #[arg(long, default_value_t = 8.0, value_parser = positive_seconds)]
+    keepalive_timeout: f64,
 }
 
 #[derive(Debug, Args)]
@@ -184,12 +205,18 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 
     let listener = TcpListener::bind(args.bind)
         .with_context(|| format!("failed to bind control socket {}", args.bind))?;
+    let state_socket = Arc::new(
+        UdpSocket::bind(args.state_bind)
+            .with_context(|| format!("failed to bind state socket {}", args.state_bind))?,
+    );
     let clock_port = provider
         .port()
         .try_into()
         .context("invalid provider port")?;
     let startup_delay = Duration::from_secs_f64(args.startup_delay);
     let release_delay = Duration::from_secs_f64(args.release_delay);
+    let state_interval = Duration::from_secs_f64(1.0 / f64::from(args.state_rate_hz));
+    let keepalive_timeout = Duration::from_secs_f64(args.keepalive_timeout);
     let session = new_master_session()?;
     let initial_plan = player.schedule_start(startup_delay)?;
     let mut transport = TransportController::new(
@@ -207,6 +234,8 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     if startup_delay.is_zero() {
         info!(
             control = %listener.local_addr()?,
+            state = %state_socket.local_addr()?,
+            state_rate_hz = args.state_rate_hz,
             clock_port,
             master_session = %session,
             transport_generation = generation,
@@ -215,6 +244,8 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     } else {
         info!(
             control = %listener.local_addr()?,
+            state = %state_socket.local_addr()?,
+            state_rate_hz = args.state_rate_hz,
             clock_port,
             master_session = %session,
             transport_generation = generation,
@@ -233,7 +264,11 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         transport: Arc::new(Mutex::new(transport)),
         compatibility,
         registry: ParticipantRegistry::new(),
+        state_socket,
+        state_interval,
+        keepalive_timeout,
     });
+    broadcast_state(server.clone());
     serve_slaves(listener, server.clone());
     player.monitor(initial_plan, Some(&server.transport))
 }
@@ -241,7 +276,13 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 fn run_slave(args: &SlaveArgs) -> Result<()> {
     let program = load_runtime_program(&args.playback)?;
     let sequence = PlaybackSequence::prepare(&program)?;
-    let subscription = create_subscription(&program, &sequence)?;
+    let state_socket = UdpSocket::bind(args.state_bind)
+        .with_context(|| format!("failed to bind state receive socket {}", args.state_bind))?;
+    let state_port = state_socket.local_addr()?.port();
+    if state_port == 0 {
+        bail!("state receive socket did not obtain a usable UDP port");
+    }
+    let subscription = create_subscription(&program, &sequence, state_port)?;
     let (mut stream, clock, authority) = wait_for_master(args.master, &subscription);
     let player = Arc::new(Player::new(&args.playback, sequence, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock, authority)?;
@@ -252,13 +293,25 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
         "accepted shared-clock release"
     );
 
-    monitor_master(stream, args.master, authority, player.clone(), subscription);
+    monitor_master(
+        stream,
+        state_socket,
+        args.master,
+        authority,
+        player.clone(),
+        subscription,
+        KeepaliveConfig {
+            interval: Duration::from_secs_f64(args.keepalive_interval),
+            timeout: Duration::from_secs_f64(args.keepalive_timeout),
+        },
+    );
     player.monitor(plan, None)
 }
 
 fn create_subscription(
     program: &ResolvedProgram,
     sequence: &PlaybackSequence,
+    state_port: u16,
 ) -> Result<Subscription> {
     if sequence.cue_durations_ns.len() > MAX_SUBSCRIPTION_CUES {
         bail!(
@@ -272,7 +325,7 @@ fn create_subscription(
         program_hash: program.hash,
         software_version: env!("CARGO_PKG_VERSION").to_owned(),
         capabilities: Capabilities::current(),
-        state_port: 0,
+        state_port,
         cue_durations_ns: sequence.cue_durations_ns.clone(),
     })
 }
@@ -404,6 +457,9 @@ struct SlaveServer {
     transport: Arc<Mutex<TransportController>>,
     compatibility: ProgramCompatibility,
     registry: Arc<ParticipantRegistry>,
+    state_socket: Arc<UdpSocket>,
+    state_interval: Duration,
+    keepalive_timeout: Duration,
 }
 
 impl SlaveServer {
@@ -435,6 +491,12 @@ struct Authority {
     generation: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct KeepaliveConfig {
+    interval: Duration,
+    timeout: Duration,
+}
+
 fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) -> Result<()> {
     configure_stream(&stream)?;
     let authority = server.authority()?;
@@ -443,7 +505,7 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
         Message::Ready => {
             lease.mark_clock_synchronized()?;
             info!(player = %subscription.player_id, %peer, "Slave clock is synchronized and ready to rejoin");
-            log_registry(&server.registry)?;
+            log_registry(&server.registry, server.keepalive_timeout)?;
         }
         Message::Error(message) => bail!("Slave rejected preparation: {message}"),
         other => bail!("expected READY from Slave, received {other:?}"),
@@ -473,7 +535,7 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
                 transport_generation = generation,
                 "Slave prepared release; starting liveness monitoring"
             );
-            log_registry(&server.registry)?;
+            log_registry(&server.registry, server.keepalive_timeout)?;
         }
         Message::Prepared {
             session,
@@ -487,7 +549,7 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
         other => bail!("expected PREPARED from Slave, received {other:?}"),
     }
 
-    let result = run_master_heartbeats(&mut stream, peer, server, authority, &lease);
+    let result = run_master_keepalives(&mut stream, peer, server, authority, &lease);
     info!(player = %lease.player_id(), %peer, "Slave participant disconnected");
     result
 }
@@ -518,18 +580,19 @@ fn accept_subscription(
             return Err(error);
         }
     };
-    let lease =
-        match server
-            .registry
-            .register(&subscription, peer, Instant::now(), LIVENESS_TIMEOUT)
-        {
-            Ok(lease) => lease,
-            Err(error) => {
-                let error = anyhow!(error);
-                reject_connection(stream, &error);
-                return Err(error);
-            }
-        };
+    let lease = match server.registry.register(
+        &subscription,
+        peer,
+        Instant::now(),
+        server.keepalive_timeout,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let error = anyhow!(error);
+            reject_connection(stream, &error);
+            return Err(error);
+        }
+    };
     if subscription.software_version != env!("CARGO_PKG_VERSION") {
         warn!(
             player = %subscription.player_id,
@@ -559,13 +622,15 @@ fn accept_subscription(
         state_port = subscription.state_port,
         "Slave subscription accepted"
     );
-    log_registry(&server.registry)?;
+    log_registry(&server.registry, server.keepalive_timeout)?;
     write_message(
         stream,
         &Message::Subscribed {
             session: authority.session,
             generation: authority.generation,
             clock_port: server.clock_port,
+            state_interval_ms: u32::try_from(server.state_interval.as_millis())
+                .context("state interval does not fit the protocol")?,
             master_cue_durations_ns: server.compatibility.cue_durations_ns.clone(),
         },
     )?;
@@ -633,6 +698,9 @@ fn validate_subscription(
             Capabilities::REQUIRED
         );
     }
+    if subscription.state_port == 0 {
+        bail!("Slave must provide a non-zero UDP state receive port");
+    }
     if subscription.cue_durations_ns.len() != compatibility.cue_durations_ns.len() {
         bail!(
             "cue-duration count mismatch: Master {}, Slave {}",
@@ -674,8 +742,8 @@ fn reject_connection(stream: &mut TcpStream, error: &anyhow::Error) {
     let _ = write_message(stream, &Message::Error(format!("{error:#}")));
 }
 
-fn log_registry(registry: &ParticipantRegistry) -> Result<()> {
-    for participant in registry.snapshot(Instant::now(), LIVENESS_TIMEOUT)? {
+fn log_registry(registry: &ParticipantRegistry, stale_after: Duration) -> Result<()> {
+    for participant in registry.snapshot(Instant::now(), stale_after)? {
         let state_endpoint = match participant.state_endpoint {
             StateEndpoint::ControlConnection => "control".to_owned(),
             StateEndpoint::Udp(endpoint) => endpoint.to_string(),
@@ -696,168 +764,189 @@ fn log_registry(registry: &ParticipantRegistry) -> Result<()> {
     Ok(())
 }
 
-fn run_master_heartbeats(
+fn broadcast_state(server: Arc<SlaveServer>) {
+    thread::spawn(move || {
+        let mut generation = None;
+        let mut sequence = 0_u64;
+        loop {
+            let started = Instant::now();
+            let result = (|| -> Result<()> {
+                let master_clock = ClockNs::new(server.clock.time().nseconds());
+                let runtime = server
+                    .transport
+                    .lock()
+                    .map_err(|_| anyhow!("transport lock poisoned"))?
+                    .snapshot(master_clock);
+                if generation != Some(runtime.generation) {
+                    generation = Some(runtime.generation);
+                    sequence = 0;
+                }
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("state sequence overflow"))?;
+                let packet = StateDatagram {
+                    session: server.authority()?.session,
+                    sequence,
+                    master_clock,
+                    state: server.player.authoritative_snapshot(runtime)?,
+                };
+                let bytes =
+                    encode_state_datagram(&packet).context("failed to encode state snapshot")?;
+                for participant in server
+                    .registry
+                    .snapshot(Instant::now(), server.keepalive_timeout)?
+                {
+                    if participant.readiness != Readiness::Ready {
+                        continue;
+                    }
+                    let StateEndpoint::Udp(endpoint) = participant.state_endpoint else {
+                        continue;
+                    };
+                    if let Err(error) = server.state_socket.send_to(&bytes, endpoint) {
+                        warn!(player = %participant.player_id, %endpoint, %error, "failed to send state snapshot");
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                error!(%error, "state broadcaster iteration failed");
+            }
+            thread::sleep(server.state_interval.saturating_sub(started.elapsed()));
+        }
+    });
+}
+
+fn run_master_keepalives(
     stream: &mut TcpStream,
     peer: SocketAddr,
     server: &SlaveServer,
     authority: Authority,
     lease: &ParticipantLease,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(LIVENESS_TIMEOUT))?;
-    stream.set_write_timeout(Some(LIVENESS_TIMEOUT))?;
-    let mut sequence = 0_u64;
+    stream.set_read_timeout(Some(server.keepalive_timeout))?;
+    stream.set_write_timeout(Some(server.keepalive_timeout))?;
+    let mut last_sequence = None;
     loop {
-        sequence = sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("heartbeat sequence overflow"))?;
-        let sent_at = Instant::now();
-        let master_clock = ClockNs::new(server.clock.time().nseconds());
-        let runtime = server
-            .transport
-            .lock()
-            .map_err(|_| anyhow!("transport lock poisoned"))?
-            .snapshot(master_clock);
-        let state = server.player.authoritative_snapshot(runtime)?;
-        write_message(
-            stream,
-            &Message::Heartbeat {
-                session: authority.session,
-                sequence,
-                master_clock,
-                state,
-            },
-        )
-        .context("failed to send heartbeat")?;
-        match read_control_message_until(stream, sent_at + LIVENESS_TIMEOUT)
-            .context("failed to read heartbeat reply")?
-        {
-            Message::Alive {
-                session,
-                sequence: reply_sequence,
-            } if session == authority.session && reply_sequence == sequence => {
+        match read_message(stream).context("failed to read Slave keepalive")? {
+            Message::Keepalive { session, sequence }
+                if session == authority.session
+                    && last_sequence.is_none_or(|old| sequence > old) =>
+            {
                 lease.mark_seen()?;
+                write_message(stream, &Message::KeepaliveAck { session, sequence })
+                    .context("failed to acknowledge Slave keepalive")?;
+                last_sequence = Some(sequence);
+                debug!(%peer, master_session = %session, keepalive_sequence = sequence,
+                    "Slave keepalive acknowledged");
             }
-            Message::Alive {
-                session,
-                sequence: reply_sequence,
-            } => bail!(
-                "invalid heartbeat reply: session {session}, sequence {reply_sequence}; expected session {}, sequence {sequence}",
-                authority.session
-            ),
-            Message::Error(message) => bail!("Slave rejected heartbeat: {message}"),
-            other => bail!("expected ALIVE from Slave, received {other:?}"),
+            Message::Keepalive { session, sequence } => {
+                bail!("invalid keepalive: session {session}, sequence {sequence}")
+            }
+            Message::Error(message) => bail!("Slave rejected control session: {message}"),
+            other => bail!("expected KEEPALIVE from Slave, received {other:?}"),
         }
-        let round_trip = sent_at.elapsed();
-        debug!(
-            %peer,
-            master_session = %authority.session,
-            heartbeat_sequence = sequence,
-            round_trip_ms = round_trip.as_millis(),
-            "Slave heartbeat acknowledged"
-        );
-        thread::sleep(HEARTBEAT_INTERVAL.saturating_sub(round_trip));
     }
 }
 
 fn monitor_master_session(
     stream: &mut TcpStream,
+    state_socket: &UdpSocket,
     master: SocketAddr,
     authority: Authority,
     player: &Player,
+    keepalive_interval: Duration,
+    keepalive_timeout: Duration,
 ) -> Result<()> {
-    let mut last_heartbeat_at = Instant::now();
-    let mut last_sequence = None;
+    stream.set_read_timeout(Some(keepalive_timeout))?;
+    stream.set_write_timeout(Some(keepalive_timeout))?;
+    let mut keepalive_sequence = 0_u64;
+    let mut next_keepalive = Instant::now();
+    let mut last_state_sequence = None;
+    let mut bytes = [0_u8; MAX_STATE_PACKET_BYTES];
     loop {
-        let age = last_heartbeat_at.elapsed();
-        let remaining = LIVENESS_TIMEOUT
-            .checked_sub(age)
-            .ok_or_else(|| anyhow!("heartbeat timeout after {} ms", age.as_millis()))?;
-        stream.set_read_timeout(Some(remaining))?;
-        let message = read_control_message_until(stream, last_heartbeat_at + LIVENESS_TIMEOUT)
-            .context("Master heartbeat unavailable before liveness deadline")?;
-        let received_at = Instant::now();
-        let (sequence, master_clock, state) =
-            validate_heartbeat(&message, authority, last_sequence)?;
-        player.accept_authoritative_snapshot(&state, authority)?;
-        write_message(
-            stream,
-            &Message::Alive {
-                session: authority.session,
-                sequence,
-            },
-        )
-        .context("failed to acknowledge Master heartbeat")?;
-        last_heartbeat_at = received_at;
-        last_sequence = Some(sequence);
-        debug!(
-            %master,
-            master_session = %authority.session,
-            transport_generation = authority.generation,
-            heartbeat_sequence = sequence,
-            master_clock_ns = master_clock.get(),
-            snapshot_anchor_clock_ns = state.anchor_clock.get(),
-            snapshot_position_ns = state.media_position.get(),
-            snapshot_item_index = state.item_index,
-            snapshot_item_position_ns = state.item_position.get(),
-            snapshot_playlist_iteration = state.playlist_iteration,
-            last_heartbeat_age_ms = last_heartbeat_at.elapsed().as_millis(),
-            "Master heartbeat received"
-        );
-    }
-}
-
-fn validate_heartbeat(
-    message: &Message,
-    authority: Authority,
-    last_sequence: Option<u64>,
-) -> Result<(u64, ClockNs, StateSnapshot)> {
-    let Message::Heartbeat {
-        session,
-        sequence,
-        master_clock,
-        state,
-    } = message
-    else {
-        bail!("expected HEARTBEAT from Master, received {message:?}");
-    };
-    if *session != authority.session {
-        bail!(
-            "heartbeat session {session} does not match authority {}",
-            authority.session
-        );
-    }
-    if last_sequence.is_some_and(|last| *sequence <= last) {
-        bail!("stale heartbeat sequence {sequence}; last accepted was {last_sequence:?}");
-    }
-    if state.transport_state == TransportState::Playing && state.anchor_clock > *master_clock {
-        bail!("playing snapshot anchor is later than its heartbeat clock");
-    }
-    Ok((*sequence, *master_clock, state.clone()))
-}
-
-fn read_control_message_until(stream: &mut TcpStream, deadline: Instant) -> Result<Message> {
-    let mut bytes = Vec::with_capacity(64);
-    let mut byte = [0_u8; 1];
-    loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| anyhow!("control-message deadline elapsed"))?;
-        stream.set_read_timeout(Some(remaining))?;
-        match stream.read(&mut byte) {
-            Ok(0) if bytes.is_empty() => bail!("control connection reached EOF"),
-            Ok(0) => bail!("control connection ended during a message"),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => {
-                if bytes.len() == MAX_LINE_BYTES {
-                    bail!("control message exceeds {MAX_LINE_BYTES} bytes");
-                }
-                bytes.push(byte[0]);
+        if Instant::now() >= next_keepalive {
+            keepalive_sequence = keepalive_sequence
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("keepalive sequence overflow"))?;
+            let sent_at = Instant::now();
+            write_message(
+                stream,
+                &Message::Keepalive {
+                    session: authority.session,
+                    sequence: keepalive_sequence,
+                },
+            )
+            .context("failed to send control keepalive")?;
+            match read_message(stream).context("keepalive acknowledgement unavailable")? {
+                Message::KeepaliveAck { session, sequence }
+                    if session == authority.session && sequence == keepalive_sequence => {}
+                Message::Error(message) => bail!("Master rejected keepalive: {message}"),
+                other => bail!("invalid keepalive acknowledgement: {other:?}"),
             }
-            Err(error) => return Err(error).context("failed to read control message"),
+            debug!(%master, keepalive_sequence, round_trip_ms = sent_at.elapsed().as_millis(),
+                "Master control keepalive acknowledged");
+            next_keepalive = Instant::now() + keepalive_interval;
+        }
+
+        let wait = next_keepalive
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(250))
+            .max(Duration::from_millis(1));
+        state_socket.set_read_timeout(Some(wait))?;
+        match state_socket.recv_from(&mut bytes) {
+            Ok((length, source)) if source.ip() == master.ip() => {
+                match decode_state_datagram(&bytes[..length]) {
+                    Ok(packet) => {
+                        if validate_state_datagram(&packet, authority, last_state_sequence)? {
+                            player.accept_authoritative_snapshot(&packet.state, authority)?;
+                            last_state_sequence = Some(packet.sequence);
+                            debug!(%master, state_sequence = packet.sequence,
+                            master_clock_ns = packet.master_clock.get(),
+                            snapshot_position_ns = packet.state.media_position.get(),
+                            "authoritative state snapshot accepted");
+                        }
+                    }
+                    Err(error) => warn!(%source, %error, "discarded malformed state datagram"),
+                }
+            }
+            Ok((_length, source)) => debug!(%source, "ignored state datagram from unexpected host"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("failed to receive state datagram"),
         }
     }
-    let line = std::str::from_utf8(&bytes).context("control message is not UTF-8")?;
-    Message::decode(line.trim_end_matches('\r')).context("malformed control message")
+}
+
+fn validate_state_datagram(
+    packet: &StateDatagram,
+    authority: Authority,
+    last_sequence: Option<u64>,
+) -> Result<bool> {
+    if packet.session != authority.session {
+        return Ok(false);
+    }
+    if packet.state.generation < authority.generation {
+        return Ok(false);
+    }
+    if packet.state.generation > authority.generation {
+        bail!(
+            "state snapshot introduced generation {}; prepared rejoin required from generation {}",
+            packet.state.generation,
+            authority.generation
+        );
+    }
+    if last_sequence.is_some_and(|last| packet.sequence <= last) {
+        return Ok(false);
+    }
+    if packet.state.transport_state == TransportState::Playing
+        && packet.state.anchor_clock > packet.master_clock
+    {
+        bail!("playing snapshot anchor is later than its packet clock");
+    }
+    Ok(true)
 }
 
 fn connect_to_master(
@@ -875,6 +964,7 @@ fn connect_to_master(
                 session,
                 generation,
                 clock_port,
+                state_interval_ms,
                 master_cue_durations_ns,
             } => (
                 clock_port,
@@ -882,7 +972,10 @@ fn connect_to_master(
                     session,
                     generation,
                 },
-                master_cue_durations_ns,
+                {
+                    debug!(state_interval_ms, "Master state snapshot cadence accepted");
+                    master_cue_durations_ns
+                },
             ),
             Message::Error(message) => bail!("Master rejected subscription: {message}"),
             other => bail!("expected SUBSCRIBED from Master, received {other:?}"),
@@ -970,16 +1063,26 @@ fn report_prepared(stream: &mut TcpStream, authority: Authority) -> Result<()> {
 
 fn monitor_master(
     mut stream: TcpStream,
+    state_socket: UdpSocket,
     master: SocketAddr,
     mut authority: Authority,
     player: Arc<Player>,
     subscription: Subscription,
+    keepalive: KeepaliveConfig,
 ) {
     thread::spawn(move || {
         loop {
-            let error = monitor_master_session(&mut stream, master, authority, &player)
-                .err()
-                .unwrap_or_else(|| anyhow!("Master heartbeat monitor stopped"));
+            let error = monitor_master_session(
+                &mut stream,
+                &state_socket,
+                master,
+                authority,
+                &player,
+                keepalive.interval,
+                keepalive.timeout,
+            )
+            .err()
+            .unwrap_or_else(|| anyhow!("Master protocol monitor stopped"));
             player.set_clock_health(false);
             if let Err(shutdown_error) = stream.shutdown(Shutdown::Both) {
                 debug!(%master, %shutdown_error, "old Master connection was already closed");
@@ -2402,17 +2505,17 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         Authority, Cli, ClockNs, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction, DriftPolicy,
-        DurationMismatchPolicy, MasterSession, MediaItem, MediaPositionNs, Message, Operation,
+        DurationMismatchPolicy, MasterSession, MediaItem, MediaPositionNs, Operation,
         PlaybackSequence, ProgramCompatibility, StateSnapshot, Timeline, TransportState,
-        can_join_startup, non_negative_seconds, recovery_attempt_is_active, validate_heartbeat,
-        validate_snapshot_generation, validate_subscription,
+        can_join_startup, non_negative_seconds, recovery_attempt_is_active,
+        validate_snapshot_generation, validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
     use syncplayer::program::ProgramHash;
-    use syncplayer::protocol::{Capabilities, Subscription};
+    use syncplayer::protocol::{Capabilities, StateDatagram, Subscription};
 
     fn authority() -> Authority {
         Authority {
@@ -2421,8 +2524,8 @@ mod tests {
         }
     }
 
-    fn heartbeat(session: MasterSession, sequence: u64) -> Message {
-        Message::Heartbeat {
+    fn state_packet(session: MasterSession, sequence: u64) -> StateDatagram {
+        StateDatagram {
             session,
             sequence,
             master_clock: ClockNs::new(123),
@@ -2467,7 +2570,7 @@ mod tests {
             program_hash: ProgramHash::from_bytes([1; 32]),
             software_version: "0.1.0".to_owned(),
             capabilities: Capabilities::current(),
-            state_port: 0,
+            state_port: 46_002,
             cue_durations_ns: vec![1_050, 2_000],
         }
     }
@@ -2483,6 +2586,38 @@ mod tests {
     #[test]
     fn command_line_supports_validate_and_rejects_prototype_inputs() {
         assert!(Cli::try_parse_from(["syncplayer", "validate", "show.toml"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "syncplayer",
+                "master",
+                "show.toml",
+                "--state-bind",
+                "127.0.0.1:47002",
+                "--state-rate-hz",
+                "20",
+                "--keepalive-timeout",
+                "12",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "syncplayer",
+                "slave",
+                "show.toml",
+                "--master",
+                "127.0.0.1:46000",
+                "--state-bind",
+                "127.0.0.1:47003",
+                "--keepalive-interval",
+                "3",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["syncplayer", "master", "show.toml", "--state-rate-hz", "0",])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["syncplayer", "master", "--media", "a.mp4"]).is_err());
         assert!(Cli::try_parse_from(["syncplayer", "master", "show.toml", "--loop"]).is_err());
     }
@@ -2534,14 +2669,26 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_validation_rejects_wrong_session_and_stale_sequence() {
+    fn state_validation_rejects_wrong_session_and_stale_sequence() {
         let authority = authority();
-        assert!(validate_heartbeat(&heartbeat(authority.session, 2), authority, Some(1)).is_ok());
-        assert!(validate_heartbeat(&heartbeat(authority.session, 1), authority, Some(1)).is_err());
         assert!(
-            validate_heartbeat(&heartbeat(MasterSession::new(2), 2), authority, Some(1)).is_err()
+            validate_state_datagram(&state_packet(authority.session, 2), authority, Some(1))
+                .unwrap()
         );
-        assert!(validate_heartbeat(&Message::Ready, authority, None).is_err());
+        assert!(
+            !validate_state_datagram(&state_packet(authority.session, 1), authority, Some(1))
+                .unwrap()
+        );
+        assert!(
+            !validate_state_datagram(&state_packet(MasterSession::new(2), 2), authority, Some(1))
+                .unwrap()
+        );
+        let mut old_generation = state_packet(authority.session, 3);
+        old_generation.state.generation = authority.generation - 1;
+        assert!(!validate_state_datagram(&old_generation, authority, None).unwrap());
+        let mut future_generation = state_packet(authority.session, 3);
+        future_generation.state.generation = authority.generation + 1;
+        assert!(validate_state_datagram(&future_generation, authority, None).is_err());
     }
 
     #[test]
@@ -2555,13 +2702,13 @@ mod tests {
     #[test]
     fn playing_snapshot_anchor_cannot_be_in_the_future() {
         let authority = authority();
-        let message = Message::Heartbeat {
+        let message = StateDatagram {
             session: authority.session,
             sequence: 1,
             master_clock: ClockNs::new(99),
             state: snapshot(authority.generation),
         };
-        assert!(validate_heartbeat(&message, authority, None).is_err());
+        assert!(validate_state_datagram(&message, authority, None).is_err());
     }
 
     #[test]

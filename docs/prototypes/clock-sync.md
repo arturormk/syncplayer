@@ -14,7 +14,7 @@ pipeline, receives the Master's projected media position at a future absolute cl
 acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
 interrupting existing playback.
 
-The bounded, newline-delimited protocol is currently version 6. Before clock calibration, a Slave
+The bounded binary protocol is currently version 7. Before clock calibration, a Slave
 subscribes with its player identity, program identity and hash, software version, capabilities,
 state endpoint, and probed cue durations. The Master rejects incompatible or duplicate active
 participants and returns its authoritative cue durations on success. A Master session UUID
@@ -24,10 +24,10 @@ have the same protocol version.
 
 ## Runtime recovery behavior
 
-- The Master sends a heartbeat to each Slave every two seconds. Each heartbeat carries a complete
-  authoritative state snapshot and requires a matching acknowledgement.
-- The Slave measures liveness with its local monotonic clock. Eight seconds without a complete,
-  valid heartbeat closes the old socket even if TCP still reports it as established.
+- The Master sends complete authoritative UDP state snapshots to each registered Slave at 10 Hz by
+  default. Loss, duplication, and reordering are handled by complete snapshots and sequence checks.
+- Each Slave sends reliable TCP keepalives at a configurable cadence. A missing acknowledgement
+  closes the old control socket even if TCP still reports it as established.
 - Playback free-runs during the outage. Reconnection retries once per second, creates a new network
   clock, calibrates it, and uses the normal prepared pause/seek/future-release path.
 - Snapshots contain session context, program identity/hash, transport generation and state,
@@ -80,7 +80,8 @@ of the test matrix and generated binaries do not belong in the repository.
 4. Repeat ten cold starts and record the largest observed frame separation.
 5. Run continuously for sixty minutes and inspect the initial and final numbered frames together.
 6. Disconnect the Master or its network after release and verify that every Slave detects missing
-   heartbeats within eight seconds and continues. Bring the Master back and verify that Slaves
+   keepalive acknowledgements within eight seconds and continues. Bring the Master back and verify
+   that Slaves
    create a new network clock, pause, seek, and rejoin its timeline once.
 7. Repeat with several Slaves, removing and restarting one at a time, and verify that neither the
    Master nor the other Slaves are interrupted.
@@ -108,7 +109,7 @@ of the test matrix and generated binaries do not belong in the repository.
 - A Slave with a mismatched program identity or hash, missing capability, colliding player ID, or
   duplicate active player ID is rejected before clock calibration.
 - Cue-duration differences obey the configured tolerance and warn/reject policy.
-- Loss of application heartbeat is detected within eight seconds and does not immediately stop or
+- Loss of application control keepalive is detected within eight seconds and does not immediately stop or
   blank Slave playback.
 - A late or restarted Slave joins without pausing the Master or other Slaves.
 - Slaves free-run through Master loss, close the stale connection, replace the network clock during

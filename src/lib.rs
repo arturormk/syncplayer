@@ -1,7 +1,5 @@
-//! Reusable pieces of the Syncplayer clock experiment.
-//!
-//! This is deliberately not the eventual product protocol. The types make
-//! clock-domain mistakes and malformed laboratory control messages explicit.
+//! Reusable configuration, transport, playback-timeline, and production
+//! protocol pieces for Syncplayer.
 
 pub mod playlist;
 pub mod program;

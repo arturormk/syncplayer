@@ -59,7 +59,7 @@ Implement:
 - [x] Defined behavior for local duration differences and early/late EOS.
 - [x] Recovery when the Master pipeline reports CLOCK_LOST.
 
-The version 6 snapshot carries complete program/cue transport identity. `TransportController`
+The version 7 snapshot carries complete program/cue transport identity. `TransportController`
 projects cue boundaries and playlist wraps from the exported Master clock, while `playbin3` prepares
 the known next local URI. Cue duration mismatches are rejected by default (or explicitly warned),
 local Slave EOS is held and diagnosed, and Master clock loss re-pins the exported clock before
@@ -67,18 +67,24 @@ resuming. Physical transition limits still require the P2 validation matrix belo
 
 ### P0 — Turn the networking prototype into the specified state protocol
 
+Status: implemented.
+
 Preserve the working shared-clock/reconnection mechanism, but separate its responsibilities.
 
 Implement:
 
-- Reliable control channel for subscription, preparation, readiness, and discontinuous operations.
-- Independent complete state snapshots, normally unicast, at an experimentally selected rate around the blueprint’s suggested 5–20 Hz.
-- Packet ordering and stale/duplicate rejection within a generation.
-- Bounded, strongly specified production encoding rather than newline text.
-- Configurable control/state ports and keepalive intervals.
-- Continue free-running when only state/control traffic is lost.
+- [x] Reliable control channel for subscription, preparation, readiness, and discontinuous operations.
+- [x] Independent complete state snapshots, normally unicast, at an experimentally selected rate around the blueprint’s suggested 5–20 Hz.
+- [x] Packet ordering and stale/duplicate rejection within a generation.
+- [x] Bounded, strongly specified production encoding rather than newline text.
+- [x] Configurable control/state ports and keepalive intervals.
+- [x] Continue free-running when only state/control traffic is lost.
 
-Currently complete snapshots are carried in acknowledged TCP heartbeats every two seconds (main.rs (src/main.rs:357)). That proves the state model but does not yet meet the blueprint/ADR separation between reliable control and freshness-oriented state traffic.
+Protocol version 7 uses bounded binary framing for reliable TCP control and independent complete
+binary UDP state snapshots. The Master fans snapshots out to registered unicast endpoints at 10 Hz
+by default; Slaves reject wrong-session, stale-generation, duplicate, and reordered packets. Slaves
+originate configurable control keepalives, registry expiry is configurable, and loss of either
+traffic class leaves playback free-running. See `docs/state-protocol.md` for the wire contract.
 
 ### P1 — Complete the local playback/output feature set
 
