@@ -1562,7 +1562,7 @@ struct Player {
     global_mute: bool,
     global_gain_db: f64,
     sequence: PlaybackSequence,
-    events: Mutex<EventRuntime>,
+    events: Option<Mutex<EventRuntime>>,
     event_projection: Mutex<Option<EventProjection>>,
     events_suppressed_until: Mutex<Option<ClockNs>>,
     cursor: Arc<Mutex<PlaylistCursor>>,
@@ -1672,6 +1672,16 @@ fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<b
             Err(anyhow!(error)).with_context(|| format!("failed to wait for {description}"))
         }
     }
+}
+
+fn make_event_runtime(sequence: &PlaybackSequence) -> Result<Option<Mutex<EventRuntime>>> {
+    if sequence.event_cues.iter().all(|cue| cue.events.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(Mutex::new(EventRuntime::new(
+        sequence.player_id.clone(),
+        sequence.event_cues.clone(),
+    )?)))
 }
 
 impl Player {
@@ -1888,10 +1898,7 @@ impl Player {
             playlist = sequence.from_playlist,
             "media sequence prerolled"
         );
-        let events = Mutex::new(EventRuntime::new(
-            sequence.player_id.clone(),
-            sequence.event_cues.clone(),
-        )?);
+        let events = make_event_runtime(&sequence)?;
         Ok(Self {
             pipeline,
             video_source,
@@ -2029,10 +2036,7 @@ impl Player {
             playlist = sequence.from_playlist,
             "embedded-media sequence prerolled"
         );
-        let events = Mutex::new(EventRuntime::new(
-            sequence.player_id.clone(),
-            sequence.event_cues.clone(),
-        )?);
+        let events = make_event_runtime(&sequence)?;
         Ok(Self {
             pipeline,
             video_source: element.clone(),
@@ -2115,14 +2119,16 @@ impl Player {
         recovery_attempt: u64,
         update_authority: bool,
     ) -> Result<()> {
-        self.events
-            .lock()
-            .map_err(|_| anyhow!("event runtime lock poisoned"))?
-            .mark_discontinuity();
-        *self
-            .events_suppressed_until
-            .lock()
-            .map_err(|_| anyhow!("event suppression lock poisoned"))? = Some(plan.release_at);
+        if let Some(events) = &self.events {
+            events
+                .lock()
+                .map_err(|_| anyhow!("event runtime lock poisoned"))?
+                .mark_discontinuity();
+            *self
+                .events_suppressed_until
+                .lock()
+                .map_err(|_| anyhow!("event suppression lock poisoned"))? = Some(plan.release_at);
+        }
         self.cancel_scheduled_release()?;
         let item_position = self.sequence.locate(plan.media_position.get())?;
         debug!(
@@ -2502,6 +2508,9 @@ impl Player {
     }
 
     fn update_event_projection(&self, projection: EventProjection) -> Result<()> {
+        if self.events.is_none() {
+            return Ok(());
+        }
         *self
             .event_projection
             .lock()
@@ -2509,7 +2518,11 @@ impl Player {
         self.tick_events()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tick_events(&self) -> Result<()> {
+        let Some(events) = &self.events else {
+            return Ok(());
+        };
         let Some(projection) = *self
             .event_projection
             .lock()
@@ -2523,7 +2536,7 @@ impl Player {
             .lock()
             .map_err(|_| anyhow!("event suppression lock poisoned"))?;
         if suppressed_until.is_some_and(|deadline| now < deadline) {
-            self.events
+            events
                 .lock()
                 .map_err(|_| anyhow!("event runtime lock poisoned"))?
                 .mark_discontinuity();
@@ -2592,7 +2605,7 @@ impl Player {
                         .saturating_add(ordinal.saturating_sub(anchor_ordinal)),
                 )
             };
-        self.events
+        events
             .lock()
             .map_err(|_| anyhow!("event runtime lock poisoned"))?
             .observe(EventObservation {
@@ -3719,6 +3732,11 @@ mod tests {
         assert_eq!(
             sequence(false).position_error(MediaPositionNs::new(11), MediaPositionNs::new(9)),
             2
+        );
+        assert!(
+            crate::make_event_runtime(&sequence(false))
+                .unwrap()
+                .is_none()
         );
         let looping = sequence(true);
         assert_eq!(
