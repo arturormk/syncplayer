@@ -1427,16 +1427,6 @@ impl PlaybackSequence {
             _ => actual - expected,
         }
     }
-
-    fn unique_item_for_uri(&self, uri: &str) -> Option<usize> {
-        let mut matches = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| (item.uri == uri).then_some(index));
-        let index = matches.next()?;
-        matches.next().is_none().then_some(index)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2298,9 +2288,19 @@ impl Player {
         master_transport: Option<&Arc<Mutex<TransportController>>>,
     ) -> Result<bool> {
         if self.role == PlayerRole::Slave {
-            let current_uri = self.video_source.property::<Option<String>>("current-uri");
+            let current_item = self
+                .cursor
+                .lock()
+                .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+                .current();
+            let current_media = self
+                .sequence
+                .items
+                .get(current_item)
+                .map(|item| item.path.display().to_string());
             warn!(
-                ?current_uri,
+                current_item,
+                ?current_media,
                 "Slave reached local EOS; holding the current logical cue until authoritative state advances"
             );
             self.pipeline
@@ -2339,12 +2339,8 @@ impl Player {
             .lock()
             .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
             .current();
-        let current_uri = self.video_source.property::<Option<String>>("current-uri");
-        let final_uri = self.sequence.items.last().map(|item| item.uri.as_str());
-        if current + 1 < self.sequence.items.len() || current_uri.as_deref() != final_uri {
-            bail!(
-                "media sequence reached EOS before its final item (cursor item {current}, current URI {current_uri:?})"
-            );
+        if current + 1 < self.sequence.items.len() {
+            bail!("media sequence reached EOS before its final item (cursor item {current})");
         }
         Ok(true)
     }
@@ -2521,12 +2517,17 @@ impl Player {
         let Some(actual_local) = self.pipeline.query_position::<gst::ClockTime>() else {
             return Ok(None);
         };
-        let Some(actual_uri) = self.video_source.property::<Option<String>>("current-uri") else {
-            return Ok(None);
-        };
-        let Some(actual_item_index) = self.sequence.unique_item_for_uri(&actual_uri) else {
-            return Ok(None);
-        };
+        // `uridecodebin3` mutates its `current-uri` storage on a streaming
+        // thread during gapless handoff. Reading that GObject string from the
+        // monitor thread can race with the mutation (and has produced invalid
+        // UTF-8 panics in glib). The playlist cursor and URI list are owned by
+        // Rust, so use them as the safe transition identity instead.
+        let actual_item_index = self
+            .cursor
+            .lock()
+            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+            .current();
+        let actual_uri = self.sequence.items[actual_item_index].uri.clone();
         let actual_item = ItemPosition {
             index: actual_item_index,
             local_ns: actual_local.nseconds(),
@@ -2538,11 +2539,6 @@ impl Player {
                 return Ok(None);
             }
         };
-        let cursor_item = self
-            .cursor
-            .lock()
-            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
-            .current();
         let pipeline_state = self.pipeline.current_state();
         let transition_in_progress = self.recovery_in_progress.load(Ordering::Acquire)
             || self
@@ -2552,7 +2548,7 @@ impl Player {
                 .is_some()
             || pipeline_state != gst::State::Playing
             || self.pipeline.pending_state() != gst::State::VoidPending
-            || cursor_item != actual_item_index;
+            || actual_item_index != expected_item.index;
         Ok(Some(PositionSample {
             recovery_attempt: self.recovery_attempt.load(Ordering::Acquire),
             clock_time: ClockNs::new(clock_now),
