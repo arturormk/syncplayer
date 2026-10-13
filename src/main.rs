@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_net as gst_net;
@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
-use syncplayer::program::{ProgramConfig, ResolvedProgram};
+use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
-    MAX_LINE_BYTES, MasterSession, Message, Operation, ReleasePlan, StateSnapshot, TransportState,
-    read_message, write_message,
+    Capabilities, MAX_LINE_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession, Message, Operation,
+    ReleasePlan, StateSnapshot, Subscription, TransportState, read_message, write_message,
 };
+use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
 use syncplayer::validation::{DiagnosticLevel, GstMediaProbe, validate_program};
 use tracing::{debug, error, info, warn};
@@ -73,6 +74,20 @@ struct MasterArgs {
     /// Best-effort startup grace period in seconds; should exceed `--release-delay`.
     #[arg(long, default_value_t = 0.0, value_parser = non_negative_seconds)]
     startup_delay: f64,
+
+    /// Maximum allowed Master/Slave cue-duration difference in milliseconds.
+    #[arg(long, default_value_t = 100)]
+    duration_tolerance_ms: u64,
+
+    /// Action when a cue exceeds the duration tolerance.
+    #[arg(long, value_enum, default_value_t = DurationMismatchPolicy::Reject)]
+    duration_mismatch: DurationMismatchPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DurationMismatchPolicy {
+    Warn,
+    Reject,
 }
 
 #[derive(Debug, Args)]
@@ -140,7 +155,19 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     // is normally the device-backed audio clock, so the Master does not have
     // to slave its own output to an unrelated system clock.
     let program = load_runtime_program(&args.playback)?;
-    let player = Arc::new(Player::new(&args.playback, program, None)?);
+    let sequence = PlaybackSequence::prepare(&program)?;
+    let compatibility = ProgramCompatibility {
+        program_id: program.program_id.clone(),
+        program_hash: program.hash,
+        master_player_id: program.player_id.to_string(),
+        cue_durations_ns: sequence.cue_durations_ns.clone(),
+        duration_tolerance_ns: args
+            .duration_tolerance_ms
+            .checked_mul(1_000_000)
+            .ok_or_else(|| anyhow!("duration tolerance is too large"))?,
+        mismatch_policy: args.duration_mismatch,
+    };
+    let player = Arc::new(Player::new(&args.playback, sequence, None)?);
     let clock = player.clock()?;
     let bind_ip = match args.bind.ip() {
         IpAddr::V4(ip) => ip.to_string(),
@@ -184,25 +211,29 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         );
     }
 
-    serve_slaves(
-        listener,
-        player.clone(),
+    let server = Arc::new(SlaveServer {
+        player: player.clone(),
         clock,
         clock_port,
         release_delay,
-        initial_plan,
-        Authority {
+        startup_plan: initial_plan,
+        authority: Authority {
             session,
             generation,
         },
-    );
+        compatibility,
+        registry: ParticipantRegistry::new(),
+    });
+    serve_slaves(listener, server);
     player.monitor(initial_plan)
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
     let program = load_runtime_program(&args.playback)?;
-    let (mut stream, clock, authority) = wait_for_master(args.master);
-    let player = Arc::new(Player::new(&args.playback, program, Some(&clock))?);
+    let sequence = PlaybackSequence::prepare(&program)?;
+    let subscription = create_subscription(&program, &sequence)?;
+    let (mut stream, clock, authority) = wait_for_master(args.master, &subscription);
+    let player = Arc::new(Player::new(&args.playback, sequence, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock, authority)?;
     player.resynchronize(&clock, plan, "initial-join")?;
     report_prepared(&mut stream, authority)?;
@@ -211,8 +242,29 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
         "accepted shared-clock release"
     );
 
-    monitor_master(stream, args.master, authority, player.clone());
+    monitor_master(stream, args.master, authority, player.clone(), subscription);
     player.monitor(plan)
+}
+
+fn create_subscription(
+    program: &ResolvedProgram,
+    sequence: &PlaybackSequence,
+) -> Result<Subscription> {
+    if sequence.cue_durations_ns.len() > MAX_SUBSCRIPTION_CUES {
+        bail!(
+            "program has {} cues; subscription supports at most {MAX_SUBSCRIPTION_CUES}",
+            sequence.cue_durations_ns.len()
+        );
+    }
+    Ok(Subscription {
+        player_id: program.player_id.to_string(),
+        program_id: program.program_id.clone(),
+        program_hash: program.hash,
+        software_version: env!("CARGO_PKG_VERSION").to_owned(),
+        capabilities: Capabilities::current(),
+        state_port: 0,
+        cue_durations_ns: sequence.cue_durations_ns.clone(),
+    })
 }
 
 fn load_runtime_program(args: &PlaybackArgs) -> Result<ResolvedProgram> {
@@ -285,9 +337,12 @@ fn run_validate(args: &ValidateArgs) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_master(master: SocketAddr) -> (TcpStream, gst::Clock, Authority) {
+fn wait_for_master(
+    master: SocketAddr,
+    subscription: &Subscription,
+) -> (TcpStream, gst::Clock, Authority) {
     loop {
-        match connect_to_master(master) {
+        match connect_to_master(master, subscription) {
             Ok(connection) => return connection,
             Err(error) => {
                 warn!(
@@ -302,24 +357,8 @@ fn wait_for_master(master: SocketAddr) -> (TcpStream, gst::Clock, Authority) {
     }
 }
 
-fn serve_slaves(
-    listener: TcpListener,
-    player: Arc<Player>,
-    clock: gst::Clock,
-    clock_port: u16,
-    release_delay: Duration,
-    startup_plan: ReleasePlan,
-    authority: Authority,
-) {
+fn serve_slaves(listener: TcpListener, server: Arc<SlaveServer>) {
     thread::spawn(move || {
-        let server = Arc::new(SlaveServer {
-            player,
-            clock,
-            clock_port,
-            release_delay,
-            startup_plan,
-            authority,
-        });
         for accepted in listener.incoming() {
             let stream = match accepted {
                 Ok(connection) => connection,
@@ -353,6 +392,18 @@ struct SlaveServer {
     release_delay: Duration,
     startup_plan: ReleasePlan,
     authority: Authority,
+    compatibility: ProgramCompatibility,
+    registry: Arc<ParticipantRegistry>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramCompatibility {
+    program_id: String,
+    program_hash: ProgramHash,
+    master_player_id: String,
+    cue_durations_ns: Vec<u64>,
+    duration_tolerance_ns: u64,
+    mismatch_policy: DurationMismatchPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,34 +414,18 @@ struct Authority {
 
 fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) -> Result<()> {
     configure_stream(&stream)?;
-    write_message(
-        &mut stream,
-        &Message::Clock {
-            session: server.authority.session,
-            generation: server.authority.generation,
-            port: server.clock_port,
-        },
-    )?;
+    let (subscription, lease) = accept_subscription(&mut stream, peer, server)?;
     match read_message(&mut stream).context("failed to read Slave readiness")? {
-        Message::Ready => info!(%peer, "Slave clock is synchronized and ready to rejoin"),
+        Message::Ready => {
+            lease.mark_clock_synchronized()?;
+            info!(player = %subscription.player_id, %peer, "Slave clock is synchronized and ready to rejoin");
+            log_registry(&server.registry)?;
+        }
         Message::Error(message) => bail!("Slave rejected preparation: {message}"),
         other => bail!("expected READY from Slave, received {other:?}"),
     }
 
-    let now = ClockNs::new(server.clock.time().nseconds());
-    let minimum_lead_ns = u64::try_from(server.release_delay.as_nanos())
-        .context("release delay is too large for the clock")?;
-    let plan = if can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns) {
-        info!(%peer, "Slave is ready for the shared startup deadline");
-        server.startup_plan
-    } else {
-        let release_at = now
-            .checked_add(server.release_delay)
-            .ok_or_else(|| anyhow!("release timestamp overflow"))?;
-        server
-            .player
-            .join_plan(server.authority.generation, release_at)?
-    };
+    let plan = plan_slave_release(peer, server)?;
     write_message(&mut stream, &Message::Release(plan))
         .context("failed to send synchronization state")?;
     info!(
@@ -406,12 +441,15 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
             session,
             generation,
         } if session == server.authority.session && generation == server.authority.generation => {
+            lease.mark_ready()?;
             info!(
+                player = %subscription.player_id,
                 %peer,
                 master_session = %session,
                 transport_generation = generation,
                 "Slave prepared release; starting liveness monitoring"
             );
+            log_registry(&server.registry)?;
         }
         Message::Prepared {
             session,
@@ -425,13 +463,215 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
         other => bail!("expected PREPARED from Slave, received {other:?}"),
     }
 
-    run_master_heartbeats(&mut stream, peer, server)
+    let result = run_master_heartbeats(&mut stream, peer, server, &lease);
+    info!(player = %lease.player_id(), %peer, "Slave participant disconnected");
+    result
+}
+
+fn accept_subscription(
+    stream: &mut TcpStream,
+    peer: SocketAddr,
+    server: &SlaveServer,
+) -> Result<(Subscription, ParticipantLease)> {
+    let subscription = match read_message(stream) {
+        Ok(Message::Subscribe(subscription)) => subscription,
+        Ok(other) => {
+            let error = anyhow!("expected SUBSCRIBE from Slave, received {other:?}");
+            reject_connection(stream, &error);
+            return Err(error);
+        }
+        Err(error) => {
+            let error = anyhow!(error).context("failed to read Slave subscription");
+            reject_connection(stream, &error);
+            return Err(error);
+        }
+    };
+    let duration_differences = match validate_subscription(&subscription, &server.compatibility) {
+        Ok(differences) => differences,
+        Err(error) => {
+            reject_connection(stream, &error);
+            return Err(error);
+        }
+    };
+    let lease =
+        match server
+            .registry
+            .register(&subscription, peer, Instant::now(), LIVENESS_TIMEOUT)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                let error = anyhow!(error);
+                reject_connection(stream, &error);
+                return Err(error);
+            }
+        };
+    if subscription.software_version != env!("CARGO_PKG_VERSION") {
+        warn!(
+            player = %subscription.player_id,
+            slave_software = %subscription.software_version,
+            master_software = env!("CARGO_PKG_VERSION"),
+            "Slave software version differs from Master; protocol remains compatible"
+        );
+    }
+    for difference in duration_differences {
+        warn!(
+            player = %subscription.player_id,
+            cue_index = difference.cue_index,
+            master_duration_ns = difference.master_duration_ns,
+            slave_duration_ns = difference.slave_duration_ns,
+            delta_ns = difference.delta_ns,
+            policy = ?server.compatibility.mismatch_policy,
+            "Slave cue duration exceeds configured tolerance"
+        );
+    }
+    info!(
+        player = %subscription.player_id,
+        %peer,
+        program = %subscription.program_id,
+        program_hash = %subscription.program_hash,
+        software = %subscription.software_version,
+        capabilities = format_args!("{:016x}", subscription.capabilities.bits()),
+        state_port = subscription.state_port,
+        "Slave subscription accepted"
+    );
+    log_registry(&server.registry)?;
+    write_message(
+        stream,
+        &Message::Subscribed {
+            session: server.authority.session,
+            generation: server.authority.generation,
+            clock_port: server.clock_port,
+            master_cue_durations_ns: server.compatibility.cue_durations_ns.clone(),
+        },
+    )?;
+    Ok((subscription, lease))
+}
+
+fn plan_slave_release(peer: SocketAddr, server: &SlaveServer) -> Result<ReleasePlan> {
+    let now = ClockNs::new(server.clock.time().nseconds());
+    let minimum_lead_ns = u64::try_from(server.release_delay.as_nanos())
+        .context("release delay is too large for the clock")?;
+    let plan = if can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns) {
+        info!(%peer, "Slave is ready for the shared startup deadline");
+        server.startup_plan
+    } else {
+        let release_at = now
+            .checked_add(server.release_delay)
+            .ok_or_else(|| anyhow!("release timestamp overflow"))?;
+        server
+            .player
+            .join_plan(server.authority.generation, release_at)?
+    };
+    Ok(plan)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DurationDifference {
+    cue_index: usize,
+    master_duration_ns: u64,
+    slave_duration_ns: u64,
+    delta_ns: u64,
+}
+
+fn validate_subscription(
+    subscription: &Subscription,
+    compatibility: &ProgramCompatibility,
+) -> Result<Vec<DurationDifference>> {
+    if subscription.player_id == compatibility.master_player_id {
+        bail!(
+            "player ID '{}' is already used by the Master",
+            subscription.player_id
+        );
+    }
+    if subscription.program_id != compatibility.program_id {
+        bail!(
+            "program ID mismatch: Master '{}', Slave '{}'",
+            compatibility.program_id,
+            subscription.program_id
+        );
+    }
+    if subscription.program_hash != compatibility.program_hash {
+        bail!(
+            "program hash mismatch: Master {}, Slave {}",
+            compatibility.program_hash,
+            subscription.program_hash
+        );
+    }
+    if !subscription.capabilities.contains(Capabilities::REQUIRED) {
+        bail!(
+            "Slave capabilities {:016x} do not include required capabilities {:016x}",
+            subscription.capabilities.bits(),
+            Capabilities::REQUIRED
+        );
+    }
+    if subscription.cue_durations_ns.len() != compatibility.cue_durations_ns.len() {
+        bail!(
+            "cue-duration count mismatch: Master {}, Slave {}",
+            compatibility.cue_durations_ns.len(),
+            subscription.cue_durations_ns.len()
+        );
+    }
+    let differences = compatibility
+        .cue_durations_ns
+        .iter()
+        .zip(&subscription.cue_durations_ns)
+        .enumerate()
+        .filter_map(|(cue_index, (master, slave))| {
+            let delta_ns = master.abs_diff(*slave);
+            (delta_ns > compatibility.duration_tolerance_ns).then_some(DurationDifference {
+                cue_index,
+                master_duration_ns: *master,
+                slave_duration_ns: *slave,
+                delta_ns,
+            })
+        })
+        .collect::<Vec<_>>();
+    if compatibility.mismatch_policy == DurationMismatchPolicy::Reject
+        && let Some(difference) = differences.first()
+    {
+        bail!(
+            "cue {} duration mismatch: Master {} ns, Slave {} ns, delta {} ns exceeds tolerance {} ns",
+            difference.cue_index,
+            difference.master_duration_ns,
+            difference.slave_duration_ns,
+            difference.delta_ns,
+            compatibility.duration_tolerance_ns
+        );
+    }
+    Ok(differences)
+}
+
+fn reject_connection(stream: &mut TcpStream, error: &anyhow::Error) {
+    let _ = write_message(stream, &Message::Error(format!("{error:#}")));
+}
+
+fn log_registry(registry: &ParticipantRegistry) -> Result<()> {
+    for participant in registry.snapshot(Instant::now(), LIVENESS_TIMEOUT)? {
+        let state_endpoint = match participant.state_endpoint {
+            StateEndpoint::ControlConnection => "control".to_owned(),
+            StateEndpoint::Udp(endpoint) => endpoint.to_string(),
+        };
+        debug!(
+            player = %participant.player_id,
+            remote = %participant.remote_address,
+            readiness = ?participant.readiness,
+            clock_synchronized = participant.clock_synchronized,
+            last_seen_ms = participant.last_seen_age.as_millis(),
+            state_endpoint,
+            software = %participant.software_version,
+            capabilities = format_args!("{:016x}", participant.capabilities.bits()),
+            cue_count = participant.cue_durations_ns.len(),
+            "participant registry status"
+        );
+    }
+    Ok(())
 }
 
 fn run_master_heartbeats(
     stream: &mut TcpStream,
     peer: SocketAddr,
     server: &SlaveServer,
+    lease: &ParticipantLease,
 ) -> Result<()> {
     stream.set_read_timeout(Some(LIVENESS_TIMEOUT))?;
     stream.set_write_timeout(Some(LIVENESS_TIMEOUT))?;
@@ -461,7 +701,9 @@ fn run_master_heartbeats(
             Message::Alive {
                 session,
                 sequence: reply_sequence,
-            } if session == server.authority.session && reply_sequence == sequence => {}
+            } if session == server.authority.session && reply_sequence == sequence => {
+                lease.mark_seen()?;
+            }
             Message::Alive {
                 session,
                 sequence: reply_sequence,
@@ -585,36 +827,63 @@ fn read_control_message_until(stream: &mut TcpStream, deadline: Instant) -> Resu
     Message::decode(line.trim_end_matches('\r')).context("malformed control message")
 }
 
-fn connect_to_master(master: SocketAddr) -> Result<(TcpStream, gst::Clock, Authority)> {
+fn connect_to_master(
+    master: SocketAddr,
+    subscription: &Subscription,
+) -> Result<(TcpStream, gst::Clock, Authority)> {
     let mut stream = TcpStream::connect_timeout(&master, IO_TIMEOUT)
         .with_context(|| format!("failed to connect to Master {master}"))?;
     configure_stream(&stream)?;
-    let (port, authority) =
-        match read_message(&mut stream).context("failed to read Master clock endpoint")? {
-            Message::Clock {
+    write_message(&mut stream, &Message::Subscribe(subscription.clone()))
+        .context("failed to send subscription")?;
+    let (clock_port, authority, master_cue_durations_ns) =
+        match read_message(&mut stream).context("failed to read subscription result")? {
+            Message::Subscribed {
                 session,
                 generation,
-                port,
+                clock_port,
+                master_cue_durations_ns,
             } => (
-                port,
+                clock_port,
                 Authority {
                     session,
                     generation,
                 },
+                master_cue_durations_ns,
             ),
-            Message::Error(message) => bail!("Master rejected connection: {message}"),
-            other => bail!("expected CLOCK from Master, received {other:?}"),
+            Message::Error(message) => bail!("Master rejected subscription: {message}"),
+            other => bail!("expected SUBSCRIBED from Master, received {other:?}"),
         };
+    if master_cue_durations_ns.len() != subscription.cue_durations_ns.len() {
+        bail!(
+            "Master returned {} cue durations for a {}-cue subscription",
+            master_cue_durations_ns.len(),
+            subscription.cue_durations_ns.len()
+        );
+    }
+    for (cue_index, (master_duration, local_duration)) in master_cue_durations_ns
+        .iter()
+        .zip(&subscription.cue_durations_ns)
+        .enumerate()
+    {
+        debug!(
+            cue_index,
+            master_duration_ns = master_duration,
+            local_duration_ns = local_duration,
+            delta_ns = master_duration.abs_diff(*local_duration),
+            "Master/Slave cue duration comparison"
+        );
+    }
     let master_ip = master.ip().to_string();
     let clock = gst_net::NetClientClock::new(
         Some("syncplayer-lab-clock"),
         &master_ip,
-        i32::from(port),
+        i32::from(clock_port),
         Some(gst::ClockTime::ZERO),
     );
     info!(
         master = %master_ip,
-        clock_port = port,
+        clock_port,
         master_session = %authority.session,
         transport_generation = authority.generation,
         "calibrating new network clock"
@@ -671,6 +940,7 @@ fn monitor_master(
     master: SocketAddr,
     mut authority: Authority,
     player: Arc<Player>,
+    subscription: Subscription,
 ) {
     thread::spawn(move || {
         loop {
@@ -691,7 +961,7 @@ fn monitor_master(
             );
 
             loop {
-                match connect_to_master(master).and_then(
+                match connect_to_master(master, &subscription).and_then(
                     |(mut new_stream, clock, new_authority)| {
                         let plan = receive_release(&mut new_stream, &clock, new_authority)?;
                         player.resynchronize(&clock, plan, "master-reconnect")?;
@@ -731,13 +1001,14 @@ struct MediaItem {
 #[derive(Debug)]
 struct PlaybackSequence {
     items: Vec<MediaItem>,
+    cue_durations_ns: Vec<u64>,
     timeline: Option<Timeline>,
     looping: bool,
     from_playlist: bool,
 }
 
 impl PlaybackSequence {
-    fn prepare(program: ResolvedProgram) -> Result<Self> {
+    fn prepare(program: &ResolvedProgram) -> Result<Self> {
         let discoverer = gst_pbutils::Discoverer::new(to_clock_time(PREROLL_TIMEOUT)?)
             .context("failed to create GStreamer media discoverer")?;
         // Startup discovery must reflect the files as they exist now. Do not
@@ -746,8 +1017,8 @@ impl PlaybackSequence {
 
         let mut items = Vec::with_capacity(program.cues.len());
         let mut durations = Vec::with_capacity(program.cues.len());
-        for (index, cue) in program.cues.into_iter().enumerate() {
-            let path = cue.video;
+        for (index, cue) in program.cues.iter().enumerate() {
+            let path = cue.video.clone();
             let uri =
                 media_uri(&path).with_context(|| format!("cue '{}' is unavailable", cue.id))?;
             let info = discoverer.discover_uri(&uri).with_context(|| {
@@ -776,11 +1047,12 @@ impl PlaybackSequence {
             items.push(MediaItem { path, uri });
             durations.push(duration_ns);
         }
-        let timeline = Timeline::new(durations, program.looping)
+        let timeline = Timeline::new(durations.clone(), program.looping)
             .context("invalid program sequence duration")?;
         let from_playlist = items.len() > 1;
         Ok(Self {
             items,
+            cue_durations_ns: durations,
             timeline: Some(timeline),
             looping: program.looping,
             from_playlist,
@@ -1077,10 +1349,9 @@ fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<b
 impl Player {
     fn new(
         args: &PlaybackArgs,
-        program: ResolvedProgram,
+        sequence: PlaybackSequence,
         forced_clock: Option<&gst::Clock>,
     ) -> Result<Self> {
-        let sequence = PlaybackSequence::prepare(program)?;
         let first_uri = sequence.items[0].uri.clone();
         let element = gst::ElementFactory::make("playbin3")
             .property("uri", &first_uri)
@@ -1921,14 +2192,17 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         Authority, Cli, ClockNs, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction, DriftPolicy,
-        MasterSession, MediaItem, MediaPositionNs, Message, Operation, PlaybackSequence,
-        StateSnapshot, Timeline, TransportState, can_join_startup, non_negative_seconds,
-        recovery_attempt_is_active, validate_heartbeat, validate_snapshot_generation,
+        DurationMismatchPolicy, MasterSession, MediaItem, MediaPositionNs, Message, Operation,
+        PlaybackSequence, ProgramCompatibility, StateSnapshot, Timeline, TransportState,
+        can_join_startup, non_negative_seconds, recovery_attempt_is_active, validate_heartbeat,
+        validate_snapshot_generation, validate_subscription,
     };
     use clap::Parser;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+    use syncplayer::program::ProgramHash;
+    use syncplayer::protocol::{Capabilities, Subscription};
 
     fn authority() -> Authority {
         Authority {
@@ -1959,6 +2233,29 @@ mod tests {
         }
     }
 
+    fn compatibility(policy: DurationMismatchPolicy) -> ProgramCompatibility {
+        ProgramCompatibility {
+            program_id: "show".to_owned(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
+            master_player_id: "master".to_owned(),
+            cue_durations_ns: vec![1_000, 2_000],
+            duration_tolerance_ns: 100,
+            mismatch_policy: policy,
+        }
+    }
+
+    fn subscription() -> Subscription {
+        Subscription {
+            player_id: "left".to_owned(),
+            program_id: "show".to_owned(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
+            software_version: "0.1.0".to_owned(),
+            capabilities: Capabilities::current(),
+            state_port: 0,
+            cue_durations_ns: vec![1_050, 2_000],
+        }
+    }
+
     #[test]
     fn command_line_requires_a_program_and_supports_player_identity() {
         assert!(Cli::try_parse_from(["syncplayer", "master"]).is_err());
@@ -1972,6 +2269,36 @@ mod tests {
         assert!(Cli::try_parse_from(["syncplayer", "validate", "show.toml"]).is_ok());
         assert!(Cli::try_parse_from(["syncplayer", "master", "--media", "a.mp4"]).is_err());
         assert!(Cli::try_parse_from(["syncplayer", "master", "show.toml", "--loop"]).is_err());
+    }
+
+    #[test]
+    fn subscription_rejects_identity_program_and_capability_conflicts() {
+        let expected = compatibility(DurationMismatchPolicy::Reject);
+        let mut candidate = subscription();
+        assert!(validate_subscription(&candidate, &expected).is_ok());
+        candidate.player_id = "master".to_owned();
+        assert!(validate_subscription(&candidate, &expected).is_err());
+        candidate = subscription();
+        candidate.program_hash = ProgramHash::from_bytes([2; 32]);
+        assert!(validate_subscription(&candidate, &expected).is_err());
+        candidate = subscription();
+        candidate.capabilities = Capabilities::from_bits(0);
+        assert!(validate_subscription(&candidate, &expected).is_err());
+    }
+
+    #[test]
+    fn duration_mismatch_policy_warns_or_rejects() {
+        let mut candidate = subscription();
+        candidate.cue_durations_ns[0] = 1_101;
+        assert!(
+            validate_subscription(&candidate, &compatibility(DurationMismatchPolicy::Reject))
+                .is_err()
+        );
+        let differences =
+            validate_subscription(&candidate, &compatibility(DurationMismatchPolicy::Warn))
+                .unwrap();
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].delta_ns, 101);
     }
 
     #[test]
@@ -2088,6 +2415,7 @@ mod tests {
                     uri: "file:///b".to_owned(),
                 },
             ],
+            cue_durations_ns: vec![10, 20],
             timeline: Some(Timeline::new(vec![10, 20], looping).unwrap()),
             looping,
             from_playlist: true,
@@ -2126,6 +2454,7 @@ mod tests {
                     uri: "file:///b".to_owned(),
                 },
             ],
+            cue_durations_ns: vec![2, 27],
             timeline: Some(Timeline::new(vec![2, 27], true).unwrap()),
             looping: true,
             from_playlist: true,

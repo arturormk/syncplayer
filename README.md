@@ -148,6 +148,8 @@ control connections.
 | `--clock-port <PORT>` | `46001` | UDP port on which `GstNetTimeProvider` exposes the Master's playback clock. |
 | `--release-delay <SECONDS>` | `5` | Positive preparation interval between sending a late-joining or reconnecting Slave a release plan and executing it. |
 | `--startup-delay <SECONDS>` | `0` | Non-negative best-effort grace period during which the Master remains prerolled on its first frame so ready Slaves can share the initial release deadline. Use a value greater than `--release-delay`. |
+| `--duration-tolerance-ms <MS>` | `100` | Maximum allowed difference between the Master's and a Slave's rendition of each cue. |
+| `--duration-mismatch <reject|warn>` | `reject` | Reject an excessive cue-duration difference or accept it with a prominent warning. |
 
 TCP `--bind` and UDP `--clock-port` are separate endpoints; both ports must be reachable from every
 Slave. A zero startup delay starts the Master immediately. The Master never waits beyond a non-zero
@@ -159,15 +161,19 @@ startup deadline for a slow or absent Slave.
 | --- | :---: | --- |
 | `--master <IP:PORT>` | Yes | Master's reachable TCP control address, matching its `--bind` port. The Master supplies the separate UDP clock port during the connection handshake. |
 
-The Slave retries the initial Master connection once per second until the Master is available, then
-calibrates a network-derived clock before accepting a release plan. The Master sends application
+The Slave retries the initial Master connection once per second until the Master is available. It
+first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
+control-channel state endpoint, and probed cue durations. The Master rejects program mismatches,
+missing capabilities, duplicate active player IDs, and duration mismatches outside its configured
+policy before the Slave calibrates a network-derived clock and accepts a release plan. The Master
+sends application
 heartbeats every two seconds and requires matching acknowledgements. If no valid heartbeat arrives
 for eight seconds—even when TCP still appears connected—the Slave closes the stale connection,
 continues playing from its last disciplined clock estimate, and attempts to reconnect in the
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 4 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 5 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
 ### Logging

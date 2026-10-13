@@ -1,13 +1,60 @@
-//! A tiny, bounded, newline-delimited protocol used only by the clock lab.
+//! Bounded control protocol for subscription and the shared-clock prototype.
 
+use crate::program::ProgramHash;
 use crate::time::{ClockNs, MediaPositionNs};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 4;
-pub const MAX_LINE_BYTES: usize = 256;
+pub const PROTOCOL_VERSION: u16 = 5;
+pub const MAX_LINE_BYTES: usize = 4_096;
+pub const MAX_SUBSCRIPTION_CUES: usize = 128;
+pub const MAX_ID_BYTES: usize = 128;
+pub const MAX_SOFTWARE_VERSION_BYTES: usize = 64;
 const PREFIX: &str = "SYNCPLAYER-LAB";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Capabilities(u64);
+
+impl Capabilities {
+    pub const NETWORK_CLOCK: u64 = 1 << 0;
+    pub const PREPARED_RELEASE: u64 = 1 << 1;
+    pub const STATE_OVER_CONTROL: u64 = 1 << 2;
+    pub const REQUIRED: u64 =
+        Self::NETWORK_CLOCK | Self::PREPARED_RELEASE | Self::STATE_OVER_CONTROL;
+
+    #[must_use]
+    pub const fn current() -> Self {
+        Self(Self::REQUIRED)
+    }
+
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, required: u64) -> bool {
+        self.0 & required == required
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Subscription {
+    pub player_id: String,
+    pub program_id: String,
+    pub program_hash: ProgramHash,
+    pub software_version: String,
+    pub capabilities: Capabilities,
+    /// UDP state port. Zero means state snapshots use this control connection.
+    pub state_port: u16,
+    pub cue_durations_ns: Vec<u64>,
+}
 
 /// Identifies one run of the authoritative Master process.
 ///
@@ -151,10 +198,12 @@ impl ReleasePlan {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
-    Clock {
+    Subscribe(Subscription),
+    Subscribed {
         session: MasterSession,
         generation: u64,
-        port: u16,
+        clock_port: u16,
+        master_cue_durations_ns: Vec<u64>,
     },
     Ready,
     Release(ReleasePlan),
@@ -179,11 +228,25 @@ impl Message {
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
-            Self::Clock {
+            Self::Subscribe(subscription) => format!(
+                "{PREFIX} {PROTOCOL_VERSION} SUBSCRIBE {} {} {} {} {:016x} {} {}",
+                encode_text(&subscription.player_id),
+                encode_text(&subscription.program_id),
+                subscription.program_hash,
+                encode_text(&subscription.software_version),
+                subscription.capabilities.bits(),
+                subscription.state_port,
+                encode_durations(&subscription.cue_durations_ns)
+            ),
+            Self::Subscribed {
                 session,
                 generation,
-                port,
-            } => format!("{PREFIX} {PROTOCOL_VERSION} CLOCK {session} {generation} {port}"),
+                clock_port,
+                master_cue_durations_ns,
+            } => format!(
+                "{PREFIX} {PROTOCOL_VERSION} SUBSCRIBED {session} {generation} {clock_port} {}",
+                encode_durations(master_cue_durations_ns)
+            ),
             Self::Ready => format!("{PREFIX} {PROTOCOL_VERSION} READY"),
             Self::Release(plan) => format!(
                 "{PREFIX} {PROTOCOL_VERSION} RELEASE {} {} {} {}",
@@ -237,10 +300,25 @@ impl Message {
         }
         let kind = next(&mut fields)?;
         let message = match kind {
-            "CLOCK" => Self::Clock {
+            "SUBSCRIBE" => Self::Subscribe(Subscription {
+                player_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
+                program_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
+                program_hash: next(&mut fields)?
+                    .parse()
+                    .map_err(|_| ParseError::InvalidProgramHash)?,
+                software_version: decode_text(next(&mut fields)?, MAX_SOFTWARE_VERSION_BYTES)?,
+                capabilities: Capabilities::from_bits(
+                    u64::from_str_radix(next(&mut fields)?, 16)
+                        .map_err(|_| ParseError::InvalidCapabilities)?,
+                ),
+                state_port: parse(next(&mut fields)?, "state port")?,
+                cue_durations_ns: parse_durations(next(&mut fields)?)?,
+            }),
+            "SUBSCRIBED" => Self::Subscribed {
                 session: next(&mut fields)?.parse()?,
                 generation: parse(next(&mut fields)?, "generation")?,
-                port: parse(next(&mut fields)?, "clock port")?,
+                clock_port: parse(next(&mut fields)?, "clock port")?,
+                master_cue_durations_ns: parse_durations(next(&mut fields)?)?,
             },
             "READY" => Self::Ready,
             "RELEASE" => Self::Release(ReleasePlan {
@@ -291,7 +369,14 @@ impl Message {
 ///
 /// Propagates errors from the underlying writer.
 pub fn write_message(writer: &mut impl Write, message: &Message) -> io::Result<()> {
-    writer.write_all(message.encode().as_bytes())?;
+    let encoded = message.encode();
+    if encoded.len() > MAX_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("protocol message exceeds {MAX_LINE_BYTES} bytes"),
+        ));
+    }
+    writer.write_all(encoded.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
@@ -332,6 +417,13 @@ pub enum ParseError {
     },
     InvalidNumber(&'static str),
     InvalidSession,
+    InvalidProgramHash,
+    InvalidCapabilities,
+    InvalidHex,
+    InvalidUtf8,
+    TextTooLong,
+    InvalidCueDurations,
+    TooManyCues,
     UnsupportedVersion(u16),
     UnknownMessage(String),
     UnknownOperation(String),
@@ -394,6 +486,60 @@ fn parse<T: FromStr>(value: &str, name: &'static str) -> Result<T, ParseError> {
     value.parse().map_err(|_| ParseError::InvalidNumber(name))
 }
 
+fn encode_text(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn decode_text(value: &str, max_bytes: usize) -> Result<String, ParseError> {
+    if value.is_empty() || value.len() & 1 == 1 {
+        return Err(ParseError::InvalidHex);
+    }
+    let byte_count = value.len() / 2;
+    if byte_count > max_bytes {
+        return Err(ParseError::TextTooLong);
+    }
+    let bytes = (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16).map_err(|_| ParseError::InvalidHex)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    String::from_utf8(bytes).map_err(|_| ParseError::InvalidUtf8)
+}
+
+fn encode_durations(durations: &[u64]) -> String {
+    durations
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_durations(value: &str) -> Result<Vec<u64>, ParseError> {
+    if value.is_empty() {
+        return Err(ParseError::InvalidCueDurations);
+    }
+    let durations = value
+        .split(',')
+        .map(|duration| {
+            duration
+                .parse::<u64>()
+                .ok()
+                .filter(|duration| *duration > 0)
+                .ok_or(ParseError::InvalidCueDurations)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if durations.len() > MAX_SUBSCRIPTION_CUES {
+        return Err(ParseError::TooManyCues);
+    }
+    Ok(durations)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,10 +561,20 @@ mod tests {
     #[test]
     fn messages_round_trip() {
         for message in [
-            Message::Clock {
+            Message::Subscribe(Subscription {
+                player_id: "wall left".to_owned(),
+                program_id: "museum show".to_owned(),
+                program_hash: ProgramHash::from_bytes([0xab; 32]),
+                software_version: "0.1.0-dev".to_owned(),
+                capabilities: Capabilities::current(),
+                state_port: 0,
+                cue_durations_ns: vec![1, 2, u64::MAX],
+            }),
+            Message::Subscribed {
                 session: session(),
                 generation: 7,
-                port: 4_601,
+                clock_port: 4_601,
+                master_cue_durations_ns: vec![1, 2, u64::MAX],
             },
             Message::Ready,
             release(),
@@ -445,6 +601,7 @@ mod tests {
                 session: session(),
                 sequence: 42,
             },
+            Message::Error("program mismatch".to_owned()),
         ] {
             assert_eq!(Message::decode(&message.encode()), Ok(message));
         }
@@ -454,12 +611,12 @@ mod tests {
     fn rejects_malformed_session_and_heartbeat() {
         assert_eq!(
             Message::decode(
-                "SYNCPLAYER-LAB 4 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7 8"
+                "SYNCPLAYER-LAB 5 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7 8"
             ),
             Err(ParseError::InvalidSession)
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 4 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
+            Message::decode("SYNCPLAYER-LAB 5 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -491,7 +648,7 @@ mod tests {
             Err(ParseError::UnsupportedVersion(99))
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 4 READY surprise"),
+            Message::decode("SYNCPLAYER-LAB 5 READY surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -523,6 +680,25 @@ mod tests {
         assert_eq!(
             plan.validate(ClockNs::new(5_000), None),
             Err(ParseError::ReleaseNotFuture)
+        );
+    }
+
+    #[test]
+    fn subscription_rejects_invalid_and_excessive_fields() {
+        let hash = ProgramHash::from_bytes([0; 32]);
+        let prefix = format!("SYNCPLAYER-LAB 5 SUBSCRIBE 61 62 {hash} 63 0000000000000007 0 ");
+        assert_eq!(
+            Message::decode(&format!("{prefix}0")),
+            Err(ParseError::InvalidCueDurations)
+        );
+        assert_eq!(
+            Message::decode(&format!("{prefix}1,not-a-duration")),
+            Err(ParseError::InvalidCueDurations)
+        );
+        let too_many = vec!["1"; MAX_SUBSCRIPTION_CUES + 1].join(",");
+        assert_eq!(
+            Message::decode(&format!("{prefix}{too_many}")),
+            Err(ParseError::TooManyCues)
         );
     }
 }

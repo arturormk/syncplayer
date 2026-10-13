@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 const PROGRAM_VERSION: u64 = 1;
 const CANONICAL_FORMAT: &[u8] = b"syncplayer-program-v1\0";
@@ -124,6 +125,34 @@ impl fmt::Display for ProgramHash {
         Ok(())
     }
 }
+
+impl FromStr for ProgramHash {
+    type Err = ProgramHashParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ProgramHashParseError);
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let offset = index * 2;
+            *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
+                .map_err(|_| ProgramHashParseError)?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramHashParseError;
+
+impl fmt::Display for ProgramHashParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("program hash must contain exactly 64 hexadecimal digits")
+    }
+}
+
+impl std::error::Error for ProgramHashParseError {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedProgram {
@@ -847,6 +876,14 @@ payload_hex = "01 02 ff"
         assert_ne!(first.program_hash(), payload_changed.program_hash());
         assert_ne!(first.program_hash(), timing_changed.program_hash());
         assert_ne!(first.program_hash(), mapping_changed.program_hash());
+    }
+
+    #[test]
+    fn program_hash_text_round_trips_and_rejects_malformed_values() {
+        let hash = ProgramHash::from_bytes([0xab; 32]);
+        assert_eq!(hash.to_string().parse(), Ok(hash));
+        assert!("abc".parse::<ProgramHash>().is_err());
+        assert!("z".repeat(64).parse::<ProgramHash>().is_err());
     }
 
     #[test]

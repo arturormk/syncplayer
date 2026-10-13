@@ -25,19 +25,23 @@ Why first: nearly every remaining subsystem needs logical cue IDs, player IDs, p
 
 ### P0 — Production subscription and participant registry
 
+Status: implemented.
+
 Once the program model exists, replace the laboratory welcome exchange with a real subscription handshake.
 
 Implement:
 
-- Subscription containing player ID, program ID/hash, protocol/software version, capabilities, and state endpoint.
-- Rejection of incompatible program hashes and protocol versions.
-- Duplicate active player-ID detection.
-- Per-cue duration exchange and configurable mismatch policy.
-- A Master subscriber registry with last-seen, readiness, clock status, and remote address.
-- Stale-subscriber expiration.
-- Status information suitable for the later installation console.
+- [x] Subscription containing player ID, program ID/hash, protocol/software version, capabilities, and state endpoint.
+- [x] Rejection of incompatible program hashes and protocol versions.
+- [x] Duplicate active player-ID detection.
+- [x] Per-cue duration exchange and configurable mismatch policy.
+- [x] A Master subscriber registry with last-seen, readiness, clock status, and remote address.
+- [x] Stale-subscriber expiration.
+- [x] Status information suitable for the later installation console.
 
-Currently a Slave effectively sends only READY; no identity or program information is exchanged (main.rs (src/main.rs:290)). The protocol is explicitly identified as a small clock-lab protocol (protocol.rs (src/protocol.rs:1)).
+The version 5 control handshake now exchanges and validates this information before clock
+calibration. Independent state transport and production encoding remain in the later state-protocol
+milestone.
 
 ### P0 — Authoritative transport and cue progression
 
