@@ -12,7 +12,8 @@ The repository currently contains a risk-reduction prototype, not the production
 that Linux pipelines can use one exported monotonic clock, join at a future clock release, detect a
 stalled Master control process, refresh authoritative transport state, and repair sustained local
 drift. The production state protocol now separates bounded binary TCP control, UDP snapshots, and
-clock synchronization; `playbin3` remains an experimental playback-engine choice.
+clock synchronization. Local playback uses separate gapless `uridecodebin3` video and audio
+branches so external cue audio follows the same pipeline clock and transport operations as video.
 
 ## Prerequisites
 
@@ -94,6 +95,13 @@ These options are accepted by both `master` and `slave`:
 | `<PROGRAM>` | Yes | Shared version 1 TOML program definition. Each host loads a semantically equivalent copy. |
 | `--player-id <NAME>` | No | Logical player identity. The system hostname and then `[aliases]` are used when omitted. |
 | `--mute` | No | Silence the selected audio stream. The audio pipeline remains active, so its timing behavior is preserved. |
+| `--gain-db <DB>` | No | Add gain in decibels to the cue's configured gain. Positive effective gain is allowed but warns because it may clip. |
+| `--fullscreen` | No | Request fullscreen output. The selected sink must expose fullscreen control; `waylandsink` is selected automatically in a Wayland session. |
+| `--width <PX> --height <PX>` | No | Set the output canvas size. The two options must be supplied together. |
+| `--display <ID>` | No | Select a Wayland/X11 display name or numeric DRM/KMS connector. An explicit `--video-sink` takes precedence. |
+| `--fit <contain|cover|stretch>` | No | Choose aspect-preserving letterbox, aspect-preserving crop, or unconstrained scaling. `cover` requires width and height. |
+| `--clock <auto|audio|system>` | No | Choose the Master's media/audio clock when available, require an audio clock, or force the monotonic system clock. Slaves always use the network clock. |
+| `--hwdec <auto|off>` | No | Let GStreamer rank hardware decoders normally or disable factories classified as hardware video decoders. |
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
 
@@ -130,12 +138,12 @@ and events, while ignoring TOML comments and formatting. See
 [`examples/simple-show.toml`](examples/simple-show.toml) and
 [`examples/full-show.toml`](examples/full-show.toml).
 
-Run `syncplayer validate show.toml [--player-id NAME]` on each host before playback. It probes the
-resolved player's video and external-audio files, checks durations and cue-relative event times,
-warns about suspicious stream-format transitions, and prints the program hash. External audio,
-cue-local mute/gain, and timed events are represented and validated but their runtime engines are
-not implemented yet; playback rejects a selected mapping that uses them instead of silently
-ignoring them. The global `--mute` option remains available.
+Run `syncplayer validate show.toml [--player-id NAME]` on each host before playback. It probes every
+resolved video and external-audio file, verifies required streams, checks durations and cue-relative
+event times, warns about suspicious stream-format transitions, and prints the program hash. An
+external audio duration more than 50 ms from its video is rejected. External audio, cue-local
+mute/gain, and the corresponding global CLI controls are active at runtime. Timed events are still
+rejected until their P1 event engine is implemented.
 
 ### Master options
 
@@ -210,11 +218,12 @@ RUST_LOG=syncplayer=debug cargo run --release -- \
   --master 192.168.1.40:46000 --mute
 ```
 
-Set `program.loop = true` to repeat the complete cue sequence. Cues are handed to `playbin3` before
-the current item finishes for gapless transitions. Compatible codecs, dimensions, frame rates, and
-audio formats give the best transition behavior. The control protocol continues to send only one
-absolute sequence position plus logical cue index, cue-local position, and program iteration; local
-paths never cross the network.
+Set `program.loop = true` to repeat the complete cue sequence. Separate video and audio decode
+branches receive their next URI before the current item finishes for gapless transitions. Both
+branches share the pipeline clock and all pause, seek, recovery, and release operations. Compatible
+codecs, dimensions, frame rates, and audio formats give the best transition behavior. The control
+protocol continues to send only one absolute sequence position plus logical cue index, cue-local
+position, and program iteration; local paths never cross the network.
 
 Allow TCP port 46000, UDP port 46001, and each Slave's selected UDP state port through host
 firewalls. For a headless loopback smoke test,

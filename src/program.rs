@@ -481,24 +481,10 @@ impl ResolvedProgram {
     /// implementation belongs to a later milestone.
     pub fn ensure_runtime_supported(&self) -> Result<()> {
         for cue in &self.cues {
-            let mut unsupported = Vec::new();
-            if cue.audio.is_some() {
-                unsupported.push("external audio");
-            }
-            if cue.mute {
-                unsupported.push("cue-local mute");
-            }
-            if cue.gain_db != 0.0 {
-                unsupported.push("cue-local gain");
-            }
             if !cue.events.is_empty() {
-                unsupported.push("timed events");
-            }
-            if !unsupported.is_empty() {
                 bail!(
-                    "cue '{}' configures {}, whose runtime support is not implemented yet",
+                    "cue '{}' configures timed events, whose runtime support is not implemented yet",
                     cue.id,
-                    unsupported.join(", ")
                 );
             }
         }

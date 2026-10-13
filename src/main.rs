@@ -20,7 +20,9 @@ use syncplayer::protocol::{
 use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, Readiness, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
 use syncplayer::transport::{EosDecision, RuntimeState, TransportController};
-use syncplayer::validation::{DiagnosticLevel, GstMediaProbe, validate_program};
+use syncplayer::validation::{
+    DiagnosticLevel, EXTERNAL_AUDIO_DURATION_TOLERANCE_NS, GstMediaProbe, validate_program,
+};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -137,6 +139,38 @@ struct PlaybackArgs {
     #[arg(long)]
     mute: bool,
 
+    /// Add this many decibels to each cue's configured gain.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = finite_f64)]
+    gain_db: f64,
+
+    /// Ask the selected video sink to occupy its display.
+    #[arg(long)]
+    fullscreen: bool,
+
+    /// Width of the video output canvas in pixels.
+    #[arg(long, requires = "height", value_parser = clap::value_parser!(u32).range(1..))]
+    width: Option<u32>,
+
+    /// Height of the video output canvas in pixels.
+    #[arg(long, requires = "width", value_parser = clap::value_parser!(u32).range(1..))]
+    height: Option<u32>,
+
+    /// Platform display/output identifier (for example WAYLAND display name or DRM connector ID).
+    #[arg(long)]
+    display: Option<String>,
+
+    /// Video scaling policy.
+    #[arg(long, value_enum, default_value_t = FitMode::Contain)]
+    fit: FitMode,
+
+    /// Master playback clock policy. Slaves always use the Master's network clock.
+    #[arg(long, value_enum, default_value_t = ClockPolicy::Auto)]
+    clock: ClockPolicy,
+
+    /// Hardware decoder policy.
+    #[arg(long, value_enum, default_value_t = HardwareDecoding::Auto)]
+    hwdec: HardwareDecoding,
+
     /// Override `GStreamer`'s automatically selected video sink.
     #[arg(long)]
     video_sink: Option<String>,
@@ -144,6 +178,26 @@ struct PlaybackArgs {
     /// Override `GStreamer`'s automatically selected audio sink.
     #[arg(long)]
     audio_sink: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum FitMode {
+    Contain,
+    Cover,
+    Stretch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ClockPolicy {
+    Auto,
+    Audio,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum HardwareDecoding {
+    Auto,
+    Off,
 }
 
 #[derive(Debug, Args)]
@@ -1132,6 +1186,10 @@ fn monitor_master(
 struct MediaItem {
     path: PathBuf,
     uri: String,
+    audio_uri: String,
+    has_audio: bool,
+    mute: bool,
+    gain_db: f64,
 }
 
 #[derive(Debug)]
@@ -1147,6 +1205,7 @@ struct PlaybackSequence {
 }
 
 impl PlaybackSequence {
+    #[allow(clippy::too_many_lines)]
     fn prepare(program: &ResolvedProgram) -> Result<Self> {
         let discoverer = gst_pbutils::Discoverer::new(to_clock_time(PREROLL_TIMEOUT)?)
             .context("failed to create GStreamer media discoverer")?;
@@ -1182,8 +1241,85 @@ impl PlaybackSequence {
                         path.display()
                     )
                 })?;
-            info!(item_index = index, cue = %cue.id, media = %path.display(), duration_ns, "program cue discovered");
-            items.push(MediaItem { path, uri });
+            if info.video_streams().is_empty() {
+                bail!(
+                    "cue '{}' contains no video stream: {}",
+                    cue.id,
+                    path.display()
+                );
+            }
+
+            let (audio_uri, audio_duration_ns, has_audio) = if let Some(audio_path) = &cue.audio {
+                let audio_uri = media_uri(audio_path)
+                    .with_context(|| format!("cue '{}' external audio is unavailable", cue.id))?;
+                let audio_info = discoverer.discover_uri(&audio_uri).with_context(|| {
+                    format!(
+                        "failed to discover cue '{}' external audio at {}",
+                        cue.id,
+                        audio_path.display()
+                    )
+                })?;
+                if audio_info.result() != gst_pbutils::DiscovererResult::Ok {
+                    bail!(
+                        "cue '{}' external audio could not be discovered (result {:?}): {}",
+                        cue.id,
+                        audio_info.result(),
+                        audio_path.display()
+                    );
+                }
+                if audio_info.audio_streams().is_empty() {
+                    bail!(
+                        "cue '{}' external audio contains no audio stream: {}",
+                        cue.id,
+                        audio_path.display()
+                    );
+                }
+                let audio_duration_ns = audio_info
+                    .duration()
+                    .map(gst::ClockTime::nseconds)
+                    .filter(|duration| *duration > 0)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "cue '{}' external audio has no known non-zero duration: {}",
+                            cue.id,
+                            audio_path.display()
+                        )
+                    })?;
+                let delta = duration_ns.abs_diff(audio_duration_ns);
+                if delta > EXTERNAL_AUDIO_DURATION_TOLERANCE_NS {
+                    bail!(
+                        "cue '{}' external audio duration differs from video by {} ms (maximum {} ms)",
+                        cue.id,
+                        format_ns_as_milliseconds(delta),
+                        format_ns_as_milliseconds(EXTERNAL_AUDIO_DURATION_TOLERANCE_NS)
+                    );
+                }
+                (audio_uri, Some(audio_duration_ns), true)
+            } else {
+                (uri.clone(), None, !info.audio_streams().is_empty())
+            };
+            gain_db_to_linear(cue.gain_db)
+                .with_context(|| format!("cue '{}' has an unsupported gain_db value", cue.id))?;
+            info!(
+                item_index = index,
+                cue = %cue.id,
+                media = %path.display(),
+                external_audio = cue.audio.as_ref().map(|value| value.display().to_string()),
+                duration_ns,
+                audio_duration_ns,
+                has_audio,
+                mute = cue.mute,
+                gain_db = cue.gain_db,
+                "program cue discovered"
+            );
+            items.push(MediaItem {
+                path,
+                uri,
+                audio_uri,
+                has_audio,
+                mute: cue.mute,
+                gain_db: cue.gain_db,
+            });
             durations.push(duration_ns);
         }
         let timeline = Timeline::new(durations.clone(), program.looping)
@@ -1401,8 +1537,14 @@ impl DriftPolicy {
 
 struct Player {
     pipeline: gst::Pipeline,
+    video_source: gst::Element,
+    audio_source: gst::Element,
+    audio_volume: gst::Element,
+    global_mute: bool,
+    global_gain_db: f64,
     sequence: PlaybackSequence,
     cursor: Arc<Mutex<PlaylistCursor>>,
+    audio_cursor: Arc<Mutex<PlaylistCursor>>,
     role: PlayerRole,
     clock_healthy: AtomicBool,
     clock: Mutex<gst::Clock>,
@@ -1511,54 +1653,175 @@ fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<b
 }
 
 impl Player {
+    #[allow(clippy::too_many_lines)]
     fn new(
         args: &PlaybackArgs,
         sequence: PlaybackSequence,
         forced_clock: Option<&gst::Clock>,
     ) -> Result<Self> {
-        let first_uri = sequence.items[0].uri.clone();
-        let element = gst::ElementFactory::make("playbin3")
-            .property("uri", &first_uri)
-            .property("mute", args.mute)
+        configure_decoder_policy(args.hwdec);
+        for item in &sequence.items {
+            let effective_gain_db = args.gain_db + item.gain_db;
+            if effective_gain_db > 0.0 {
+                warn!(
+                    media = %item.path.display(),
+                    gain_db = effective_gain_db,
+                    "positive audio gain may clip"
+                );
+            }
+            combined_gain(args.gain_db, item.gain_db)
+                .with_context(|| format!("invalid effective gain for {}", item.path.display()))?;
+        }
+        let first = &sequence.items[0];
+        let pipeline = gst::Pipeline::new();
+        let video_source = gst::ElementFactory::make("uridecodebin3")
+            .name("video-source")
+            .property("uri", &first.uri)
             .build()
-            .context("playbin3 is unavailable")?;
+            .context("uridecodebin3 is unavailable for video")?;
+        let audio_source = gst::ElementFactory::make("uridecodebin3")
+            .name("audio-source")
+            .property("uri", &first.audio_uri)
+            .build()
+            .context("uridecodebin3 is unavailable for audio")?;
+
+        let video_queue = make_named_element("queue", "video-queue", "video queue")?;
+        let video_convert = make_named_element("videoconvert", "video-convert", "video converter")?;
+        let video_scale = gst::ElementFactory::make("videoscale")
+            .name("video-scale")
+            .property("add-borders", args.fit == FitMode::Contain)
+            .build()
+            .context("videoscale is unavailable")?;
+        let mut video_chain = vec![video_queue.clone(), video_convert, video_scale];
+        if args.fit == FitMode::Cover {
+            let (width, height) = output_size(args)?;
+            let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
+            let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
+            let crop = gst::ElementFactory::make("aspectratiocrop")
+                .name("video-cover-crop")
+                .property("aspect-ratio", gst::Fraction::new(width, height))
+                .build()
+                .context("cover mode requires the aspectratiocrop GStreamer element")?;
+            video_chain.push(crop);
+        }
+        if let Some((width, height)) = optional_output_size(args) {
+            let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
+            let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("width", width)
+                .field("height", height)
+                .build();
+            let caps_filter = gst::ElementFactory::make("capsfilter")
+                .name("video-output-size")
+                .property("caps", &caps)
+                .build()
+                .context("capsfilter is unavailable")?;
+            video_chain.push(caps_filter);
+        }
+        let video_sink = select_video_sink(args)?;
+        force_clock_sync(&video_sink, "video sink")?;
+        configure_video_sink(&video_sink, args)?;
+        video_chain.push(video_sink);
+
+        let audio_queue = make_named_element("queue", "audio-queue", "audio queue")?;
+        let audio_convert = make_named_element("audioconvert", "audio-convert", "audio converter")?;
+        let audio_resample =
+            make_named_element("audioresample", "audio-resample", "audio resampler")?;
+        let audio_volume = gst::ElementFactory::make("volume")
+            .name("audio-volume")
+            .property("mute", args.mute || first.mute)
+            .property("volume", combined_gain(args.gain_db, first.gain_db)?)
+            .build()
+            .context("volume is unavailable")?;
+        let audio_sink = if let Some(name) = &args.audio_sink {
+            make_element(name, "audio sink")?
+        } else {
+            make_element("autoaudiosink", "automatic audio sink")?
+        };
+        force_clock_sync(&audio_sink, "audio sink")?;
+        // A cue without an audio stream must still be able to preroll its
+        // video. The sink remains clock-synchronised once buffers arrive.
+        if audio_sink.find_property("async").is_some() {
+            audio_sink.set_property("async", false);
+        }
+        let audio_chain = [
+            audio_queue.clone(),
+            audio_convert,
+            audio_resample,
+            audio_volume.clone(),
+            audio_sink,
+        ];
+
+        pipeline.add(&video_source)?;
+        pipeline.add_many(&video_chain)?;
+        gst::Element::link_many(&video_chain)?;
+        pipeline.add(&audio_source)?;
+        pipeline.add_many(&audio_chain)?;
+        gst::Element::link_many(&audio_chain)?;
+        select_decoded_streams(&video_source, gst::StreamType::VIDEO);
+        select_decoded_streams(&audio_source, gst::StreamType::AUDIO);
+        connect_decoded_pad(&video_source, &video_queue, "video_", "video");
+        connect_decoded_pad(&audio_source, &audio_queue, "audio_", "audio");
+
         let cursor = Arc::new(Mutex::new(PlaylistCursor::new(
             sequence.items.len(),
             sequence.looping,
             0,
         )));
-        let weak_element = element.downgrade();
+        let audio_cursor = Arc::new(Mutex::new(PlaylistCursor::new(
+            sequence.items.len(),
+            sequence.looping,
+            0,
+        )));
+        let weak_video_source = video_source.downgrade();
+        let weak_audio_source = audio_source.downgrade();
+        let weak_volume = audio_volume.downgrade();
         let callback_cursor = cursor.clone();
-        let uris: Vec<String> = sequence.items.iter().map(|item| item.uri.clone()).collect();
-        element.connect("about-to-finish", false, move |_| {
+        let video_uris: Vec<String> = sequence.items.iter().map(|item| item.uri.clone()).collect();
+        video_source.connect("about-to-finish", false, move |_| {
             let next = callback_cursor
                 .lock()
                 .ok()
                 .and_then(|mut cursor| cursor.queue_next());
-            if let (Some(index), Some(element)) = (next, weak_element.upgrade()) {
-                debug!(next_item_index = index, next_uri = %uris[index], "queueing gapless playlist item");
-                // Supplying the next URI before EOS lets playbin3 prepare it
-                // and carry the running timeline across the boundary.
-                element.set_property("uri", &uris[index]);
-                debug!(next_item_index = index, "gapless playlist item queued");
+            if let (Some(index), Some(source)) = (next, weak_video_source.upgrade()) {
+                debug!(next_item_index = index, next_uri = %video_uris[index], "queueing prepared video item");
+                source.set_property("uri", &video_uris[index]);
             }
             None
         });
-        if let Some(name) = &args.video_sink {
-            let sink = make_element(name, "video sink")?;
-            force_clock_sync(&sink, "video sink")?;
-            element.set_property("video-sink", &sink);
-        }
-        if let Some(name) = &args.audio_sink {
-            let sink = make_element(name, "audio sink")?;
-            force_clock_sync(&sink, "audio sink")?;
-            element.set_property("audio-sink", &sink);
-        }
-        let pipeline = element
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| anyhow!("playbin3 did not create a GstPipeline"))?;
+        let callback_audio_cursor = audio_cursor.clone();
+        let audio_items: Vec<(String, bool, f64)> = sequence
+            .items
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.audio_uri.clone(),
+                    args.mute || item.mute,
+                    combined_gain(args.gain_db, item.gain_db)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        audio_source.connect("about-to-finish", false, move |_| {
+            let next = callback_audio_cursor
+                .lock()
+                .ok()
+                .and_then(|mut cursor| cursor.queue_next());
+            if let Some(index) = next {
+                if let Some(source) = weak_audio_source.upgrade() {
+                    source.set_property("uri", &audio_items[index].0);
+                }
+                if let Some(volume) = weak_volume.upgrade() {
+                    volume.set_property("mute", audio_items[index].1);
+                    volume.set_property("volume", audio_items[index].2);
+                }
+                debug!(next_item_index = index, next_uri = %audio_items[index].0, "queueing prepared audio item");
+            }
+            None
+        });
         if let Some(clock) = forced_clock {
             pipeline.use_clock(Some(clock));
+        } else if args.clock == ClockPolicy::System {
+            pipeline.use_clock(Some(&gst::SystemClock::obtain()));
         }
         pipeline
             .set_state(gst::State::Paused)
@@ -1571,11 +1834,8 @@ impl Player {
         if forced_clock.is_some() {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
-        let clock = forced_clock.cloned().unwrap_or_else(|| {
-            pipeline
-                .provide_clock()
-                .unwrap_or_else(|| gst::SystemClock::obtain().upcast())
-        });
+        log_selected_pipeline_elements(&pipeline);
+        let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
         // Pin the clock selected during preroll so the one exported by the
         // Master is exactly the one used once the pipeline starts playing.
         pipeline.use_clock(Some(&clock));
@@ -1590,15 +1850,28 @@ impl Player {
             media = %sequence.items[0].path.display(),
             item_count = sequence.items.len(),
             duration_ns = duration.map(gst::ClockTime::nseconds),
-            mute = args.mute,
+            mute = args.mute || first.mute,
+            gain_db = args.gain_db + first.gain_db,
+            fit = ?args.fit,
+            fullscreen = args.fullscreen,
+            output_width = args.width,
+            output_height = args.height,
+            display = args.display.as_deref(),
+            hwdec = ?args.hwdec,
             looped = sequence.looping,
             playlist = sequence.from_playlist,
             "media sequence prerolled"
         );
         Ok(Self {
             pipeline,
+            video_source,
+            audio_source,
+            audio_volume,
+            global_mute: args.mute,
+            global_gain_db: args.gain_db,
             sequence,
             cursor,
+            audio_cursor,
             role: PlayerRole::from_external_clock(forced_clock.is_some()),
             clock_healthy: AtomicBool::new(true),
             clock: Mutex::new(clock),
@@ -1691,8 +1964,17 @@ impl Player {
             .lock()
             .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
             .reset(item_position.index);
-        self.pipeline
-            .set_property("uri", &self.sequence.items[item_position.index].uri);
+        self.audio_cursor
+            .lock()
+            .map_err(|_| anyhow!("audio playlist cursor lock poisoned"))?
+            .reset(item_position.index);
+        let item = &self.sequence.items[item_position.index];
+        self.video_source.set_property("uri", &item.uri);
+        self.audio_source.set_property("uri", &item.audio_uri);
+        self.audio_volume
+            .set_property("mute", self.global_mute || item.mute);
+        self.audio_volume
+            .set_property("volume", combined_gain(self.global_gain_db, item.gain_db)?);
         self.pipeline.use_clock(Some(clock));
         *self
             .clock
@@ -2016,7 +2298,7 @@ impl Player {
         master_transport: Option<&Arc<Mutex<TransportController>>>,
     ) -> Result<bool> {
         if self.role == PlayerRole::Slave {
-            let current_uri = self.pipeline.property::<Option<String>>("current-uri");
+            let current_uri = self.video_source.property::<Option<String>>("current-uri");
             warn!(
                 ?current_uri,
                 "Slave reached local EOS; holding the current logical cue until authoritative state advances"
@@ -2057,7 +2339,7 @@ impl Player {
             .lock()
             .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
             .current();
-        let current_uri = self.pipeline.property::<Option<String>>("current-uri");
+        let current_uri = self.video_source.property::<Option<String>>("current-uri");
         let final_uri = self.sequence.items.last().map(|item| item.uri.as_str());
         if current + 1 < self.sequence.items.len() || current_uri.as_deref() != final_uri {
             bail!(
@@ -2239,7 +2521,7 @@ impl Player {
         let Some(actual_local) = self.pipeline.query_position::<gst::ClockTime>() else {
             return Ok(None);
         };
-        let Some(actual_uri) = self.pipeline.property::<Option<String>>("current-uri") else {
+        let Some(actual_uri) = self.video_source.property::<Option<String>>("current-uri") else {
             return Ok(None);
         };
         let Some(actual_item_index) = self.sequence.unique_item_for_uri(&actual_uri) else {
@@ -2409,6 +2691,212 @@ fn make_element(factory: &str, description: &str) -> Result<gst::Element> {
         .with_context(|| format!("{description} factory '{factory}' is unavailable"))
 }
 
+fn make_named_element(factory: &str, name: &str, description: &str) -> Result<gst::Element> {
+    gst::ElementFactory::make(factory)
+        .name(name)
+        .build()
+        .with_context(|| format!("{description} factory '{factory}' is unavailable"))
+}
+
+fn connect_decoded_pad(
+    source: &gst::Element,
+    queue: &gst::Element,
+    pad_prefix: &'static str,
+    description: &'static str,
+) {
+    let weak_queue = queue.downgrade();
+    source.connect_pad_added(move |_, pad| {
+        if !pad.name().starts_with(pad_prefix) {
+            return;
+        }
+        let Some(queue) = weak_queue.upgrade() else {
+            return;
+        };
+        let Some(sink_pad) = queue.static_pad("sink") else {
+            error!(stream = description, "decode queue has no sink pad");
+            return;
+        };
+        if sink_pad.is_linked() {
+            debug!(stream = description, pad = %pad.name(), "ignoring additional decoded stream");
+            return;
+        }
+        match pad.link(&sink_pad) {
+            Ok(_) => debug!(stream = description, pad = %pad.name(), "decoded stream linked"),
+            Err(error) => error!(stream = description, pad = %pad.name(), ?error, "failed to link decoded stream"),
+        }
+    });
+}
+
+fn select_decoded_streams(source: &gst::Element, selected_type: gst::StreamType) {
+    source.connect("select-stream", false, move |values| {
+        let selected = values
+            .get(2)
+            .and_then(|value| value.get::<gst::Stream>().ok())
+            .is_some_and(|stream| stream.stream_type().intersects(selected_type));
+        Some(i32::from(selected).to_value())
+    });
+}
+
+fn optional_output_size(args: &PlaybackArgs) -> Option<(u32, u32)> {
+    args.width.zip(args.height)
+}
+
+fn output_size(args: &PlaybackArgs) -> Result<(u32, u32)> {
+    optional_output_size(args).ok_or_else(|| {
+        anyhow!("--fit cover requires both --width and --height to define the crop aspect ratio")
+    })
+}
+
+fn select_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
+    if let Some(factory) = &args.video_sink {
+        return make_element(factory, "video sink");
+    }
+    if let Some(display) = &args.display {
+        if display.parse::<u32>().is_ok() && gst::ElementFactory::find("kmssink").is_some() {
+            return make_element("kmssink", "DRM/KMS video sink");
+        }
+        if display.starts_with(':') && gst::ElementFactory::find("ximagesink").is_some() {
+            return make_element("ximagesink", "X11 video sink");
+        }
+        if gst::ElementFactory::find("waylandsink").is_some() {
+            return make_element("waylandsink", "Wayland video sink");
+        }
+    }
+    if args.fullscreen
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && gst::ElementFactory::find("waylandsink").is_some()
+    {
+        return make_element("waylandsink", "Wayland video sink");
+    }
+    make_element("autovideosink", "automatic video sink")
+}
+
+fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> {
+    if sink.find_property("force-aspect-ratio").is_some() {
+        sink.set_property("force-aspect-ratio", args.fit == FitMode::Contain);
+    }
+    if args.fullscreen {
+        if sink.find_property("fullscreen").is_none() {
+            bail!(
+                "video sink '{}' cannot be made fullscreen directly; select a fullscreen-capable sink such as waylandsink",
+                sink.name()
+            );
+        }
+        sink.set_property("fullscreen", true);
+    }
+    if let Some(display) = &args.display {
+        if sink.find_property("display").is_some() {
+            sink.set_property("display", display);
+        } else if sink.find_property("connector-id").is_some() {
+            let connector = display.parse::<u32>().with_context(|| {
+                format!("DRM/KMS display identifier '{display}' is not a connector number")
+            })?;
+            sink.set_property("connector-id", connector);
+        } else {
+            bail!(
+                "video sink '{}' does not expose a supported display-selection property",
+                sink.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn configure_decoder_policy(policy: HardwareDecoding) {
+    if policy == HardwareDecoding::Auto {
+        info!(
+            hwdec = "auto",
+            "GStreamer decoder ranking will select hardware acceleration when available"
+        );
+        return;
+    }
+    let decoder_type = gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO;
+    let mut disabled = Vec::new();
+    for factory in gst::ElementFactory::factories_with_type(decoder_type, gst::Rank::MARGINAL) {
+        let is_hardware = factory
+            .metadata(gst::ELEMENT_METADATA_KLASS)
+            .is_some_and(|klass| klass.split('/').any(|part| part == "Hardware"));
+        if is_hardware {
+            disabled.push(factory.name().to_string());
+            factory.set_rank(gst::Rank::NONE);
+        }
+    }
+    info!(hwdec = "off", decoders = ?disabled, "hardware video decoders disabled by rank");
+}
+
+fn log_selected_pipeline_elements(pipeline: &gst::Pipeline) {
+    for result in pipeline.iterate_recurse() {
+        let Ok(element) = result else {
+            continue;
+        };
+        let Some(factory) = element.factory() else {
+            continue;
+        };
+        let Some(klass) = factory.metadata(gst::ELEMENT_METADATA_KLASS) else {
+            continue;
+        };
+        let is_decoder = klass.split('/').any(|part| part == "Decoder");
+        let is_sink = klass.split('/').any(|part| part == "Sink");
+        if is_decoder || is_sink {
+            info!(
+                element = %element.name(),
+                factory = %factory.name(),
+                class = klass,
+                hardware = klass.split('/').any(|part| part == "Hardware"),
+                "selected playback element"
+            );
+        }
+    }
+}
+
+fn select_playback_clock(
+    pipeline: &gst::Pipeline,
+    forced_clock: Option<&gst::Clock>,
+    policy: ClockPolicy,
+    cue_has_audio: bool,
+) -> Result<gst::Clock> {
+    if let Some(clock) = forced_clock {
+        return Ok(clock.clone());
+    }
+    if policy == ClockPolicy::System {
+        return Ok(gst::SystemClock::obtain().upcast());
+    }
+    if policy == ClockPolicy::Audio && !cue_has_audio {
+        bail!(
+            "--clock audio requires the first cue to contain an embedded or external audio stream"
+        );
+    }
+    match pipeline.provide_clock() {
+        Some(clock) => Ok(clock),
+        None if policy == ClockPolicy::Audio => {
+            bail!("--clock audio was requested, but the selected audio sink provides no clock")
+        }
+        None => {
+            warn!("no media clock is available; falling back to the system clock");
+            Ok(gst::SystemClock::obtain().upcast())
+        }
+    }
+}
+
+fn combined_gain(cli_gain_db: f64, cue_gain_db: f64) -> Result<f64> {
+    gain_db_to_linear(cli_gain_db + cue_gain_db)
+}
+
+fn gain_db_to_linear(gain_db: f64) -> Result<f64> {
+    if !gain_db.is_finite() {
+        bail!("gain must be finite");
+    }
+    let linear = 10_f64.powf(gain_db / 20.0);
+    if !linear.is_finite() || linear > 10.0 {
+        bail!("combined gain {gain_db:+.2} dB exceeds the supported maximum of +20 dB");
+    }
+    Ok(linear)
+}
+
+fn format_ns_as_milliseconds(value: u64) -> String {
+    format!("{}.{:03}", value / 1_000_000, value % 1_000_000 / 1_000)
+}
+
 fn force_clock_sync(element: &gst::Element, description: &str) -> Result<()> {
     if element.find_property("sync").is_none() {
         bail!(
@@ -2492,6 +2980,15 @@ fn positive_seconds(value: &str) -> Result<f64, String> {
     }
 }
 
+fn finite_f64(value: &str) -> Result<f64, String> {
+    let number: f64 = value.parse().map_err(|_| "must be a number".to_owned())?;
+    if number.is_finite() {
+        Ok(number)
+    } else {
+        Err("must be finite".to_owned())
+    }
+}
+
 fn non_negative_seconds(value: &str) -> Result<f64, String> {
     let seconds: f64 = value.parse().map_err(|_| "must be a number".to_owned())?;
     if seconds.is_finite() && seconds >= 0.0 {
@@ -2504,11 +3001,12 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Authority, Cli, ClockNs, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction, DriftPolicy,
-        DurationMismatchPolicy, MasterSession, MediaItem, MediaPositionNs, Operation,
-        PlaybackSequence, ProgramCompatibility, StateSnapshot, Timeline, TransportState,
-        can_join_startup, non_negative_seconds, recovery_attempt_is_active,
-        validate_snapshot_generation, validate_state_datagram, validate_subscription,
+        Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction,
+        DriftPolicy, DurationMismatchPolicy, FitMode, HardwareDecoding, MasterSession, MediaItem,
+        MediaPositionNs, Operation, PlaybackSequence, ProgramCompatibility, StateSnapshot,
+        Timeline, TransportState, can_join_startup, combined_gain, finite_f64, gain_db_to_linear,
+        non_negative_seconds, recovery_attempt_is_active, validate_snapshot_generation,
+        validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -2620,6 +3118,50 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["syncplayer", "master", "--media", "a.mp4"]).is_err());
         assert!(Cli::try_parse_from(["syncplayer", "master", "show.toml", "--loop"]).is_err());
+    }
+
+    #[test]
+    fn command_line_accepts_local_output_controls() {
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "master",
+            "show.toml",
+            "--gain-db",
+            "+3",
+            "--fullscreen",
+            "--width",
+            "1920",
+            "--height",
+            "1080",
+            "--display",
+            "HDMI-A-1",
+            "--fit",
+            "cover",
+            "--clock",
+            "audio",
+            "--hwdec",
+            "off",
+        ])
+        .unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        assert_eq!(args.playback.gain_db, 3.0);
+        assert!(args.playback.fullscreen);
+        assert_eq!(args.playback.fit, FitMode::Cover);
+        assert_eq!(args.playback.clock, ClockPolicy::Audio);
+        assert_eq!(args.playback.hwdec, HardwareDecoding::Off);
+        assert!(
+            Cli::try_parse_from(["syncplayer", "master", "show.toml", "--width", "1920"]).is_err()
+        );
+    }
+
+    #[test]
+    fn decibel_gain_is_composed_in_linear_space() {
+        assert!((combined_gain(-6.0, 6.0).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((gain_db_to_linear(20.0).unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!(gain_db_to_linear(20.1).is_err());
+        assert!(finite_f64("NaN").is_err());
     }
 
     #[test]
@@ -2775,10 +3317,18 @@ mod tests {
                 MediaItem {
                     path: PathBuf::from("a"),
                     uri: "file:///a".to_owned(),
+                    audio_uri: "file:///a".to_owned(),
+                    has_audio: true,
+                    mute: false,
+                    gain_db: 0.0,
                 },
                 MediaItem {
                     path: PathBuf::from("b"),
                     uri: "file:///b".to_owned(),
+                    audio_uri: "file:///b".to_owned(),
+                    has_audio: true,
+                    mute: false,
+                    gain_db: 0.0,
                 },
             ],
             cue_durations_ns: vec![10, 20],
@@ -2817,10 +3367,18 @@ mod tests {
                 MediaItem {
                     path: PathBuf::from("a"),
                     uri: "file:///a".to_owned(),
+                    audio_uri: "file:///a".to_owned(),
+                    has_audio: true,
+                    mute: false,
+                    gain_db: 0.0,
                 },
                 MediaItem {
                     path: PathBuf::from("b"),
                     uri: "file:///b".to_owned(),
+                    audio_uri: "file:///b".to_owned(),
+                    has_audio: true,
+                    mute: false,
+                    gain_db: 0.0,
                 },
             ],
             cue_durations_ns: vec![2, 27],

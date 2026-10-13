@@ -60,10 +60,11 @@ Implement:
 - [x] Recovery when the Master pipeline reports CLOCK_LOST.
 
 The version 7 snapshot carries complete program/cue transport identity. `TransportController`
-projects cue boundaries and playlist wraps from the exported Master clock, while `playbin3` prepares
-the known next local URI. Cue duration mismatches are rejected by default (or explicitly warned),
-local Slave EOS is held and diagnosed, and Master clock loss re-pins the exported clock before
-resuming. Physical transition limits still require the P2 validation matrix below.
+projects cue boundaries and playlist wraps from the exported Master clock, while the local decode
+branches prepare the known next video and audio URIs. Cue duration mismatches are rejected by
+default (or explicitly warned), local Slave EOS is held and diagnosed, and Master clock loss
+re-pins the exported clock before resuming. Physical transition limits still require the P2
+validation matrix below.
 
 ### P0 — Turn the networking prototype into the specified state protocol
 
@@ -88,18 +89,24 @@ traffic class leaves playback free-running. See `docs/state-protocol.md` for the
 
 ### P1 — Complete the local playback/output feature set
 
-Fill the remaining Phase 1 playback gaps:
+Status: implemented.
 
-- --gain-db, including positive-gain warning.
-- --fullscreen, width/height, display selection, and contain/cover/stretch.
-- --clock auto|audio|system.
-- --hwdec auto|off and logging of the selected decoder/sinks.
-- External audio files synchronized with cue video.
-- Duration validation between external video and audio.
-- Probe and validate single-file media as thoroughly as playlists.
-- Decide whether playbin3 is sufficient or move to prepared pipelines/branches for deterministic switching.
+The local player now provides:
 
-The current CLI exposes media/playlist, mute, looping, and sink overrides only (main.rs (src/main.rs:84)).
+- [x] `--gain-db`, composed with cue-local gain, including positive-gain warnings.
+- [x] `--fullscreen`, paired width/height, Wayland/X11/DRM display selection, and contain/cover/stretch.
+- [x] `--clock auto|audio|system` on the Master; Slaves remain pinned to the network clock.
+- [x] `--hwdec auto|off` plus selected decoder and sink logging.
+- [x] External audio files on the same pipeline clock and transport as cue video.
+- [x] Strict external video/audio stream and duration validation (50 ms tolerance).
+- [x] The same stream, duration, and gain probing for one-cue and multi-cue programs.
+- [x] Replacement of `playbin3` with independently prepared gapless `uridecodebin3` video/audio
+  branches. This avoids `playbin3`'s lack of an external-audio URI and its ineffective
+  force-software-decoder flag while retaining ahead-of-boundary URI preparation.
+
+Fullscreen and display selection intentionally follow sink capabilities: Wayland display names,
+X11 display names, and numeric DRM/KMS connector IDs are supported by the display abstraction, and
+an explicit sink that lacks the requested property fails clearly instead of ignoring it.
 
 ### P1 — Host-local timed events
 
@@ -183,7 +190,7 @@ Automatic Master election, event failover, GUI/web UI, media transfer, cross-cue
 The following should be evolved rather than rebuilt:
 
 - GStreamer local playback and muting.
-- Gapless playbin3 handoff for playlists and loops.
+- Gapless `uridecodebin3` video/audio handoff for playlists and loops.
 - Media probing and timeline calculations for playlists.
 - Master playback-clock export and Slave network-clock calibration.
 - Future-clock preparation/release.

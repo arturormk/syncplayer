@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-const DURATION_WARNING_NS: u64 = 50_000_000;
+pub const EXTERNAL_AUDIO_DURATION_TOLERANCE_NS: u64 = 50_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaMetadata {
@@ -219,8 +219,8 @@ fn validate_cue(
     }
     if let (Some(video), Some(audio)) = (&video, &audio) {
         let delta = video.duration_ns.abs_diff(audio.duration_ns);
-        if delta > DURATION_WARNING_NS {
-            diagnostics.push(warning_diagnostic(
+        if delta > EXTERNAL_AUDIO_DURATION_TOLERANCE_NS {
+            diagnostics.push(error_diagnostic(
                 &cue.id,
                 format!(
                     "external audio differs from video by {} ms",
@@ -297,15 +297,6 @@ fn validate_event_times(cue: &ResolvedCue, duration_ns: u64, diagnostics: &mut V
 
 fn warn_on_pending_runtime(cue: &ResolvedCue, diagnostics: &mut Vec<Diagnostic>) {
     let mut pending = Vec::new();
-    if cue.audio.is_some() {
-        pending.push("external audio");
-    }
-    if cue.mute {
-        pending.push("cue-local mute");
-    }
-    if cue.gain_db != 0.0 {
-        pending.push("cue-local gain");
-    }
     if !cue.events.is_empty() {
         pending.push("timed events");
     }
