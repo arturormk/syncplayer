@@ -14,11 +14,13 @@ use std::time::{Duration, Instant};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
 use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
-    Capabilities, MAX_LINE_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession, Message, Operation,
-    ReleasePlan, StateSnapshot, Subscription, TransportState, read_message, write_message,
+    Capabilities, DebugLoopState, MAX_LINE_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession, Message,
+    Operation, ReleasePlan, StateSnapshot, Subscription, TransportState, read_message,
+    write_message,
 };
 use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
+use syncplayer::transport::{EosDecision, RuntimeState, TransportController};
 use syncplayer::validation::{DiagnosticLevel, GstMediaProbe, validate_program};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -189,8 +191,19 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     let startup_delay = Duration::from_secs_f64(args.startup_delay);
     let release_delay = Duration::from_secs_f64(args.release_delay);
     let session = new_master_session()?;
-    let generation = 1;
     let initial_plan = player.schedule_start(startup_delay)?;
+    let mut transport = TransportController::new(
+        session,
+        program.program_id.clone(),
+        program.hash,
+        program.cues.iter().map(|cue| cue.id.clone()).collect(),
+        compatibility.cue_durations_ns.clone(),
+        program.looping,
+        ClockNs::new(clock.time().nseconds()),
+    )
+    .context("failed to create authoritative transport")?;
+    transport.start(initial_plan.release_at);
+    let generation = transport.generation();
     if startup_delay.is_zero() {
         info!(
             control = %listener.local_addr()?,
@@ -217,15 +230,12 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         clock_port,
         release_delay,
         startup_plan: initial_plan,
-        authority: Authority {
-            session,
-            generation,
-        },
+        transport: Arc::new(Mutex::new(transport)),
         compatibility,
         registry: ParticipantRegistry::new(),
     });
-    serve_slaves(listener, server);
-    player.monitor(initial_plan)
+    serve_slaves(listener, server.clone());
+    player.monitor(initial_plan, Some(&server.transport))
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
@@ -243,7 +253,7 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
     );
 
     monitor_master(stream, args.master, authority, player.clone(), subscription);
-    player.monitor(plan)
+    player.monitor(plan, None)
 }
 
 fn create_subscription(
@@ -391,9 +401,22 @@ struct SlaveServer {
     clock_port: u16,
     release_delay: Duration,
     startup_plan: ReleasePlan,
-    authority: Authority,
+    transport: Arc<Mutex<TransportController>>,
     compatibility: ProgramCompatibility,
     registry: Arc<ParticipantRegistry>,
+}
+
+impl SlaveServer {
+    fn authority(&self) -> Result<Authority> {
+        let transport = self
+            .transport
+            .lock()
+            .map_err(|_| anyhow!("transport lock poisoned"))?;
+        Ok(Authority {
+            session: transport.session(),
+            generation: transport.generation(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -414,7 +437,8 @@ struct Authority {
 
 fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) -> Result<()> {
     configure_stream(&stream)?;
-    let (subscription, lease) = accept_subscription(&mut stream, peer, server)?;
+    let authority = server.authority()?;
+    let (subscription, lease) = accept_subscription(&mut stream, peer, server, authority)?;
     match read_message(&mut stream).context("failed to read Slave readiness")? {
         Message::Ready => {
             lease.mark_clock_synchronized()?;
@@ -425,7 +449,7 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
         other => bail!("expected READY from Slave, received {other:?}"),
     }
 
-    let plan = plan_slave_release(peer, server)?;
+    let plan = plan_slave_release(peer, server, authority)?;
     write_message(&mut stream, &Message::Release(plan))
         .context("failed to send synchronization state")?;
     info!(
@@ -440,7 +464,7 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
         Message::Prepared {
             session,
             generation,
-        } if session == server.authority.session && generation == server.authority.generation => {
+        } if session == authority.session && generation == authority.generation => {
             lease.mark_ready()?;
             info!(
                 player = %subscription.player_id,
@@ -456,14 +480,14 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
             generation,
         } => bail!(
             "invalid preparation result: session {session}, generation {generation}; expected session {}, generation {}",
-            server.authority.session,
-            server.authority.generation
+            authority.session,
+            authority.generation
         ),
         Message::Error(message) => bail!("Slave failed to prepare release: {message}"),
         other => bail!("expected PREPARED from Slave, received {other:?}"),
     }
 
-    let result = run_master_heartbeats(&mut stream, peer, server, &lease);
+    let result = run_master_heartbeats(&mut stream, peer, server, authority, &lease);
     info!(player = %lease.player_id(), %peer, "Slave participant disconnected");
     result
 }
@@ -472,6 +496,7 @@ fn accept_subscription(
     stream: &mut TcpStream,
     peer: SocketAddr,
     server: &SlaveServer,
+    authority: Authority,
 ) -> Result<(Subscription, ParticipantLease)> {
     let subscription = match read_message(stream) {
         Ok(Message::Subscribe(subscription)) => subscription,
@@ -538,8 +563,8 @@ fn accept_subscription(
     write_message(
         stream,
         &Message::Subscribed {
-            session: server.authority.session,
-            generation: server.authority.generation,
+            session: authority.session,
+            generation: authority.generation,
             clock_port: server.clock_port,
             master_cue_durations_ns: server.compatibility.cue_durations_ns.clone(),
         },
@@ -547,20 +572,24 @@ fn accept_subscription(
     Ok((subscription, lease))
 }
 
-fn plan_slave_release(peer: SocketAddr, server: &SlaveServer) -> Result<ReleasePlan> {
+fn plan_slave_release(
+    peer: SocketAddr,
+    server: &SlaveServer,
+    authority: Authority,
+) -> Result<ReleasePlan> {
     let now = ClockNs::new(server.clock.time().nseconds());
     let minimum_lead_ns = u64::try_from(server.release_delay.as_nanos())
         .context("release delay is too large for the clock")?;
-    let plan = if can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns) {
+    let plan = if server.startup_plan.generation == authority.generation
+        && can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns)
+    {
         info!(%peer, "Slave is ready for the shared startup deadline");
         server.startup_plan
     } else {
         let release_at = now
             .checked_add(server.release_delay)
             .ok_or_else(|| anyhow!("release timestamp overflow"))?;
-        server
-            .player
-            .join_plan(server.authority.generation, release_at)?
+        server.player.join_plan(authority.generation, release_at)?
     };
     Ok(plan)
 }
@@ -671,6 +700,7 @@ fn run_master_heartbeats(
     stream: &mut TcpStream,
     peer: SocketAddr,
     server: &SlaveServer,
+    authority: Authority,
     lease: &ParticipantLease,
 ) -> Result<()> {
     stream.set_read_timeout(Some(LIVENESS_TIMEOUT))?;
@@ -682,13 +712,16 @@ fn run_master_heartbeats(
             .ok_or_else(|| anyhow!("heartbeat sequence overflow"))?;
         let sent_at = Instant::now();
         let master_clock = ClockNs::new(server.clock.time().nseconds());
-        let state = server
-            .player
-            .authoritative_snapshot(master_clock, server.authority.generation)?;
+        let runtime = server
+            .transport
+            .lock()
+            .map_err(|_| anyhow!("transport lock poisoned"))?
+            .snapshot(master_clock);
+        let state = server.player.authoritative_snapshot(runtime)?;
         write_message(
             stream,
             &Message::Heartbeat {
-                session: server.authority.session,
+                session: authority.session,
                 sequence,
                 master_clock,
                 state,
@@ -701,7 +734,7 @@ fn run_master_heartbeats(
             Message::Alive {
                 session,
                 sequence: reply_sequence,
-            } if session == server.authority.session && reply_sequence == sequence => {
+            } if session == authority.session && reply_sequence == sequence => {
                 lease.mark_seen()?;
             }
             Message::Alive {
@@ -709,7 +742,7 @@ fn run_master_heartbeats(
                 sequence: reply_sequence,
             } => bail!(
                 "invalid heartbeat reply: session {session}, sequence {reply_sequence}; expected session {}, sequence {sequence}",
-                server.authority.session
+                authority.session
             ),
             Message::Error(message) => bail!("Slave rejected heartbeat: {message}"),
             other => bail!("expected ALIVE from Slave, received {other:?}"),
@@ -717,7 +750,7 @@ fn run_master_heartbeats(
         let round_trip = sent_at.elapsed();
         debug!(
             %peer,
-            master_session = %server.authority.session,
+            master_session = %authority.session,
             heartbeat_sequence = sequence,
             round_trip_ms = round_trip.as_millis(),
             "Slave heartbeat acknowledged"
@@ -745,7 +778,7 @@ fn monitor_master_session(
         let received_at = Instant::now();
         let (sequence, master_clock, state) =
             validate_heartbeat(&message, authority, last_sequence)?;
-        player.accept_authoritative_snapshot(state, authority)?;
+        player.accept_authoritative_snapshot(&state, authority)?;
         write_message(
             stream,
             &Message::Alive {
@@ -799,7 +832,7 @@ fn validate_heartbeat(
     if state.transport_state == TransportState::Playing && state.anchor_clock > *master_clock {
         bail!("playing snapshot anchor is later than its heartbeat clock");
     }
-    Ok((*sequence, *master_clock, *state))
+    Ok((*sequence, *master_clock, state.clone()))
 }
 
 fn read_control_message_until(stream: &mut TcpStream, deadline: Instant) -> Result<Message> {
@@ -1000,6 +1033,9 @@ struct MediaItem {
 
 #[derive(Debug)]
 struct PlaybackSequence {
+    program_id: String,
+    program_hash: ProgramHash,
+    cue_ids: Vec<String>,
     items: Vec<MediaItem>,
     cue_durations_ns: Vec<u64>,
     timeline: Option<Timeline>,
@@ -1051,6 +1087,9 @@ impl PlaybackSequence {
             .context("invalid program sequence duration")?;
         let from_playlist = items.len() > 1;
         Ok(Self {
+            program_id: program.program_id.clone(),
+            program_hash: program.hash,
+            cue_ids: program.cues.iter().map(|cue| cue.id.clone()).collect(),
             items,
             cue_durations_ns: durations,
             timeline: Some(timeline),
@@ -1083,6 +1122,7 @@ impl PlaybackSequence {
         }
     }
 
+    #[cfg(test)]
     fn cue_identity(&self, absolute_position_ns: u64) -> Result<(ItemPosition, u64)> {
         let item = self.locate(absolute_position_ns)?;
         let iteration = self.timeline.as_ref().map_or(0, |timeline| {
@@ -1109,6 +1149,24 @@ impl PlaybackSequence {
                 item.index
             ),
         }
+    }
+
+    fn position_for_snapshot(
+        &self,
+        item: ItemPosition,
+        playlist_iteration: u64,
+    ) -> Result<MediaPositionNs> {
+        if !self.looping
+            && item.index + 1 == self.items.len()
+            && item.local_ns == self.cue_durations_ns[item.index]
+        {
+            return self
+                .timeline
+                .as_ref()
+                .map(|timeline| MediaPositionNs::new(timeline.total_ns()))
+                .ok_or_else(|| anyhow!("completed sequence has no timeline"));
+        }
+        self.position_for_cue(item, playlist_iteration)
     }
 
     fn sequence_position(&self, position: ItemPosition) -> Result<MediaPositionNs> {
@@ -1164,6 +1222,7 @@ struct PositionSample {
     clock_time: ClockNs,
     expected_sequence_position: MediaPositionNs,
     expected_item: ItemPosition,
+    expected_playlist_iteration: u64,
     actual_sequence_position: MediaPositionNs,
     actual_item: ItemPosition,
     actual_uri: String,
@@ -1245,10 +1304,12 @@ struct Player {
     clock_healthy: AtomicBool,
     clock: Mutex<gst::Clock>,
     plan: Mutex<Option<ReleasePlan>>,
+    transport_state: Mutex<TransportState>,
     recovery_lock: Mutex<()>,
     recovery_in_progress: AtomicBool,
     recovery_attempt: Arc<AtomicU64>,
     drift_policy: Mutex<DriftPolicy>,
+    boundary_mismatch: Mutex<Option<(usize, usize, u64)>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
 }
@@ -1439,10 +1500,12 @@ impl Player {
             clock_healthy: AtomicBool::new(true),
             clock: Mutex::new(clock),
             plan: Mutex::new(None),
+            transport_state: Mutex::new(TransportState::Waiting),
             recovery_lock: Mutex::new(()),
             recovery_in_progress: AtomicBool::new(false),
             recovery_attempt: Arc::new(AtomicU64::new(0)),
             drift_policy: Mutex::new(DriftPolicy::default()),
+            boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
         })
@@ -1572,6 +1635,10 @@ impl Player {
                 .plan
                 .lock()
                 .map_err(|_| anyhow!("plan lock poisoned"))? = Some(plan);
+            *self
+                .transport_state
+                .lock()
+                .map_err(|_| anyhow!("transport state lock poisoned"))? = TransportState::Playing;
         }
 
         let clock = self.clock()?;
@@ -1661,51 +1728,39 @@ impl Player {
         })
     }
 
-    fn authoritative_snapshot(&self, now: ClockNs, generation: u64) -> Result<StateSnapshot> {
-        let plan = self
-            .plan
-            .lock()
-            .map_err(|_| anyhow!("plan lock poisoned"))?
-            .ok_or_else(|| anyhow!("playback has no authoritative plan"))?;
-        if plan.generation != generation {
-            bail!(
-                "authoritative plan generation {} does not match server generation {generation}",
-                plan.generation
-            );
-        }
-        let (transport_state, media_position, anchor_clock) = if plan.release_at > now {
-            (
-                TransportState::Waiting,
-                plan.media_position,
-                plan.release_at,
-            )
-        } else {
-            let elapsed_ns = now.get().saturating_sub(plan.release_at.get());
-            (
-                TransportState::Playing,
-                MediaPositionNs::new(
-                    self.sequence
-                        .project(plan.media_position.get(), elapsed_ns)?,
-                ),
-                now,
-            )
+    fn authoritative_snapshot(&self, runtime: RuntimeState) -> Result<StateSnapshot> {
+        let item = ItemPosition {
+            index: runtime.cue_index,
+            local_ns: runtime.anchor_cue_position.get(),
         };
-        let (item, playlist_iteration) = self.sequence.cue_identity(media_position.get())?;
+        let media_position = self
+            .sequence
+            .position_for_snapshot(item, runtime.playlist_iteration)?;
         Ok(StateSnapshot {
-            generation,
-            transport_state,
-            operation: plan.operation,
+            generation: runtime.generation,
+            program_id: runtime.program_id,
+            program_hash: runtime.program_hash,
+            transport_state: runtime.transport_state,
+            operation: runtime.operation,
             media_position,
-            anchor_clock,
+            anchor_clock: runtime.anchor_clock,
             item_index: u64::try_from(item.index).context("item index exceeds u64")?,
+            cue_id: runtime.cue_id,
+            cue_occurrence: runtime.cue_occurrence,
             item_position: MediaPositionNs::new(item.local_ns),
-            playlist_iteration,
+            cue_duration: runtime.cue_duration,
+            playlist_iteration: runtime.playlist_iteration,
+            debug_loop: runtime.debug_loop.map(|debug_loop| DebugLoopState {
+                start: MediaPositionNs::new(debug_loop.start_ns),
+                end: MediaPositionNs::new(debug_loop.end_ns),
+                events_enabled: debug_loop.events_enabled,
+            }),
         })
     }
 
     fn accept_authoritative_snapshot(
         &self,
-        snapshot: StateSnapshot,
+        snapshot: &StateSnapshot,
         authority: Authority,
     ) -> Result<()> {
         if !validate_snapshot_generation(snapshot, authority)? {
@@ -1718,7 +1773,31 @@ impl Player {
         }
         let item_index = usize::try_from(snapshot.item_index)
             .context("snapshot item index does not fit this host")?;
-        let local_media_position = self.sequence.position_for_cue(
+        if snapshot.program_id != self.sequence.program_id
+            || snapshot.program_hash != self.sequence.program_hash
+        {
+            bail!("authoritative snapshot identifies a different program");
+        }
+        let local_cue_id = self
+            .sequence
+            .cue_ids
+            .get(item_index)
+            .ok_or_else(|| anyhow!("snapshot cue index {item_index} does not exist"))?;
+        if &snapshot.cue_id != local_cue_id {
+            bail!(
+                "snapshot cue identity mismatch: index {item_index} is '{}' locally, Master announced '{}'",
+                local_cue_id,
+                snapshot.cue_id
+            );
+        }
+        let master_duration_ns = snapshot.cue_duration.get();
+        if master_duration_ns == 0 {
+            bail!("snapshot announced a zero cue duration");
+        }
+        if snapshot.item_position.get() > master_duration_ns {
+            bail!("snapshot cue position exceeds the authoritative cue duration");
+        }
+        let local_media_position = self.sequence.position_for_snapshot(
             ItemPosition {
                 index: item_index,
                 local_ns: snapshot.item_position.get(),
@@ -1749,10 +1828,18 @@ impl Player {
             );
             *plan = Some(refreshed);
         }
+        *self
+            .transport_state
+            .lock()
+            .map_err(|_| anyhow!("transport state lock poisoned"))? = snapshot.transport_state;
         Ok(())
     }
 
-    fn monitor(&self, initial_plan: ReleasePlan) -> Result<()> {
+    fn monitor(
+        &self,
+        initial_plan: ReleasePlan,
+        master_transport: Option<&Arc<Mutex<TransportController>>>,
+    ) -> Result<()> {
         let bus = self
             .pipeline
             .bus()
@@ -1776,27 +1863,11 @@ impl Player {
                         ));
                     }
                     gst::MessageView::Eos(..) => {
-                        if self.sequence.looping {
-                            break Err(anyhow!(
-                                "looping pipeline reached EOS instead of performing a gapless handoff"
-                            ));
+                        if self.handle_eos(master_transport)? {
+                            info!("end of stream");
+                            break Ok(());
                         }
-                        let current = self
-                            .cursor
-                            .lock()
-                            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
-                            .current();
-                        let current_uri = self.pipeline.property::<Option<String>>("current-uri");
-                        let final_uri = self.sequence.items.last().map(|item| item.uri.as_str());
-                        if current + 1 < self.sequence.items.len()
-                            || current_uri.as_deref() != final_uri
-                        {
-                            break Err(anyhow!(
-                                "media sequence reached EOS before its final item (cursor item {current}, current URI {current_uri:?})"
-                            ));
-                        }
-                        info!("end of stream");
-                        break Ok(());
+                        continue;
                     }
                     gst::MessageView::ClockLost(..) => {
                         self.set_clock_health(false);
@@ -1805,10 +1876,13 @@ impl Player {
                                 recovery_reason = "clock-lost",
                                 "Slave pipeline reported CLOCK_LOST; shared clock marked unhealthy and local drift repair disabled"
                             ),
-                            PlayerRole::Master => error!(
-                                recovery_reason = "clock-lost",
-                                "Master pipeline reported CLOCK_LOST; this fault is not automatically recovered"
-                            ),
+                            PlayerRole::Master => {
+                                warn!(
+                                    recovery_reason = "clock-lost",
+                                    "Master pipeline reported CLOCK_LOST; rebuilding clock selection"
+                                );
+                                self.recover_master_clock(master_transport)?;
+                            }
                         }
                     }
                     _ => unreachable!(),
@@ -1833,6 +1907,102 @@ impl Player {
         result
     }
 
+    /// Returns true only for the authoritative end of a non-looping program.
+    fn handle_eos(
+        &self,
+        master_transport: Option<&Arc<Mutex<TransportController>>>,
+    ) -> Result<bool> {
+        if self.role == PlayerRole::Slave {
+            let current_uri = self.pipeline.property::<Option<String>>("current-uri");
+            warn!(
+                ?current_uri,
+                "Slave reached local EOS; holding the current logical cue until authoritative state advances"
+            );
+            self.pipeline
+                .set_state(gst::State::Paused)
+                .context("failed to hold Slave pipeline after local EOS")?;
+            return Ok(false);
+        }
+
+        let transport = master_transport
+            .ok_or_else(|| anyhow!("Master player has no authoritative transport"))?;
+        let now = ClockNs::new(self.clock()?.time().nseconds());
+        let decision = transport
+            .lock()
+            .map_err(|_| anyhow!("transport lock poisoned"))?
+            .master_eos(now);
+        if let EosDecision::HeldEarly { remaining_ns } = decision {
+            warn!(
+                remaining_ns,
+                "Master reached EOS before its authoritative cue boundary; holding the cue"
+            );
+            self.pipeline
+                .set_state(gst::State::Paused)
+                .context("failed to hold early Master EOS")?;
+            return Ok(false);
+        }
+        if decision == EosDecision::Advanced {
+            debug!("Master EOS confirmed an authoritative cue transition");
+        }
+        if self.sequence.looping {
+            bail!(
+                "Master looping pipeline reached terminal EOS instead of performing its prepared handoff"
+            );
+        }
+        let current = self
+            .cursor
+            .lock()
+            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+            .current();
+        let current_uri = self.pipeline.property::<Option<String>>("current-uri");
+        let final_uri = self.sequence.items.last().map(|item| item.uri.as_str());
+        if current + 1 < self.sequence.items.len() || current_uri.as_deref() != final_uri {
+            bail!(
+                "media sequence reached EOS before its final item (cursor item {current}, current URI {current_uri:?})"
+            );
+        }
+        Ok(true)
+    }
+
+    fn recover_master_clock(
+        &self,
+        master_transport: Option<&Arc<Mutex<TransportController>>>,
+    ) -> Result<()> {
+        let _recovery = self
+            .recovery_lock
+            .lock()
+            .map_err(|_| anyhow!("recovery lock poisoned"))?;
+        let clock = self.clock()?;
+        self.pipeline
+            .set_state(gst::State::Paused)
+            .context("failed to pause Master during clock recovery")?;
+        wait_for_state(
+            &self.pipeline,
+            PREROLL_TIMEOUT,
+            "Master did not pause during clock recovery",
+        )?;
+        // The exported clock remains the installation time authority. Pin it
+        // again before PLAYING so a disappearing sink clock cannot silently
+        // replace the clock domain seen by Slaves.
+        self.pipeline.use_clock(Some(&clock));
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .context("failed to resume Master after clock recovery")?;
+        let now = ClockNs::new(clock.time().nseconds());
+        master_transport
+            .ok_or_else(|| anyhow!("Master player has no authoritative transport"))?
+            .lock()
+            .map_err(|_| anyhow!("transport lock poisoned"))?
+            .reanchor(now);
+        self.set_clock_health(true);
+        info!(
+            recovery_reason = "clock-lost",
+            clock = %clock.name(),
+            "Master clock recovery completed"
+        );
+        Ok(())
+    }
+
     fn process_telemetry(&self, fallback_plan: ReleasePlan) -> Result<()> {
         let Some(sample) = self.position_sample(fallback_plan)? else {
             self.drift_policy
@@ -1848,6 +2018,7 @@ impl Player {
             expected_sequence_position_ns = sample.expected_sequence_position.get(),
             expected_item_index = sample.expected_item.index,
             expected_item_local_ns = sample.expected_item.local_ns,
+            expected_playlist_iteration = sample.expected_playlist_iteration,
             actual_sequence_position_ns = sample.actual_sequence_position.get(),
             actual_item_index = sample.actual_item.index,
             actual_item_local_ns = sample.actual_item.local_ns,
@@ -1857,6 +2028,7 @@ impl Player {
             transition_in_progress = sample.transition_in_progress,
             "position telemetry"
         );
+        self.diagnose_boundary_mismatch(&sample)?;
 
         if sample.transition_in_progress || !self.clock_healthy.load(Ordering::Acquire) {
             self.drift_policy
@@ -1901,6 +2073,32 @@ impl Player {
         Ok(())
     }
 
+    fn diagnose_boundary_mismatch(&self, sample: &PositionSample) -> Result<()> {
+        let mut previous = self
+            .boundary_mismatch
+            .lock()
+            .map_err(|_| anyhow!("boundary mismatch lock poisoned"))?;
+        if sample.expected_item.index == sample.actual_item.index {
+            *previous = None;
+            return Ok(());
+        }
+        let mismatch = (
+            sample.expected_item.index,
+            sample.actual_item.index,
+            sample.expected_playlist_iteration,
+        );
+        if previous.as_ref() != Some(&mismatch) {
+            warn!(
+                authoritative_cue_index = sample.expected_item.index,
+                local_cue_index = sample.actual_item.index,
+                playlist_iteration = sample.expected_playlist_iteration,
+                "local cue boundary differs from the Master; treating the local transition as diagnostic only"
+            );
+            *previous = Some(mismatch);
+        }
+        Ok(())
+    }
+
     fn position_sample(&self, fallback_plan: ReleasePlan) -> Result<Option<PositionSample>> {
         let _recovery = match self.recovery_lock.try_lock() {
             Ok(recovery) => recovery,
@@ -1918,12 +2116,23 @@ impl Player {
             .unwrap_or(fallback_plan);
         let clock = self.clock()?;
         let clock_now = clock.time().nseconds();
-        let elapsed_ns = clock_now.saturating_sub(plan.release_at.get());
+        let transport_state = *self
+            .transport_state
+            .lock()
+            .map_err(|_| anyhow!("transport state lock poisoned"))?;
+        let elapsed_ns = if transport_state == TransportState::Playing {
+            clock_now.saturating_sub(plan.release_at.get())
+        } else {
+            0
+        };
         let expected_sequence_position = MediaPositionNs::new(
             self.sequence
                 .project(plan.media_position.get(), elapsed_ns)?,
         );
         let expected_item = self.sequence.locate(expected_sequence_position.get())?;
+        let expected_playlist_iteration = self.sequence.timeline.as_ref().map_or(0, |timeline| {
+            timeline.playlist_iteration(expected_sequence_position.get())
+        });
         let Some(actual_local) = self.pipeline.query_position::<gst::ClockTime>() else {
             return Ok(None);
         };
@@ -1964,6 +2173,7 @@ impl Player {
             clock_time: ClockNs::new(clock_now),
             expected_sequence_position,
             expected_item,
+            expected_playlist_iteration,
             actual_sequence_position,
             actual_item,
             actual_uri,
@@ -2039,7 +2249,7 @@ impl Player {
     }
 }
 
-fn validate_snapshot_generation(snapshot: StateSnapshot, authority: Authority) -> Result<bool> {
+fn validate_snapshot_generation(snapshot: &StateSnapshot, authority: Authority) -> Result<bool> {
     if snapshot.generation < authority.generation {
         return Ok(false);
     }
@@ -2223,13 +2433,19 @@ mod tests {
     fn snapshot(generation: u64) -> StateSnapshot {
         StateSnapshot {
             generation,
+            program_id: "show".to_owned(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
             transport_state: TransportState::Playing,
             operation: Operation::Start,
             media_position: MediaPositionNs::new(0),
             anchor_clock: ClockNs::new(100),
             item_index: 0,
+            cue_id: "first".to_owned(),
+            cue_occurrence: 0,
             item_position: MediaPositionNs::new(0),
+            cue_duration: MediaPositionNs::new(1_000),
             playlist_iteration: 0,
+            debug_loop: None,
         }
     }
 
@@ -2331,9 +2547,9 @@ mod tests {
     #[test]
     fn snapshots_require_the_current_generation() {
         let authority = authority();
-        assert!(validate_snapshot_generation(snapshot(7), authority).unwrap());
-        assert!(!validate_snapshot_generation(snapshot(6), authority).unwrap());
-        assert!(validate_snapshot_generation(snapshot(8), authority).is_err());
+        assert!(validate_snapshot_generation(&snapshot(7), authority).unwrap());
+        assert!(!validate_snapshot_generation(&snapshot(6), authority).unwrap());
+        assert!(validate_snapshot_generation(&snapshot(8), authority).is_err());
     }
 
     #[test]
@@ -2405,6 +2621,9 @@ mod tests {
     #[test]
     fn sequence_error_is_correct_across_item_and_loop_boundaries() {
         let sequence = |looping| PlaybackSequence {
+            program_id: "show".to_owned(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
+            cue_ids: vec!["a".to_owned(), "b".to_owned()],
             items: vec![
                 MediaItem {
                     path: PathBuf::from("a"),
@@ -2444,6 +2663,9 @@ mod tests {
     #[test]
     fn authoritative_cue_maps_through_local_playlist_durations() {
         let sequence = PlaybackSequence {
+            program_id: "show".to_owned(),
+            program_hash: ProgramHash::from_bytes([1; 32]),
+            cue_ids: vec!["a".to_owned(), "b".to_owned()],
             items: vec![
                 MediaItem {
                     path: PathBuf::from("a"),

@@ -173,7 +173,7 @@ continues playing from its last disciplined clock estimate, and attempts to reco
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 5 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 6 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
 ### Logging

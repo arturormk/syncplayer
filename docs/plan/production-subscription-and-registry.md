@@ -17,4 +17,5 @@ Status: Complete
 
 This increments the laboratory control protocol to version 5. Subscription remains on the bounded
 TCP control channel; independent state transport and production binary encoding remain the later
-state-protocol milestone.
+state-protocol milestone. The subsequent authoritative-transport milestone increments the combined
+protocol to version 6 without changing these subscription fields.

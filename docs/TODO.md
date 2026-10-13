@@ -1,4 +1,4 @@
-The repository has a solid synchronization prototype, but it is not yet the complete player described by the blueprint. The clock/recovery work is comparatively advanced; configuration, authoritative transport, events, and installation controls are the main missing layers.
+The repository has a solid synchronization prototype, but it is not yet the complete player described by the blueprint. The clock/recovery, configuration, subscription, and authoritative transport layers are comparatively advanced; the production state protocol, events, and installation controls are the main missing layers.
 
 I treated explicitly optional/future items and the V1 exclusions in BLUEPRINT.md (docs/BLUEPRINT.md:3061) as non-blocking.
 
@@ -39,25 +39,31 @@ Implement:
 - [x] Stale-subscriber expiration.
 - [x] Status information suitable for the later installation console.
 
-The version 5 control handshake now exchanges and validates this information before clock
-calibration. Independent state transport and production encoding remain in the later state-protocol
-milestone.
+The subscription handshake introduced in version 5 exchanges and validates this information before
+clock calibration; the authoritative transport work below advances the combined protocol to version
+6. Independent state transport and production encoding remain in the later state-protocol milestone.
 
 ### P0 — Authoritative transport and cue progression
+
+Status: implemented.
 
 Introduce a real Master transport controller rather than a single immutable startup plan.
 
 Implement:
 
-- Mutable runtime state containing program/cue identity, cue occurrence, local cue position, duration, paused/playing state, debug loop, session, and generation.
-- Generation increments for goto, stop, pause/release discontinuities, loop changes, and program loads.
-- Master-owned cue completion and transition decisions.
-- Slaves holding or diagnosing early local EOS rather than advancing independently.
-- Prepared, exact-clock cue transitions and playlist wrap.
-- Defined behavior for local duration differences and early/late EOS.
-- Recovery when the Master pipeline reports CLOCK_LOST.
+- [x] Mutable runtime state containing program/cue identity, cue occurrence, local cue position, duration, paused/playing state, debug loop, session, and generation.
+- [x] Generation increments for goto, stop, pause/release discontinuities, loop changes, and program loads.
+- [x] Master-owned cue completion and transition decisions.
+- [x] Slaves holding or diagnosing early local EOS rather than advancing independently.
+- [x] Prepared, exact-clock cue transitions and playlist wrap.
+- [x] Defined behavior for local duration differences and early/late EOS.
+- [x] Recovery when the Master pipeline reports CLOCK_LOST.
 
-At present generation is fixed at 1 (main.rs (src/main.rs:161)), TransportState has only Waiting and Playing (protocol.rs (src/protocol.rs:80)), and every host queues its next URI independently through playbin3. Logical cue mapping exists, but full Master authority at boundaries does not.
+The version 6 snapshot carries complete program/cue transport identity. `TransportController`
+projects cue boundaries and playlist wraps from the exported Master clock, while `playbin3` prepares
+the known next local URI. Cue duration mismatches are rejected by default (or explicitly warned),
+local Slave EOS is held and diagnosed, and Master clock loss re-pins the exported clock before
+resuming. Physical transition limits still require the P2 validation matrix below.
 
 ### P0 — Turn the networking prototype into the specified state protocol
 
@@ -184,4 +190,5 @@ The following should be evolved rather than rebuilt:
 - Multiple concurrent Slaves.
 - Linux/Pi build assistance and media-normalization tooling.
 
-All 32 current unit tests pass. The most coherent next milestone is therefore: implement the complete ProgramConfig, validation/hash, and identity-aware subscription together, then use that foundation to replace the fixed-generation laboratory timeline with the authoritative cue/transport controller.
+All current unit tests pass. The next implementation milestone is the production state protocol,
+followed by local playback/output completion and host-local timed events.

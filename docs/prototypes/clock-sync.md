@@ -14,13 +14,13 @@ pipeline, receives the Master's projected media position at a future absolute cl
 acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
 interrupting existing playback.
 
-The bounded, newline-delimited protocol is currently version 5. Before clock calibration, a Slave
+The bounded, newline-delimited protocol is currently version 6. Before clock calibration, a Slave
 subscribes with its player identity, program identity and hash, software version, capabilities,
 state endpoint, and probed cue durations. The Master rejects incompatible or duplicate active
 participants and returns its authoritative cue durations on success. A Master session UUID
-identifies one process run; the transport generation remains stable when Slaves join and changes
-only for a future discontinuous authoritative timeline change. Master and Slave binaries must have
-the same protocol version.
+identifies one process run; the transport generation remains stable when Slaves join and changes for
+goto, stop, pause/release, debug-loop changes, and program loads. Master and Slave binaries must
+have the same protocol version.
 
 ## Runtime recovery behavior
 
@@ -30,11 +30,12 @@ the same protocol version.
   valid heartbeat closes the old socket even if TCP still reports it as established.
 - Playback free-runs during the outage. Reconnection retries once per second, creates a new network
   clock, calibrates it, and uses the normal prepared pause/seek/future-release path.
-- Snapshots contain session context, transport generation and state, operation, sequence-position
-  and clock anchors, logical item index, item-local position, and playlist iteration. Each host maps
-  that cue-local anchor through its own rendition durations, avoiding false identity failures at
-  playlist boundaries. Unchanged state does not seek; stale state is ignored; a newer generation
-  requires a prepared rejoin.
+- Snapshots contain session context, program identity/hash, transport generation and state,
+  operation, sequence-position and clock anchors, cue index/ID/occurrence/duration, item-local
+  position, playlist iteration, and optional debug-loop state. Each host maps that cue-local anchor
+  through its own rendition durations, avoiding false identity failures at playlist boundaries.
+  Unchanged state does not seek; stale state is ignored; a newer generation requires a prepared
+  rejoin.
 - Snapshots come from the Master's logical plan and authoritative clock, not its renderer's queried
   position. A Master renderer stall is therefore repaired locally instead of being published as a
   timeline for Slaves to chase.
@@ -47,6 +48,9 @@ the same protocol version.
 - Reconnect and local-drift recovery share one serialized coordinator. Starting a newer recovery
   cancels its predecessor's scheduled release, and attempt IDs prevent late workers from starting
   playback.
+- A Slave's local EOS is held and treated as diagnostic rather than logical cue authority. Master
+  cue boundaries and playlist wraps are projected from the exported clock, and `CLOCK_LOST` on the
+  Master pauses, re-pins that clock, resumes, and re-anchors the logical transport.
 
 ## Test asset
 

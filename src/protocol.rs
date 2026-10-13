@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_LINE_BYTES: usize = 4_096;
 pub const MAX_SUBSCRIPTION_CUES: usize = 128;
 pub const MAX_ID_BYTES: usize = 128;
@@ -99,6 +99,11 @@ pub enum Operation {
     Start,
     Resume,
     Goto,
+    Pause,
+    Stop,
+    Loop,
+    Unloop,
+    Load,
 }
 
 impl fmt::Display for Operation {
@@ -107,6 +112,11 @@ impl fmt::Display for Operation {
             Self::Start => "START",
             Self::Resume => "RESUME",
             Self::Goto => "GOTO",
+            Self::Pause => "PAUSE",
+            Self::Stop => "STOP",
+            Self::Loop => "LOOP",
+            Self::Unloop => "UNLOOP",
+            Self::Load => "LOAD",
         })
     }
 }
@@ -119,6 +129,11 @@ impl FromStr for Operation {
             "START" => Ok(Self::Start),
             "RESUME" => Ok(Self::Resume),
             "GOTO" => Ok(Self::Goto),
+            "PAUSE" => Ok(Self::Pause),
+            "STOP" => Ok(Self::Stop),
+            "LOOP" => Ok(Self::Loop),
+            "UNLOOP" => Ok(Self::Unloop),
+            "LOAD" => Ok(Self::Load),
             _ => Err(ParseError::UnknownOperation(value.to_owned())),
         }
     }
@@ -127,6 +142,7 @@ impl FromStr for Operation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportState {
     Waiting,
+    Paused,
     Playing,
 }
 
@@ -134,6 +150,7 @@ impl fmt::Display for TransportState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Waiting => "WAITING",
+            Self::Paused => "PAUSED",
             Self::Playing => "PLAYING",
         })
     }
@@ -145,6 +162,7 @@ impl FromStr for TransportState {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "WAITING" => Ok(Self::Waiting),
+            "PAUSED" => Ok(Self::Paused),
             "PLAYING" => Ok(Self::Playing),
             _ => Err(ParseError::UnknownTransportState(value.to_owned())),
         }
@@ -161,15 +179,28 @@ pub struct ReleasePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugLoopState {
+    pub start: MediaPositionNs,
+    pub end: MediaPositionNs,
+    pub events_enabled: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateSnapshot {
     pub generation: u64,
+    pub program_id: String,
+    pub program_hash: ProgramHash,
     pub transport_state: TransportState,
     pub operation: Operation,
     pub media_position: MediaPositionNs,
     pub anchor_clock: ClockNs,
     pub item_index: u64,
+    pub cue_id: String,
+    pub cue_occurrence: u64,
     pub item_position: MediaPositionNs,
+    pub cue_duration: MediaPositionNs,
     pub playlist_iteration: u64,
+    pub debug_loop: Option<DebugLoopState>,
 }
 
 impl ReleasePlan {
@@ -262,15 +293,21 @@ impl Message {
                 master_clock,
                 state,
             } => format!(
-                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {} {}",
+                "{PREFIX} {PROTOCOL_VERSION} HEARTBEAT {session} {sequence} {master_clock} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                 state.generation,
+                encode_text(&state.program_id),
+                state.program_hash,
                 state.transport_state,
                 state.operation,
                 state.media_position,
                 state.anchor_clock,
                 state.item_index,
+                encode_text(&state.cue_id),
+                state.cue_occurrence,
                 state.item_position,
-                state.playlist_iteration
+                state.cue_duration,
+                state.playlist_iteration,
+                encode_debug_loop(state.debug_loop)
             ),
             Self::Alive { session, sequence } => {
                 format!("{PREFIX} {PROTOCOL_VERSION} ALIVE {session} {sequence}")
@@ -337,16 +374,24 @@ impl Message {
                 master_clock: ClockNs::new(parse(next(&mut fields)?, "Master clock")?),
                 state: StateSnapshot {
                     generation: parse(next(&mut fields)?, "generation")?,
+                    program_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
+                    program_hash: next(&mut fields)?
+                        .parse()
+                        .map_err(|_| ParseError::InvalidProgramHash)?,
                     transport_state: next(&mut fields)?.parse()?,
                     operation: next(&mut fields)?.parse()?,
                     media_position: MediaPositionNs::new(parse(next(&mut fields)?, "position")?),
                     anchor_clock: ClockNs::new(parse(next(&mut fields)?, "anchor clock")?),
                     item_index: parse(next(&mut fields)?, "item index")?,
+                    cue_id: decode_text(next(&mut fields)?, MAX_ID_BYTES)?,
+                    cue_occurrence: parse(next(&mut fields)?, "cue occurrence")?,
                     item_position: MediaPositionNs::new(parse(
                         next(&mut fields)?,
                         "item position",
                     )?),
+                    cue_duration: MediaPositionNs::new(parse(next(&mut fields)?, "cue duration")?),
                     playlist_iteration: parse(next(&mut fields)?, "playlist iteration")?,
+                    debug_loop: parse_debug_loop(next(&mut fields)?)?,
                 },
             },
             "ALIVE" => Self::Alive {
@@ -423,6 +468,7 @@ pub enum ParseError {
     InvalidUtf8,
     TextTooLong,
     InvalidCueDurations,
+    InvalidDebugLoop,
     TooManyCues,
     UnsupportedVersion(u16),
     UnknownMessage(String),
@@ -540,6 +586,48 @@ fn parse_durations(value: &str) -> Result<Vec<u64>, ParseError> {
     Ok(durations)
 }
 
+fn encode_debug_loop(debug_loop: Option<DebugLoopState>) -> String {
+    debug_loop.map_or_else(
+        || "-".to_owned(),
+        |value| {
+            format!(
+                "{},{},{}",
+                value.start.get(),
+                value.end.get(),
+                u8::from(value.events_enabled)
+            )
+        },
+    )
+}
+
+fn parse_debug_loop(value: &str) -> Result<Option<DebugLoopState>, ParseError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let mut fields = value.split(',');
+    let start = parse(
+        fields.next().ok_or(ParseError::InvalidDebugLoop)?,
+        "loop start",
+    )?;
+    let end = parse(
+        fields.next().ok_or(ParseError::InvalidDebugLoop)?,
+        "loop end",
+    )?;
+    let events_enabled = match fields.next() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => return Err(ParseError::InvalidDebugLoop),
+    };
+    if fields.next().is_some() || start >= end {
+        return Err(ParseError::InvalidDebugLoop);
+    }
+    Ok(Some(DebugLoopState {
+        start: MediaPositionNs::new(start),
+        end: MediaPositionNs::new(end),
+        events_enabled,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,13 +676,23 @@ mod tests {
                 master_clock: ClockNs::new(9_000),
                 state: StateSnapshot {
                     generation: 7,
+                    program_id: "museum show".to_owned(),
+                    program_hash: ProgramHash::from_bytes([0xab; 32]),
                     transport_state: TransportState::Playing,
                     operation: Operation::Start,
                     media_position: MediaPositionNs::new(3_000),
                     anchor_clock: ClockNs::new(8_000),
                     item_index: 2,
+                    cue_id: "main".to_owned(),
+                    cue_occurrence: 14,
                     item_position: MediaPositionNs::new(400),
+                    cue_duration: MediaPositionNs::new(5_000),
                     playlist_iteration: 4,
+                    debug_loop: Some(DebugLoopState {
+                        start: MediaPositionNs::new(100),
+                        end: MediaPositionNs::new(200),
+                        events_enabled: false,
+                    }),
                 },
             },
             Message::Alive {
@@ -611,12 +709,12 @@ mod tests {
     fn rejects_malformed_session_and_heartbeat() {
         assert_eq!(
             Message::decode(
-                "SYNCPLAYER-LAB 5 HEARTBEAT not-a-session 1 2 3 PLAYING START 4 5 6 7 8"
+                "SYNCPLAYER-LAB 6 HEARTBEAT not-a-session 1 2 3 4 5 PLAYING START 6 7 8 9 10 11 12 13 -"
             ),
             Err(ParseError::InvalidSession)
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 5 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
+            Message::decode("SYNCPLAYER-LAB 6 ALIVE 0123456789abcdef0123456789abcdef 1 surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -629,13 +727,23 @@ mod tests {
             master_clock: ClockNs::new(u64::MAX),
             state: StateSnapshot {
                 generation: u64::MAX,
+                program_id: "p".repeat(MAX_ID_BYTES),
+                program_hash: ProgramHash::from_bytes([0xff; 32]),
                 transport_state: TransportState::Playing,
                 operation: Operation::Resume,
                 media_position: MediaPositionNs::new(u64::MAX),
                 anchor_clock: ClockNs::new(u64::MAX),
                 item_index: u64::MAX,
+                cue_id: "c".repeat(MAX_ID_BYTES),
+                cue_occurrence: u64::MAX,
                 item_position: MediaPositionNs::new(u64::MAX),
+                cue_duration: MediaPositionNs::new(u64::MAX),
                 playlist_iteration: u64::MAX,
+                debug_loop: Some(DebugLoopState {
+                    start: MediaPositionNs::new(u64::MAX - 1),
+                    end: MediaPositionNs::new(u64::MAX),
+                    events_enabled: true,
+                }),
             },
         };
         assert!(message.encode().len() <= MAX_LINE_BYTES);
@@ -648,7 +756,7 @@ mod tests {
             Err(ParseError::UnsupportedVersion(99))
         );
         assert_eq!(
-            Message::decode("SYNCPLAYER-LAB 5 READY surprise"),
+            Message::decode("SYNCPLAYER-LAB 6 READY surprise"),
             Err(ParseError::TrailingFields)
         );
     }
@@ -686,7 +794,9 @@ mod tests {
     #[test]
     fn subscription_rejects_invalid_and_excessive_fields() {
         let hash = ProgramHash::from_bytes([0; 32]);
-        let prefix = format!("SYNCPLAYER-LAB 5 SUBSCRIBE 61 62 {hash} 63 0000000000000007 0 ");
+        let prefix = format!(
+            "SYNCPLAYER-LAB {PROTOCOL_VERSION} SUBSCRIBE 61 62 {hash} 63 0000000000000007 0 "
+        );
         assert_eq!(
             Message::decode(&format!("{prefix}0")),
             Err(ParseError::InvalidCueDurations)
