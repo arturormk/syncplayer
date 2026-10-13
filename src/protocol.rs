@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 16_384;
 pub const MAX_STATE_PACKET_BYTES: usize = 1_024;
 pub const MAX_SUBSCRIPTION_CUES: usize = 128;
@@ -25,8 +25,12 @@ impl Capabilities {
     pub const PREPARED_RELEASE: u64 = 1 << 1;
     pub const STATE_DATAGRAM: u64 = 1 << 2;
     pub const BINARY_CONTROL: u64 = 1 << 3;
-    pub const REQUIRED: u64 =
-        Self::NETWORK_CLOCK | Self::PREPARED_RELEASE | Self::STATE_DATAGRAM | Self::BINARY_CONTROL;
+    pub const DIAGNOSTIC_TELEMETRY: u64 = 1 << 4;
+    pub const REQUIRED: u64 = Self::NETWORK_CLOCK
+        | Self::PREPARED_RELEASE
+        | Self::STATE_DATAGRAM
+        | Self::BINARY_CONTROL
+        | Self::DIAGNOSTIC_TELEMETRY;
     #[must_use]
     pub const fn current() -> Self {
         Self(Self::REQUIRED)
@@ -152,6 +156,7 @@ impl TransportState {
 pub struct ReleasePlan {
     pub generation: u64,
     pub operation: Operation,
+    pub transport_state: TransportState,
     pub media_position: MediaPositionNs,
     pub release_at: ClockNs,
 }
@@ -187,6 +192,23 @@ pub struct StateDatagram {
     pub sequence: u64,
     pub master_clock: ClockNs,
     pub state: StateSnapshot,
+}
+
+/// A bounded, periodic observation made in the shared clock domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticTelemetry {
+    pub clock_time: ClockNs,
+    pub generation: u64,
+    pub expected_position: MediaPositionNs,
+    pub actual_position: MediaPositionNs,
+    pub error_ns: i64,
+    pub cue_index: u64,
+    pub cue_position: MediaPositionNs,
+    pub pipeline_playing: bool,
+    pub transition_in_progress: bool,
+    pub clock_healthy: bool,
+    pub disconnect_count: u64,
+    pub recovery_count: u64,
 }
 
 impl ReleasePlan {
@@ -233,6 +255,10 @@ pub enum Message {
         session: MasterSession,
         sequence: u64,
     },
+    Telemetry {
+        session: MasterSession,
+        sample: DiagnosticTelemetry,
+    },
     Error(String),
 }
 
@@ -246,6 +272,7 @@ impl Message {
             Self::Prepared { .. } => 5,
             Self::Keepalive { .. } => 6,
             Self::KeepaliveAck { .. } => 7,
+            Self::Telemetry { .. } => 8,
             Self::Error(_) => 255,
         }
     }
@@ -278,6 +305,7 @@ impl Message {
             Self::Release(v) => {
                 u64v(&mut out, v.generation);
                 out.push(v.operation.code());
+                out.push(v.transport_state.code());
                 u64v(&mut out, v.media_position.get());
                 u64v(&mut out, v.release_at.get());
             }
@@ -291,6 +319,21 @@ impl Message {
             Self::Keepalive { session, sequence } | Self::KeepaliveAck { session, sequence } => {
                 u128v(&mut out, session.get());
                 u64v(&mut out, *sequence);
+            }
+            Self::Telemetry { session, sample } => {
+                u128v(&mut out, session.get());
+                u64v(&mut out, sample.clock_time.get());
+                u64v(&mut out, sample.generation);
+                u64v(&mut out, sample.expected_position.get());
+                u64v(&mut out, sample.actual_position.get());
+                out.extend_from_slice(&sample.error_ns.to_be_bytes());
+                u64v(&mut out, sample.cue_index);
+                u64v(&mut out, sample.cue_position.get());
+                out.push(u8::from(sample.pipeline_playing));
+                out.push(u8::from(sample.transition_in_progress));
+                out.push(u8::from(sample.clock_healthy));
+                u64v(&mut out, sample.disconnect_count);
+                u64v(&mut out, sample.recovery_count);
             }
             Self::Error(value) => string(&mut out, value, MAX_ERROR_BYTES)?,
         }
@@ -323,6 +366,7 @@ impl Message {
             4 => Self::Release(ReleasePlan {
                 generation: d.u64()?,
                 operation: Operation::decode(d.u8()?)?,
+                transport_state: TransportState::decode(d.u8()?)?,
                 media_position: MediaPositionNs::new(d.u64()?),
                 release_at: ClockNs::new(d.u64()?),
             }),
@@ -337,6 +381,23 @@ impl Message {
             7 => Self::KeepaliveAck {
                 session: MasterSession::new(d.u128()?),
                 sequence: d.u64()?,
+            },
+            8 => Self::Telemetry {
+                session: MasterSession::new(d.u128()?),
+                sample: DiagnosticTelemetry {
+                    clock_time: ClockNs::new(d.u64()?),
+                    generation: d.u64()?,
+                    expected_position: MediaPositionNs::new(d.u64()?),
+                    actual_position: MediaPositionNs::new(d.u64()?),
+                    error_ns: i64::from_be_bytes(d.array()?),
+                    cue_index: d.u64()?,
+                    cue_position: MediaPositionNs::new(d.u64()?),
+                    pipeline_playing: d.boolean("pipeline playing")?,
+                    transition_in_progress: d.boolean("transition in progress")?,
+                    clock_healthy: d.boolean("clock healthy")?,
+                    disconnect_count: d.u64()?,
+                    recovery_count: d.u64()?,
+                },
             },
             255 => Self::Error(d.string(MAX_ERROR_BYTES)?),
             _ => return Err(ParseError::UnknownMessage(kind)),
@@ -612,6 +673,13 @@ impl<'a> Decoder<'a> {
     fn u8(&mut self) -> Result<u8, ParseError> {
         Ok(self.take(1)?[0])
     }
+    fn boolean(&mut self, field: &'static str) -> Result<bool, ParseError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ParseError::InvalidValue(field)),
+        }
+    }
     fn u16(&mut self) -> Result<u16, ParseError> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
@@ -713,6 +781,7 @@ mod tests {
             Message::Release(ReleasePlan {
                 generation: 7,
                 operation: Operation::Start,
+                transport_state: TransportState::Playing,
                 media_position: MediaPositionNs::new(0),
                 release_at: ClockNs::new(10),
             }),
@@ -727,6 +796,23 @@ mod tests {
             Message::KeepaliveAck {
                 session: session(),
                 sequence: 1,
+            },
+            Message::Telemetry {
+                session: session(),
+                sample: DiagnosticTelemetry {
+                    clock_time: ClockNs::new(100),
+                    generation: 7,
+                    expected_position: MediaPositionNs::new(50),
+                    actual_position: MediaPositionNs::new(49),
+                    error_ns: -1,
+                    cue_index: 2,
+                    cue_position: MediaPositionNs::new(9),
+                    pipeline_playing: true,
+                    transition_in_progress: false,
+                    clock_healthy: true,
+                    disconnect_count: 3,
+                    recovery_count: 4,
+                },
             },
             Message::Error("bad".into()),
         ];

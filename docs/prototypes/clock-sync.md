@@ -14,7 +14,7 @@ pipeline, receives the Master's projected media position at a future absolute cl
 acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
 interrupting existing playback.
 
-The bounded binary protocol is currently version 7. Before clock calibration, a Slave
+The bounded binary protocol is currently version 8. Before clock calibration, a Slave
 subscribes with its player identity, program identity and hash, software version, capabilities,
 state endpoint, and probed cue durations. The Master rejects incompatible or duplicate active
 participants and returns its authoritative cue durations on success. A Master session UUID
@@ -42,6 +42,9 @@ have the same protocol version.
 - Every player samples drift once per second. Three valid samples above 100 ms produce a warning;
   three valid samples above 250 ms perform one prepared local repair. A repair starts a ten-second
   cooldown.
+- Slaves report periodic observations over their existing reliable control sessions. The Master
+  aggregates current/minimum/maximum/RMS error, health and recovery counters, and error slope in
+  parts per million; it can append the complete sample stream to CSV for later physical analysis.
 - Drift samples are suppressed during pause, preroll, seek, scheduled release, ambiguous playlist
   handoff, recovery, or unhealthy-clock periods. Loop and cue-boundary errors use sequence-aware
   positions, including absolute playlist occurrence.

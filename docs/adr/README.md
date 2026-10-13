@@ -21,6 +21,7 @@ ADR, the ADR takes precedence until a later ADR supersedes it.
 - [0008 - Use a versioned shared configuration with a canonical hash](0008-use-a-versioned-shared-configuration-with-a-canonical-hash.md) (Accepted, 2026-09-16)
 - [0009 - Execute host-local events on timeline crossings](0009-execute-host-local-events-on-timeline-crossings.md) (Accepted, 2026-09-16)
 - [0010 - Schedule discontinuous transport operations against the shared clock](0010-schedule-discontinuous-transport-operations-against-the-shared-clock.md) (Accepted, 2026-09-16)
+- [0011 - Centralize structured playback diagnostics on the Master](0011-centralize-structured-playback-diagnostics-on-the-master.md) (Accepted, 2026-10-13)
 <!-- ADR-INDEX:END -->
 
 ## Authority and lifecycle

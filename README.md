@@ -162,6 +162,8 @@ control connections.
 | `--startup-delay <SECONDS>` | `0` | Non-negative best-effort grace period during which the Master remains prerolled on its first frame so ready Slaves can share the initial release deadline. Use a value greater than `--release-delay`. |
 | `--duration-tolerance-ms <MS>` | `100` | Maximum allowed difference between the Master's and a Slave's rendition of each cue. |
 | `--duration-mismatch <reject|warn>` | `reject` | Reject an excessive cue-duration difference or accept it with a prominent warning. |
+| `--console-bind <IP:PORT>` | Disabled | Enable the line-oriented installation console on an explicit address. Use `127.0.0.1:2323` for host-local access. |
+| `--diagnostics-log <PATH>` | Disabled | Append Master and Slave playback observations to a CSV file for synchronization analysis. |
 
 TCP `--bind` and UDP `--clock-port` are separate endpoints; both ports must be reachable from every
 Slave. A zero startup delay starts the Master immediately. The Master never waits beyond a non-zero
@@ -188,8 +190,37 @@ continues playing from its last disciplined clock estimate, and attempts to reco
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 7 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 8 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
+
+### Installation console and centralized diagnostics
+
+The Master console is disabled by default. Enable it on an explicit address, preferably loopback
+unless the installation LAN is trusted:
+
+```sh
+syncplayer master show.toml --console-bind 127.0.0.1:2323 \
+  --diagnostics-log syncplayer-diagnostics.csv
+nc 127.0.0.1 2323
+```
+
+Commands are `help`, `status`, `diagnostics`, `pause`, `play [DELAY]`, `stop`,
+`goto [CUE] TIME`, `loop SECONDS`, and `unloop`. Times accept seconds, `ms`/`s`/`m`/`h`
+suffixes, and `MM:SS` or `HH:MM:SS` notation. Transport text is interpreted only by the Master;
+Slaves receive structured generation and release state through the normal protocol. A participant
+that misses a shared deadline performs a separately prepared late rejoin instead of delaying ready
+players. Console operations reserve two release-delay windows by default—one to detect and prepare
+the generation change and one for the final shared-clock release. An explicit `play DELAY` must be
+at least that large.
+
+Every player measures expected versus actual playback position. Slaves report bounded telemetry on
+their existing reliable control sessions, and the Master includes its own samples. `diagnostics`
+shows current/minimum/maximum/RMS error, disconnect and recovery counts, clock/transition state,
+and the error slope in parts per million. For example, a player consistently running 0.1% slow
+converges toward approximately `-1000 ppm`. Rate windows restart after generations, disconnects,
+recoveries, unhealthy-clock periods, or transitions. The optional CSV log flushes every sample so
+long-running physical tests retain useful evidence after an abnormal exit; connection and planned
+transport-rejoin events are recorded in the same file.
 
 ### Logging
 

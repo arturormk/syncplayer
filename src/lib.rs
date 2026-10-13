@@ -1,6 +1,8 @@
 //! Reusable configuration, transport, playback-timeline, and production
 //! protocol pieces for Syncplayer.
 
+pub mod console;
+pub mod diagnostics;
 pub mod events;
 pub mod playlist;
 pub mod program;

@@ -4,19 +4,23 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_net as gst_net;
 use gstreamer_pbutils as gst_pbutils;
+use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, parse_command};
+use syncplayer::diagnostics::DiagnosticsHub;
 use syncplayer::events::{EventCue, EventObservation, EventRuntime};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
 use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
-    Capabilities, DebugLoopState, MAX_STATE_PACKET_BYTES, MAX_SUBSCRIPTION_CUES, MasterSession,
-    Message, Operation, ReleasePlan, StateDatagram, StateSnapshot, Subscription, TransportState,
-    decode_state_datagram, encode_state_datagram, read_message, write_message,
+    Capabilities, DebugLoopState, DiagnosticTelemetry, MAX_STATE_PACKET_BYTES,
+    MAX_SUBSCRIPTION_CUES, MasterSession, Message, Operation, ReleasePlan, StateDatagram,
+    StateSnapshot, Subscription, TransportState, decode_state_datagram, encode_state_datagram,
+    read_message, write_message,
 };
 use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, Readiness, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
@@ -96,6 +100,14 @@ struct MasterArgs {
     /// Action when a cue exceeds the duration tolerance.
     #[arg(long, value_enum, default_value_t = DurationMismatchPolicy::Reject)]
     duration_mismatch: DurationMismatchPolicy,
+
+    /// Append centralized Master/Slave playback observations to this CSV file.
+    #[arg(long, value_name = "PATH")]
+    diagnostics_log: Option<PathBuf>,
+
+    /// Enable the installation console on this explicit TCP address.
+    #[arg(long, value_name = "IP:PORT")]
+    console_bind: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -228,6 +240,7 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_master(args: &MasterArgs) -> Result<()> {
     // Let the pipeline choose its natural clock. With a real audio sink this
     // is normally the device-backed audio clock, so the Master does not have
@@ -273,7 +286,21 @@ fn run_master(args: &MasterArgs) -> Result<()> {
     let state_interval = Duration::from_secs_f64(1.0 / f64::from(args.state_rate_hz));
     let keepalive_timeout = Duration::from_secs_f64(args.keepalive_timeout);
     let session = new_master_session()?;
+    let diagnostics = Arc::new(
+        DiagnosticsHub::new(args.diagnostics_log.as_deref())
+            .context("failed to open diagnostics log")?,
+    );
     let initial_plan = player.schedule_start(startup_delay)?;
+    let console_listener = args
+        .console_bind
+        .map(TcpListener::bind)
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to bind installation console {}",
+                args.console_bind.expect("console address exists")
+            )
+        })?;
     let mut transport = TransportController::new(
         session,
         program.program_id.clone(),
@@ -315,17 +342,27 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         clock,
         clock_port,
         release_delay,
-        startup_plan: initial_plan,
+        operation_plan: Mutex::new(initial_plan),
         transport: Arc::new(Mutex::new(transport)),
         compatibility,
         registry: ParticipantRegistry::new(),
         state_socket,
         state_interval,
         keepalive_timeout,
+        diagnostics: diagnostics.clone(),
+        operator_lock: Mutex::new(()),
     });
     broadcast_state(server.clone());
     serve_slaves(listener, server.clone());
-    player.monitor(initial_plan, Some(&server.transport))
+    if let Some(console_listener) = console_listener {
+        info!(console = %console_listener.local_addr()?, "installation console enabled");
+        serve_console(console_listener, server.clone());
+    }
+    player.monitor(
+        initial_plan,
+        Some(&server.transport),
+        Some((diagnostics.as_ref(), program.player_id.as_str())),
+    )
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
@@ -341,7 +378,7 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
     let (mut stream, clock, authority) = wait_for_master(args.master, &subscription);
     let player = Arc::new(Player::new(&args.playback, sequence, Some(&clock))?);
     let plan = receive_release(&mut stream, &clock, authority)?;
-    player.resynchronize(&clock, plan, "initial-join")?;
+    player.apply_control_plan(&clock, plan)?;
     report_prepared(&mut stream, authority)?;
     info!(
         release_at_ns = plan.release_at.get(),
@@ -360,7 +397,7 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
             timeout: Duration::from_secs_f64(args.keepalive_timeout),
         },
     );
-    player.monitor(plan, None)
+    player.monitor(plan, None, None)
 }
 
 fn create_subscription(
@@ -502,18 +539,370 @@ fn serve_slaves(listener: TcpListener, server: Arc<SlaveServer>) {
     });
 }
 
+fn serve_console(listener: TcpListener, server: Arc<SlaveServer>) {
+    thread::spawn(move || {
+        for accepted in listener.incoming() {
+            let stream = match accepted {
+                Ok(stream) => stream,
+                Err(error) => {
+                    warn!(%error, "failed to accept console connection");
+                    continue;
+                }
+            };
+            let peer = stream.peer_addr().ok();
+            let server = server.clone();
+            thread::spawn(move || {
+                if let Err(error) = run_console_session(stream, &server) {
+                    warn!(?peer, %error, "console session ended with an error");
+                }
+            });
+        }
+    });
+}
+
+fn run_console_session(mut stream: TcpStream, server: &SlaveServer) -> Result<()> {
+    writeln!(stream, "Syncplayer installation console")?;
+    writeln!(stream, "{CONSOLE_HELP}")?;
+    write!(stream, "> ")?;
+    stream.flush()?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let response = if line.len() > 4096 {
+            "error: command exceeds 4096 bytes".to_owned()
+        } else {
+            match parse_command(&line) {
+                Ok(command) => execute_console_command(server, command)
+                    .unwrap_or_else(|error| format!("error: {error:#}")),
+                Err(error) => format!("error: {error}"),
+            }
+        };
+        writeln!(stream, "{response}")?;
+        write!(stream, "> ")?;
+        stream.flush()?;
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_console_command(server: &SlaveServer, command: ConsoleCommand) -> Result<String> {
+    let _operator = if matches!(
+        &command,
+        ConsoleCommand::Help | ConsoleCommand::Status | ConsoleCommand::Diagnostics
+    ) {
+        None
+    } else {
+        Some(
+            server
+                .operator_lock
+                .lock()
+                .map_err(|_| anyhow!("operator lock poisoned"))?,
+        )
+    };
+    match command {
+        ConsoleCommand::Help => Ok(CONSOLE_HELP.to_owned()),
+        ConsoleCommand::Status => console_status(server),
+        ConsoleCommand::Diagnostics => console_diagnostics(server),
+        ConsoleCommand::Pause => {
+            let release_at = console_release_at(server, console_operation_delay(server)?)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            transport.pause(release_at)?;
+            let runtime = transport.snapshot(release_at);
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Pause, release_at)?;
+            publish_operation_plan(server, plan)?;
+            server.player.schedule_pause(plan)?;
+            Ok(format!(
+                "pause scheduled at shared clock {}",
+                release_at.get()
+            ))
+        }
+        ConsoleCommand::Play { delay } => {
+            let minimum_delay = console_operation_delay(server)?;
+            let delay = delay.unwrap_or(minimum_delay);
+            if delay < minimum_delay {
+                bail!(
+                    "play delay must be at least {:.3} seconds so participants retain a preparation window",
+                    minimum_delay.as_secs_f64()
+                );
+            }
+            let release_at = console_release_at(server, delay)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            transport.release(release_at)?;
+            let runtime = transport.snapshot(release_at);
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Resume, release_at)?;
+            publish_operation_plan(server, plan)?;
+            server
+                .player
+                .resynchronize(&server.clock, plan, "operator-play")?;
+            Ok(format!(
+                "play scheduled at shared clock {}",
+                release_at.get()
+            ))
+        }
+        ConsoleCommand::Stop => {
+            let now = ClockNs::new(server.clock.time().nseconds());
+            let release_at = console_release_at(server, console_operation_delay(server)?)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            transport.stop(now)?;
+            let runtime = transport.snapshot(now);
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Stop, release_at)?;
+            publish_operation_plan(server, plan)?;
+            server
+                .player
+                .prepare_paused(&server.clock, plan, "operator-stop")?;
+            Ok("stopped at the first cue".to_owned())
+        }
+        ConsoleCommand::Goto { cue, time } => {
+            let cue_index = match cue {
+                Some(cue) => server
+                    .player
+                    .sequence
+                    .cue_ids
+                    .iter()
+                    .position(|candidate| candidate == &cue)
+                    .ok_or_else(|| anyhow!("unknown cue '{cue}'"))?,
+                None => {
+                    server
+                        .transport
+                        .lock()
+                        .map_err(|_| anyhow!("transport lock poisoned"))?
+                        .snapshot(ClockNs::new(server.clock.time().nseconds()))
+                        .cue_index
+                }
+            };
+            let cue_position_ns =
+                u64::try_from(time.as_nanos()).context("goto time is too large")?;
+            let release_at = console_release_at(server, console_operation_delay(server)?)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            transport.goto(cue_index, cue_position_ns, release_at)?;
+            let runtime = transport.snapshot(release_at);
+            let playing = runtime.transport_state != TransportState::Paused;
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Goto, release_at)?;
+            publish_operation_plan(server, plan)?;
+            if playing {
+                server
+                    .player
+                    .resynchronize(&server.clock, plan, "operator-goto")?;
+            } else {
+                server
+                    .player
+                    .prepare_paused(&server.clock, plan, "operator-goto")?;
+            }
+            Ok(format!(
+                "goto scheduled for cue {}",
+                server.player.sequence.cue_ids[cue_index]
+            ))
+        }
+        ConsoleCommand::Loop { duration } => {
+            let now = ClockNs::new(server.clock.time().nseconds());
+            let duration_ns =
+                u64::try_from(duration.as_nanos()).context("loop duration is too large")?;
+            if duration_ns == 0 {
+                bail!("loop duration must be positive");
+            }
+            let release_at = console_release_at(server, console_operation_delay(server)?)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            let current = transport.snapshot(now);
+            let end_ns = current
+                .anchor_cue_position
+                .get()
+                .checked_add(duration_ns)
+                .ok_or_else(|| anyhow!("loop endpoint overflow"))?;
+            transport.set_debug_loop(current.anchor_cue_position.get(), end_ns, false, now)?;
+            let runtime = transport.snapshot(release_at);
+            let playing = runtime.transport_state != TransportState::Paused;
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Loop, release_at)?;
+            publish_operation_plan(server, plan)?;
+            if playing {
+                server
+                    .player
+                    .resynchronize(&server.clock, plan, "operator-loop")?;
+            } else {
+                server
+                    .player
+                    .prepare_paused(&server.clock, plan, "operator-loop")?;
+            }
+            Ok("diagnostic loop enabled; timed events are suppressed".to_owned())
+        }
+        ConsoleCommand::Unloop => {
+            let now = ClockNs::new(server.clock.time().nseconds());
+            let release_at = console_release_at(server, console_operation_delay(server)?)?;
+            let mut transport = server
+                .transport
+                .lock()
+                .map_err(|_| anyhow!("transport lock poisoned"))?;
+            if transport.snapshot(now).debug_loop.is_none() {
+                return Ok("diagnostic loop is not active".to_owned());
+            }
+            transport.clear_debug_loop(now)?;
+            let runtime = transport.snapshot(release_at);
+            let playing = runtime.transport_state != TransportState::Paused;
+            drop(transport);
+            let plan = plan_from_runtime(server, runtime, Operation::Unloop, release_at)?;
+            publish_operation_plan(server, plan)?;
+            if playing {
+                server
+                    .player
+                    .resynchronize(&server.clock, plan, "operator-unloop")?;
+            } else {
+                server
+                    .player
+                    .prepare_paused(&server.clock, plan, "operator-unloop")?;
+            }
+            Ok("diagnostic loop disabled".to_owned())
+        }
+    }
+}
+
+fn console_release_at(server: &SlaveServer, delay: Duration) -> Result<ClockNs> {
+    ClockNs::new(server.clock.time().nseconds())
+        .checked_add(delay)
+        .ok_or_else(|| anyhow!("operation deadline overflow"))
+}
+
+fn console_operation_delay(server: &SlaveServer) -> Result<Duration> {
+    server
+        .release_delay
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("operation preparation delay overflow"))
+}
+
+fn plan_from_runtime(
+    server: &SlaveServer,
+    runtime: RuntimeState,
+    operation: Operation,
+    release_at: ClockNs,
+) -> Result<ReleasePlan> {
+    let generation = runtime.generation;
+    let snapshot = server.player.authoritative_snapshot(runtime)?;
+    Ok(ReleasePlan {
+        generation,
+        operation,
+        transport_state: snapshot.transport_state,
+        media_position: snapshot.media_position,
+        release_at,
+    })
+}
+
+fn publish_operation_plan(server: &SlaveServer, plan: ReleasePlan) -> Result<()> {
+    *server
+        .operation_plan
+        .lock()
+        .map_err(|_| anyhow!("operation plan lock poisoned"))? = plan;
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn console_status(server: &SlaveServer) -> Result<String> {
+    let now = ClockNs::new(server.clock.time().nseconds());
+    let runtime = server
+        .transport
+        .lock()
+        .map_err(|_| anyhow!("transport lock poisoned"))?
+        .snapshot(now);
+    let participants = server
+        .registry
+        .snapshot(Instant::now(), server.keepalive_timeout)?;
+    let mut lines = vec![format!(
+        "master session={} generation={} state={:?} cue={} time={:.3}s loop={}",
+        runtime.session,
+        runtime.generation,
+        runtime.transport_state,
+        runtime.cue_id,
+        runtime.anchor_cue_position.get() as f64 / 1_000_000_000.0,
+        runtime.debug_loop.is_some()
+    )];
+    if participants.is_empty() {
+        lines.push("slaves: none".to_owned());
+    } else {
+        for participant in participants {
+            lines.push(format!(
+                "slave {} remote={} readiness={:?} clock={} last_seen={}ms",
+                participant.player_id,
+                participant.remote_address,
+                participant.readiness,
+                if participant.clock_synchronized {
+                    "ok"
+                } else {
+                    "syncing"
+                },
+                participant.last_seen_age.as_millis()
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn console_diagnostics(server: &SlaveServer) -> Result<String> {
+    let summaries = server.diagnostics.summaries()?;
+    if summaries.is_empty() {
+        return Ok("no diagnostic samples collected yet".to_owned());
+    }
+    Ok(summaries
+        .into_iter()
+        .map(|summary| {
+            let rate = summary.rate_error_ppm.map_or_else(
+                || "warming-up".to_owned(),
+                |ppm| format!("{ppm:+.1}ppm ({:+.4}%)", ppm / 10_000.0),
+            );
+            format!(
+                "{} samples={} error={:+.3}ms min={:+.3}ms max={:+.3}ms rms={:.3}ms rate={} disconnects={} recoveries={} playing={} transition={} clock={}",
+                summary.player_id,
+                summary.samples,
+                summary.latest_error_ns as f64 / 1_000_000.0,
+                summary.minimum_error_ns as f64 / 1_000_000.0,
+                summary.maximum_error_ns as f64 / 1_000_000.0,
+                summary.rms_error_ns / 1_000_000.0,
+                rate,
+                summary.disconnect_count,
+                summary.recovery_count,
+                summary.pipeline_playing,
+                summary.transition_in_progress,
+                if summary.clock_healthy { "ok" } else { "lost" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 struct SlaveServer {
     player: Arc<Player>,
     clock: gst::Clock,
     clock_port: u16,
     release_delay: Duration,
-    startup_plan: ReleasePlan,
+    operation_plan: Mutex<ReleasePlan>,
     transport: Arc<Mutex<TransportController>>,
     compatibility: ProgramCompatibility,
     registry: Arc<ParticipantRegistry>,
     state_socket: Arc<UdpSocket>,
     state_interval: Duration,
     keepalive_timeout: Duration,
+    diagnostics: Arc<DiagnosticsHub>,
+    operator_lock: Mutex<()>,
 }
 
 impl SlaveServer {
@@ -544,6 +933,24 @@ struct Authority {
     session: MasterSession,
     generation: u64,
 }
+
+#[derive(Debug)]
+struct GenerationChanged {
+    received: u64,
+    current: u64,
+}
+
+impl std::fmt::Display for GenerationChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "authoritative generation changed from {} to {}",
+            self.current, self.received
+        )
+    }
+}
+
+impl std::error::Error for GenerationChanged {}
 
 #[derive(Clone, Copy, Debug)]
 struct KeepaliveConfig {
@@ -582,6 +989,15 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
             generation,
         } if session == authority.session && generation == authority.generation => {
             lease.mark_ready()?;
+            server
+                .diagnostics
+                .record_event(
+                    &subscription.player_id,
+                    server.clock.time().nseconds(),
+                    "connected",
+                    "ready",
+                )
+                .context("failed to record Slave connection event")?;
             info!(
                 player = %subscription.player_id,
                 %peer,
@@ -604,6 +1020,24 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
     }
 
     let result = run_master_keepalives(&mut stream, peer, server, authority, &lease);
+    let disconnect_kind = if server.authority()?.generation == authority.generation {
+        "disconnected"
+    } else {
+        "transport-rejoin"
+    };
+    let detail = result
+        .as_ref()
+        .err()
+        .map_or_else(|| "session-ended".to_owned(), |error| format!("{error:#}"));
+    server
+        .diagnostics
+        .record_event(
+            lease.player_id(),
+            server.clock.time().nseconds(),
+            disconnect_kind,
+            &detail,
+        )
+        .context("failed to record Slave disconnect event")?;
     info!(player = %lease.player_id(), %peer, "Slave participant disconnected");
     result
 }
@@ -696,19 +1130,42 @@ fn plan_slave_release(
     server: &SlaveServer,
     authority: Authority,
 ) -> Result<ReleasePlan> {
+    if server.authority()? != authority {
+        bail!("transport changed while the Slave was preparing; retry the subscription");
+    }
     let now = ClockNs::new(server.clock.time().nseconds());
     let minimum_lead_ns = u64::try_from(server.release_delay.as_nanos())
         .context("release delay is too large for the clock")?;
-    let plan = if server.startup_plan.generation == authority.generation
-        && can_join_startup(server.startup_plan.release_at, now, minimum_lead_ns)
+    let current_operation = *server
+        .operation_plan
+        .lock()
+        .map_err(|_| anyhow!("operation plan lock poisoned"))?;
+    let plan = if current_operation.generation == authority.generation
+        && can_join_startup(current_operation.release_at, now, minimum_lead_ns)
     {
-        info!(%peer, "Slave is ready for the shared startup deadline");
-        server.startup_plan
+        info!(%peer, "Slave is ready for the shared operation deadline");
+        current_operation
     } else {
         let release_at = now
             .checked_add(server.release_delay)
             .ok_or_else(|| anyhow!("release timestamp overflow"))?;
-        server.player.join_plan(authority.generation, release_at)?
+        let runtime = server
+            .transport
+            .lock()
+            .map_err(|_| anyhow!("transport lock poisoned"))?
+            .snapshot(now);
+        if runtime.transport_state == TransportState::Paused {
+            let snapshot = server.player.authoritative_snapshot(runtime)?;
+            ReleasePlan {
+                generation: authority.generation,
+                operation: Operation::Goto,
+                transport_state: TransportState::Paused,
+                media_position: snapshot.media_position,
+                release_at,
+            }
+        } else {
+            server.player.join_plan(authority.generation, release_at)?
+        }
     };
     Ok(plan)
 }
@@ -877,16 +1334,24 @@ fn run_master_keepalives(
     authority: Authority,
     lease: &ParticipantLease,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(server.keepalive_timeout))?;
     stream.set_write_timeout(Some(server.keepalive_timeout))?;
     let mut last_sequence = None;
+    let mut last_keepalive = Instant::now();
     loop {
-        match read_message(stream).context("failed to read Slave keepalive")? {
+        let remaining = server
+            .keepalive_timeout
+            .saturating_sub(last_keepalive.elapsed());
+        if remaining.is_zero() {
+            bail!("Slave keepalive deadline expired");
+        }
+        stream.set_read_timeout(Some(remaining))?;
+        match read_message(stream).context("failed to read Slave control message")? {
             Message::Keepalive { session, sequence }
                 if session == authority.session
                     && last_sequence.is_none_or(|old| sequence > old) =>
             {
                 lease.mark_seen()?;
+                last_keepalive = Instant::now();
                 write_message(stream, &Message::KeepaliveAck { session, sequence })
                     .context("failed to acknowledge Slave keepalive")?;
                 last_sequence = Some(sequence);
@@ -895,6 +1360,15 @@ fn run_master_keepalives(
             }
             Message::Keepalive { session, sequence } => {
                 bail!("invalid keepalive: session {session}, sequence {sequence}")
+            }
+            Message::Telemetry { session, sample } if session == authority.session => {
+                server
+                    .diagnostics
+                    .record(lease.player_id(), sample)
+                    .context("failed to record Slave diagnostics")?;
+            }
+            Message::Telemetry { session, .. } => {
+                bail!("invalid telemetry session {session}")
             }
             Message::Error(message) => bail!("Slave rejected control session: {message}"),
             other => bail!("expected KEEPALIVE from Slave, received {other:?}"),
@@ -915,6 +1389,7 @@ fn monitor_master_session(
     stream.set_write_timeout(Some(keepalive_timeout))?;
     let mut keepalive_sequence = 0_u64;
     let mut next_keepalive = Instant::now();
+    let mut next_diagnostic = Instant::now();
     let mut last_state_sequence = None;
     let mut bytes = [0_u8; MAX_STATE_PACKET_BYTES];
     loop {
@@ -942,8 +1417,23 @@ fn monitor_master_session(
             next_keepalive = Instant::now() + keepalive_interval;
         }
 
+        if Instant::now() >= next_diagnostic {
+            if let Some(sample) = player.diagnostic_telemetry()? {
+                write_message(
+                    stream,
+                    &Message::Telemetry {
+                        session: authority.session,
+                        sample,
+                    },
+                )
+                .context("failed to send diagnostic telemetry")?;
+            }
+            next_diagnostic = Instant::now() + TELEMETRY_INTERVAL;
+        }
+
         let wait = next_keepalive
             .saturating_duration_since(Instant::now())
+            .min(next_diagnostic.saturating_duration_since(Instant::now()))
             .min(Duration::from_millis(250))
             .max(Duration::from_millis(1));
         state_socket.set_read_timeout(Some(wait))?;
@@ -986,11 +1476,11 @@ fn validate_state_datagram(
         return Ok(false);
     }
     if packet.state.generation > authority.generation {
-        bail!(
-            "state snapshot introduced generation {}; prepared rejoin required from generation {}",
-            packet.state.generation,
-            authority.generation
-        );
+        return Err(GenerationChanged {
+            received: packet.state.generation,
+            current: authority.generation,
+        }
+        .into());
     }
     if last_sequence.is_some_and(|last| packet.sequence <= last) {
         return Ok(false);
@@ -1137,24 +1627,38 @@ fn monitor_master(
             )
             .err()
             .unwrap_or_else(|| anyhow!("Master protocol monitor stopped"));
-            player.set_clock_health(false);
+            let planned_rejoin = error.downcast_ref::<GenerationChanged>().is_some();
+            if !planned_rejoin {
+                player.set_clock_health(false);
+            }
             if let Err(shutdown_error) = stream.shutdown(Shutdown::Both) {
                 debug!(%master, %shutdown_error, "old Master connection was already closed");
             }
-            warn!(
-                %master,
-                master_session = %authority.session,
-                transport_generation = authority.generation,
-                recovery_reason = "master-liveness",
-                %error,
-                "Master liveness lost; entering free-running mode"
-            );
+            if planned_rejoin {
+                info!(
+                    %master,
+                    master_session = %authority.session,
+                    transport_generation = authority.generation,
+                    %error,
+                    "authoritative operation requires a prepared rejoin"
+                );
+            } else {
+                warn!(
+                    %master,
+                    master_session = %authority.session,
+                    transport_generation = authority.generation,
+                    recovery_reason = "master-liveness",
+                    %error,
+                    "Master liveness lost; entering free-running mode"
+                );
+                player.disconnect_count.fetch_add(1, Ordering::AcqRel);
+            }
 
             loop {
                 match connect_to_master(master, &subscription).and_then(
                     |(mut new_stream, clock, new_authority)| {
                         let plan = receive_release(&mut new_stream, &clock, new_authority)?;
-                        player.resynchronize(&clock, plan, "master-reconnect")?;
+                        player.apply_control_plan(&clock, plan)?;
                         report_prepared(&mut new_stream, new_authority)?;
                         player.set_clock_health(true);
                         Ok((new_stream, plan, new_authority))
@@ -1575,6 +2079,7 @@ struct Player {
     recovery_lock: Mutex<()>,
     recovery_in_progress: AtomicBool,
     recovery_attempt: Arc<AtomicU64>,
+    disconnect_count: AtomicU64,
     drift_policy: Mutex<DriftPolicy>,
     boundary_mismatch: Mutex<Option<(usize, usize, u64)>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
@@ -1600,6 +2105,7 @@ struct ReleaseWorker {
     active_recovery_attempt: Arc<AtomicU64>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
+    target_state: gst::State,
 }
 
 impl ReleaseWorker {
@@ -1646,8 +2152,8 @@ impl ReleaseWorker {
             "shared-clock release fired"
         );
         self.pipeline
-            .set_state(gst::State::Playing)
-            .context("failed to request PLAYING at release")?;
+            .set_state(self.target_state)
+            .with_context(|| format!("failed to request {:?} at release", self.target_state))?;
         Ok(())
     }
 }
@@ -1920,6 +2426,7 @@ impl Player {
             recovery_lock: Mutex::new(()),
             recovery_in_progress: AtomicBool::new(false),
             recovery_attempt: Arc::new(AtomicU64::new(0)),
+            disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
@@ -2058,6 +2565,7 @@ impl Player {
             recovery_lock: Mutex::new(()),
             recovery_in_progress: AtomicBool::new(false),
             recovery_attempt: Arc::new(AtomicU64::new(0)),
+            disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
@@ -2073,6 +2581,7 @@ impl Player {
         let plan = ReleasePlan {
             generation: 1,
             operation: Operation::Start,
+            transport_state: TransportState::Playing,
             media_position: MediaPositionNs::new(0),
             release_at,
         };
@@ -2110,6 +2619,33 @@ impl Player {
             );
         }
         result
+    }
+
+    fn apply_control_plan(&self, clock: &gst::Clock, plan: ReleasePlan) -> Result<()> {
+        match plan.operation {
+            Operation::Pause if plan.transport_state == TransportState::Paused => {
+                self.schedule_pause(plan)
+            }
+            _ if plan.transport_state == TransportState::Paused => {
+                self.prepare_paused(clock, plan, "operator-control")
+            }
+            _ => self.resynchronize(clock, plan, "operator-control"),
+        }
+    }
+
+    fn prepare_paused(
+        &self,
+        clock: &gst::Clock,
+        plan: ReleasePlan,
+        reason: &'static str,
+    ) -> Result<()> {
+        self.resynchronize(clock, plan, reason)?;
+        self.cancel_scheduled_release()?;
+        *self
+            .transport_state
+            .lock()
+            .map_err(|_| anyhow!("transport state lock poisoned"))? = TransportState::Paused;
+        Ok(())
     }
 
     fn resynchronize_inner(
@@ -2238,6 +2774,7 @@ impl Player {
             active_recovery_attempt: self.recovery_attempt.clone(),
             scheduled_release: self.scheduled_release.clone(),
             release_error: self.release_error.clone(),
+            target_state: gst::State::Playing,
         };
         let worker = thread::Builder::new()
             .name("syncplayer-release".to_owned())
@@ -2247,6 +2784,51 @@ impl Player {
             return Err(error).context("failed to spawn release worker");
         }
 
+        Ok(())
+    }
+
+    fn schedule_pause(&self, plan: ReleasePlan) -> Result<()> {
+        self.cancel_scheduled_release()?;
+        *self
+            .plan
+            .lock()
+            .map_err(|_| anyhow!("plan lock poisoned"))? = Some(plan);
+        *self
+            .transport_state
+            .lock()
+            .map_err(|_| anyhow!("transport state lock poisoned"))? = TransportState::Paused;
+        let clock = self.clock()?;
+        let now = ClockNs::new(clock.time().nseconds());
+        if plan.release_at <= now {
+            self.pipeline
+                .set_state(gst::State::Paused)
+                .context("failed to pause pipeline")?;
+            return Ok(());
+        }
+        let recovery_attempt = self.next_recovery_attempt();
+        let release_id =
+            clock.new_single_shot_id(gst::ClockTime::from_nseconds(plan.release_at.get()));
+        *self
+            .scheduled_release
+            .lock()
+            .map_err(|_| anyhow!("scheduled release lock poisoned"))? = Some(ScheduledRelease {
+            release_id: release_id.clone(),
+        });
+        let worker = ReleaseWorker {
+            pipeline: self.pipeline.clone(),
+            clock,
+            plan,
+            release_id,
+            recovery_attempt,
+            active_recovery_attempt: self.recovery_attempt.clone(),
+            scheduled_release: self.scheduled_release.clone(),
+            release_error: self.release_error.clone(),
+            target_state: gst::State::Paused,
+        };
+        thread::Builder::new()
+            .name("syncplayer-pause".to_owned())
+            .spawn(move || worker.run())
+            .context("failed to spawn pause worker")?;
         Ok(())
     }
 
@@ -2293,6 +2875,7 @@ impl Player {
         Ok(ReleasePlan {
             generation,
             operation: Operation::Goto,
+            transport_state: TransportState::Playing,
             media_position: MediaPositionNs::new(
                 self.sequence
                     .project(current_plan.media_position.get(), elapsed)?,
@@ -2407,6 +2990,7 @@ impl Player {
         let refreshed = ReleasePlan {
             generation: snapshot.generation,
             operation: snapshot.operation,
+            transport_state: snapshot.transport_state,
             media_position: local_media_position,
             release_at: snapshot.anchor_clock,
         };
@@ -2438,6 +3022,7 @@ impl Player {
         &self,
         initial_plan: ReleasePlan,
         master_transport: Option<&Arc<Mutex<TransportController>>>,
+        diagnostics: Option<(&DiagnosticsHub, &str)>,
     ) -> Result<()> {
         let bus = self
             .pipeline
@@ -2489,6 +3074,12 @@ impl Player {
             }
             if Instant::now() >= next_telemetry {
                 self.process_telemetry(initial_plan)?;
+                if let Some((hub, player_id)) = &diagnostics
+                    && let Some(sample) = self.diagnostic_telemetry()?
+                {
+                    hub.record(player_id, sample)
+                        .context("failed to record Master diagnostics")?;
+                }
                 next_telemetry = Instant::now() + TELEMETRY_INTERVAL;
             }
             self.tick_events()?;
@@ -2904,6 +3495,41 @@ impl Player {
                 .position_error(actual_sequence_position, expected_sequence_position),
             pipeline_state,
             transition_in_progress,
+        }))
+    }
+
+    fn diagnostic_telemetry(&self) -> Result<Option<DiagnosticTelemetry>> {
+        let Some(plan) = *self
+            .plan
+            .lock()
+            .map_err(|_| anyhow!("plan lock poisoned"))?
+        else {
+            return Ok(None);
+        };
+        let Some(sample) = self.position_sample(plan)? else {
+            return Ok(None);
+        };
+        let error_ns = i64::try_from(sample.error_ns).unwrap_or_else(|_| {
+            if sample.error_ns.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        });
+        Ok(Some(DiagnosticTelemetry {
+            clock_time: sample.clock_time,
+            generation: plan.generation,
+            expected_position: sample.expected_sequence_position,
+            actual_position: sample.actual_sequence_position,
+            error_ns,
+            cue_index: u64::try_from(sample.actual_item.index)
+                .context("cue index does not fit diagnostic protocol")?,
+            cue_position: MediaPositionNs::new(sample.actual_item.local_ns),
+            pipeline_playing: sample.pipeline_state == gst::State::Playing,
+            transition_in_progress: sample.transition_in_progress,
+            clock_healthy: self.clock_healthy.load(Ordering::Acquire),
+            disconnect_count: self.disconnect_count.load(Ordering::Acquire),
+            recovery_count: self.recovery_attempt.load(Ordering::Acquire),
         }))
     }
 
@@ -3484,6 +4110,10 @@ mod tests {
                 "20",
                 "--keepalive-timeout",
                 "12",
+                "--console-bind",
+                "127.0.0.1:2323",
+                "--diagnostics-log",
+                "diagnostics.csv",
             ])
             .is_ok()
         );

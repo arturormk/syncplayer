@@ -1,4 +1,4 @@
-# State protocol version 7
+# State protocol version 8
 
 Syncplayer separates three network responsibilities:
 
@@ -13,7 +13,7 @@ Every control frame and state datagram begins with this 12-byte network-byte-ord
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `SYNP` |
-| 4 | 2 | protocol version (`7`) |
+| 4 | 2 | protocol version (`8`) |
 | 6 | 1 | message kind |
 | 7 | 1 | reserved flags, currently zero |
 | 8 | 4 | payload length |
@@ -27,13 +27,20 @@ UTF-8 are rejected.
 ## Reliable control
 
 Control message kinds cover `SUBSCRIBE`, `SUBSCRIBED`, `READY`, `RELEASE`, `PREPARED`,
-`KEEPALIVE`, `KEEPALIVE_ACK`, and `ERROR`. Subscription advertises the Slave's UDP receive port.
+`KEEPALIVE`, `KEEPALIVE_ACK`, `TELEMETRY`, and `ERROR`. Subscription advertises the Slave's UDP receive port.
 The response supplies the Master session, transport generation, clock port, selected state cadence,
-and authoritative cue durations. Preparation and release remain reliable discontinuous operations.
+and authoritative cue durations. A release plan identifies the structured operation, target
+paused/playing state, media position, and shared-clock deadline. Preparation and release remain
+reliable discontinuous operations.
 
 After joining, the Slave periodically sends a monotonically increasing keepalive and requires the
 matching acknowledgement. A failed control exchange closes that session; playback continues
 free-running while reconnection and prepared rejoin happen in the background.
+
+While the control session is active, a Slave periodically sends a bounded telemetry sample
+containing shared clock time, generation, expected and actual sequence positions, signed error, cue position,
+pipeline/transition/clock health, and cumulative disconnect/recovery counts. Telemetry is
+diagnostic: it never changes authoritative transport state and its loss never stops playback.
 
 ## UDP state
 
