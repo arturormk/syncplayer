@@ -7,9 +7,11 @@
 
 ## Context and trigger
 
-The P1 local-playback implementation uses separate `uridecodebin3` video and audio branches. Each
-branch receives its next URI from an `about-to-finish` callback so it can prepare the next logical
-cue before the current cue reaches EOS.
+The affected P1 local-playback implementation routed every program through separate
+`uridecodebin3` video and audio branches. Each branch received its next URI from an
+`about-to-finish` callback so it could prepare the next logical cue before the current cue reached
+EOS. Embedded-audio programs now use the coordinated `playbin3` engine, while the separate branch
+engine remains available for external-audio mappings.
 
 At the same time, the main monitoring thread sampled pipeline position once per second. It read the
 video decoder's `current-uri` GObject property to map the queried item-local position back to a
@@ -130,7 +132,8 @@ Raspberry Pi Slave complete repeated playlist transitions with their real sinks.
 - Code: [`src/main.rs`](../../src/main.rs)
 - Design: [`docs/BLUEPRINT.md`](../BLUEPRINT.md), sections 14–19 and 85
 - GStreamer: [`playbin3` `about-to-finish` documentation](https://gstreamer.freedesktop.org/documentation/playback/playbin3.html)
-- Related incident: [`INC-0001`](INC-0001-forced-system-clock-stalls-master-after-delayed-startup.md)
+- Related incidents: [`INC-0001`](INC-0001-forced-system-clock-stalls-master-after-delayed-startup.md),
+  [`INC-0003`](INC-0003-independent-decode-branches-break-preroll-and-handoff.md)
 - Commit or pull request: not yet recorded
 
 ## Tags

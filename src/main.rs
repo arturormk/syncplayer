@@ -1187,6 +1187,7 @@ struct MediaItem {
     path: PathBuf,
     uri: String,
     audio_uri: String,
+    external_audio: bool,
     has_audio: bool,
     mute: bool,
     gain_db: f64,
@@ -1316,6 +1317,7 @@ impl PlaybackSequence {
                 path,
                 uri,
                 audio_uri,
+                external_audio: cue.audio.is_some(),
                 has_audio,
                 mute: cue.mute,
                 gain_db: cue.gain_db,
@@ -1662,6 +1664,9 @@ impl Player {
             combined_gain(args.gain_db, item.gain_db)
                 .with_context(|| format!("invalid effective gain for {}", item.path.display()))?;
         }
+        if sequence.items.iter().all(|item| !item.external_audio) {
+            return Self::new_playbin(args, sequence, forced_clock);
+        }
         let first = &sequence.items[0];
         let pipeline = gst::Pipeline::new();
         let video_source = gst::ElementFactory::make("uridecodebin3")
@@ -1857,6 +1862,140 @@ impl Player {
             video_source,
             audio_source,
             audio_volume,
+            global_mute: args.mute,
+            global_gain_db: args.gain_db,
+            sequence,
+            cursor,
+            audio_cursor,
+            role: PlayerRole::from_external_clock(forced_clock.is_some()),
+            clock_healthy: AtomicBool::new(true),
+            clock: Mutex::new(clock),
+            plan: Mutex::new(None),
+            transport_state: Mutex::new(TransportState::Waiting),
+            recovery_lock: Mutex::new(()),
+            recovery_in_progress: AtomicBool::new(false),
+            recovery_attempt: Arc::new(AtomicU64::new(0)),
+            drift_policy: Mutex::new(DriftPolicy::default()),
+            boundary_mismatch: Mutex::new(None),
+            scheduled_release: Arc::new(Mutex::new(None)),
+            release_error: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn new_playbin(
+        args: &PlaybackArgs,
+        sequence: PlaybackSequence,
+        forced_clock: Option<&gst::Clock>,
+    ) -> Result<Self> {
+        let first = &sequence.items[0];
+        let element = gst::ElementFactory::make("playbin3")
+            .name("embedded-media-player")
+            .property("uri", &first.uri)
+            .property("mute", args.mute || first.mute)
+            .property("volume", combined_gain(args.gain_db, first.gain_db)?)
+            .property("force-aspect-ratio", args.fit == FitMode::Contain)
+            .build()
+            .context("playbin3 is unavailable")?;
+        let video_sink = build_playbin_video_sink(args)?;
+        element.set_property("video-sink", &video_sink);
+        let audio_sink = if let Some(name) = &args.audio_sink {
+            make_element(name, "audio sink")?
+        } else {
+            make_element("autoaudiosink", "automatic audio sink")?
+        };
+        force_clock_sync(&audio_sink, "audio sink")?;
+        element.set_property("audio-sink", &audio_sink);
+
+        let cursor = Arc::new(Mutex::new(PlaylistCursor::new(
+            sequence.items.len(),
+            sequence.looping,
+            0,
+        )));
+        let audio_cursor = Arc::new(Mutex::new(PlaylistCursor::new(
+            sequence.items.len(),
+            sequence.looping,
+            0,
+        )));
+        let callback_cursor = cursor.clone();
+        let weak_element = element.downgrade();
+        let items: Vec<(String, bool, f64)> = sequence
+            .items
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.uri.clone(),
+                    args.mute || item.mute,
+                    combined_gain(args.gain_db, item.gain_db)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        element.connect("about-to-finish", false, move |_| {
+            let next = callback_cursor
+                .lock()
+                .ok()
+                .and_then(|mut cursor| cursor.queue_next());
+            if let (Some(index), Some(element)) = (next, weak_element.upgrade()) {
+                element.set_property("mute", items[index].1);
+                element.set_property("volume", items[index].2);
+                element.set_property("uri", &items[index].0);
+                debug!(next_item_index = index, next_uri = %items[index].0, "queueing prepared embedded-media item");
+            }
+            None
+        });
+
+        let pipeline = element
+            .clone()
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| anyhow!("playbin3 did not create a GstPipeline"))?;
+        if let Some(clock) = forced_clock {
+            pipeline.use_clock(Some(clock));
+        } else if args.clock == ClockPolicy::System {
+            pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+        }
+        pipeline
+            .set_state(gst::State::Paused)
+            .context("failed to request PAUSED")?;
+        wait_for_state(
+            &pipeline,
+            PREROLL_TIMEOUT,
+            "media did not preroll before timeout",
+        )?;
+        if forced_clock.is_some() {
+            configure_external_clock_audio_slaving(&pipeline)?;
+        }
+        log_selected_pipeline_elements(&pipeline);
+        let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
+        pipeline.use_clock(Some(&clock));
+        info!(
+            clock = %clock.name(),
+            clock_type = %clock.type_().name(),
+            externally_driven = forced_clock.is_some(),
+            "playback clock selected"
+        );
+        let duration = pipeline.query_duration::<gst::ClockTime>();
+        info!(
+            engine = "playbin3",
+            media = %first.path.display(),
+            item_count = sequence.items.len(),
+            duration_ns = duration.map(gst::ClockTime::nseconds),
+            mute = args.mute || first.mute,
+            gain_db = args.gain_db + first.gain_db,
+            fit = ?args.fit,
+            fullscreen = args.fullscreen,
+            output_width = args.width,
+            output_height = args.height,
+            display = args.display.as_deref(),
+            hwdec = ?args.hwdec,
+            looped = sequence.looping,
+            playlist = sequence.from_playlist,
+            "embedded-media sequence prerolled"
+        );
+        Ok(Self {
+            pipeline,
+            video_source: element.clone(),
+            audio_source: element.clone(),
+            audio_volume: element,
             global_mute: args.mute,
             global_gain_db: args.gain_db,
             sequence,
@@ -2767,6 +2906,58 @@ fn select_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
     make_element("autovideosink", "automatic video sink")
 }
 
+fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
+    let video_convert =
+        make_named_element("videoconvert", "embedded-video-convert", "video converter")?;
+    let video_scale = gst::ElementFactory::make("videoscale")
+        .name("embedded-video-scale")
+        .property("add-borders", args.fit == FitMode::Contain)
+        .build()
+        .context("videoscale is unavailable")?;
+    let mut video_chain = vec![video_convert, video_scale];
+    if args.fit == FitMode::Cover {
+        let (width, height) = output_size(args)?;
+        let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
+        let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
+        let crop = gst::ElementFactory::make("aspectratiocrop")
+            .name("embedded-video-cover-crop")
+            .property("aspect-ratio", gst::Fraction::new(width, height))
+            .build()
+            .context("cover mode requires the aspectratiocrop GStreamer element")?;
+        video_chain.push(crop);
+    }
+    if let Some((width, height)) = optional_output_size(args) {
+        let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
+        let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("width", width)
+            .field("height", height)
+            .build();
+        let caps_filter = gst::ElementFactory::make("capsfilter")
+            .name("embedded-video-output-size")
+            .property("caps", &caps)
+            .build()
+            .context("capsfilter is unavailable")?;
+        video_chain.push(caps_filter);
+    }
+    let video_sink = select_video_sink(args)?;
+    force_clock_sync(&video_sink, "video sink")?;
+    configure_video_sink(&video_sink, args)?;
+    video_chain.push(video_sink);
+
+    let bin = gst::Bin::with_name("embedded-video-output");
+    bin.add_many(&video_chain)?;
+    gst::Element::link_many(&video_chain)?;
+    let sink_pad = video_chain[0]
+        .static_pad("sink")
+        .context("video converter has no sink pad")?;
+    let ghost_pad = gst::GhostPad::builder_with_target(&sink_pad)?
+        .name("sink")
+        .build();
+    bin.add_pad(&ghost_pad)?;
+    Ok(bin.upcast())
+}
+
 fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> {
     if sink.find_property("force-aspect-ratio").is_some() {
         sink.set_property("force-aspect-ratio", args.fit == FitMode::Contain);
@@ -3314,6 +3505,7 @@ mod tests {
                     path: PathBuf::from("a"),
                     uri: "file:///a".to_owned(),
                     audio_uri: "file:///a".to_owned(),
+                    external_audio: false,
                     has_audio: true,
                     mute: false,
                     gain_db: 0.0,
@@ -3322,6 +3514,7 @@ mod tests {
                     path: PathBuf::from("b"),
                     uri: "file:///b".to_owned(),
                     audio_uri: "file:///b".to_owned(),
+                    external_audio: false,
                     has_audio: true,
                     mute: false,
                     gain_db: 0.0,
@@ -3364,6 +3557,7 @@ mod tests {
                     path: PathBuf::from("a"),
                     uri: "file:///a".to_owned(),
                     audio_uri: "file:///a".to_owned(),
+                    external_audio: false,
                     has_audio: true,
                     mute: false,
                     gain_db: 0.0,
@@ -3372,6 +3566,7 @@ mod tests {
                     path: PathBuf::from("b"),
                     uri: "file:///b".to_owned(),
                     audio_uri: "file:///b".to_owned(),
+                    external_audio: false,
                     has_audio: true,
                     mute: false,
                     gain_db: 0.0,

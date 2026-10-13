@@ -100,9 +100,10 @@ The local player now provides:
 - [x] External audio files on the same pipeline clock and transport as cue video.
 - [x] Strict external video/audio stream and duration validation (50 ms tolerance).
 - [x] The same stream, duration, and gain probing for one-cue and multi-cue programs.
-- [x] Replacement of `playbin3` with independently prepared gapless `uridecodebin3` video/audio
-  branches. This avoids `playbin3`'s lack of an external-audio URI and its ineffective
-  force-software-decoder flag while retaining ahead-of-boundary URI preparation.
+- [x] Hybrid gapless playback: `playbin3` coordinates embedded-audio media, while independently
+  prepared `uridecodebin3` video/audio branches support programs that map external audio. This
+  retains ahead-of-boundary URI preparation without giving up `playbin3`'s internal stream
+  coordination for the common case.
 
 Fullscreen and display selection intentionally follow sink capabilities: Wayland display names,
 X11 display names, and numeric DRM/KMS connector IDs are supported by the display abstraction, and

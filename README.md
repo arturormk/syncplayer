@@ -12,8 +12,9 @@ The repository currently contains a risk-reduction prototype, not the production
 that Linux pipelines can use one exported monotonic clock, join at a future clock release, detect a
 stalled Master control process, refresh authoritative transport state, and repair sustained local
 drift. The production state protocol now separates bounded binary TCP control, UDP snapshots, and
-clock synchronization. Local playback uses separate gapless `uridecodebin3` video and audio
-branches so external cue audio follows the same pipeline clock and transport operations as video.
+clock synchronization. Local playback uses `playbin3`'s coordinated gapless handoff for ordinary
+embedded-audio media, and synchronized `uridecodebin3` video/audio branches when a program maps
+external cue audio.
 
 ## Prerequisites
 
