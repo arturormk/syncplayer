@@ -471,27 +471,6 @@ impl ProgramConfig {
     }
 }
 
-impl ResolvedProgram {
-    /// Rejects configuration features that are modeled but do not yet have a
-    /// runtime engine.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when any cue uses a modeled feature whose runtime
-    /// implementation belongs to a later milestone.
-    pub fn ensure_runtime_supported(&self) -> Result<()> {
-        for cue in &self.cues {
-            if !cue.events.is_empty() {
-                bail!(
-                    "cue '{}' configures timed events, whose runtime support is not implemented yet",
-                    cue.id,
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
 impl EventDocument {
     fn to_event(&self) -> Result<Event> {
         validate_identifier("event ID", &self.id)?;

@@ -111,21 +111,25 @@ an explicit sink that lacks the requested property fails clearly instead of igno
 
 ### P1 — Host-local timed events
 
-Implement the entire Phase 6 event subsystem:
+Status: implemented.
 
-- at and before_end parsing into integer nanoseconds.
-- Typed process and UDP actions, including textual and hexadecimal payloads.
-- Timeline-crossing scheduler.
-- Traversal identity across cue and playlist iterations.
-- No firing on seek, initial join, or resynchronization.
-- Re-eligibility on the next normal traversal.
-- Duplicate suppression around jitter/corrections.
-- Low-priority asynchronous process executor with safe output handling and child reaping.
-- Prepared/reused UDP sockets.
-- Structured firing, completion, and failure logs.
-- Default suppression during debug loops.
+The local event subsystem now provides:
 
-No event configuration or runtime scheduler currently exists. This is the blueprint’s Phase 6 (BLUEPRINT.md (docs/BLUEPRINT.md:3253)).
+- [x] `at` and `before_end` parsing into integer nanoseconds.
+- [x] Typed process and UDP actions, including textual and hexadecimal payloads.
+- [x] Timeline-crossing scheduler.
+- [x] Traversal identity across cue and playlist iterations.
+- [x] No firing on seek, initial join, or resynchronization.
+- [x] Re-eligibility on the next normal traversal.
+- [x] Duplicate suppression around jitter/corrections.
+- [x] Low-priority asynchronous process executor with safe output handling and child reaping.
+- [x] Prepared/reused UDP sockets.
+- [x] Structured firing, completion, and failure logs.
+- [x] Default suppression during debug loops.
+
+Events advance from the last authoritative shared-clock anchor and continue free-running during
+state-traffic loss. The scheduler treats generation changes and local recovery as discontinuities,
+while normal cue and playlist traversal changes re-enable each cue's events.
 
 ### P1 — Installation transport controls and console
 

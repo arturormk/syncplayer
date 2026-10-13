@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use syncplayer::events::{EventCue, EventObservation, EventRuntime};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
 use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
@@ -388,7 +389,6 @@ fn load_runtime_program(args: &PlaybackArgs) -> Result<ResolvedProgram> {
     let config = ProgramConfig::load(&args.program)
         .with_context(|| format!("failed to load program {}", args.program.display()))?;
     let program = config.resolve_player(args.player_id.as_deref())?;
-    program.ensure_runtime_supported()?;
     info!(
         program = %program.program_id,
         program_hash = %program.hash,
@@ -1197,7 +1197,9 @@ struct MediaItem {
 struct PlaybackSequence {
     program_id: String,
     program_hash: ProgramHash,
+    player_id: String,
     cue_ids: Vec<String>,
+    event_cues: Vec<EventCue>,
     items: Vec<MediaItem>,
     cue_durations_ns: Vec<u64>,
     timeline: Option<Timeline>,
@@ -1327,10 +1329,22 @@ impl PlaybackSequence {
         let timeline = Timeline::new(durations.clone(), program.looping)
             .context("invalid program sequence duration")?;
         let from_playlist = items.len() > 1;
+        let event_cues = program
+            .cues
+            .iter()
+            .zip(&durations)
+            .map(|(cue, duration_ns)| EventCue {
+                id: cue.id.clone(),
+                duration_ns: *duration_ns,
+                events: cue.events.clone(),
+            })
+            .collect();
         Ok(Self {
             program_id: program.program_id.clone(),
             program_hash: program.hash,
+            player_id: program.player_id.to_string(),
             cue_ids: program.cues.iter().map(|cue| cue.id.clone()).collect(),
+            event_cues,
             items,
             cue_durations_ns: durations,
             timeline: Some(timeline),
@@ -1462,6 +1476,19 @@ struct PositionSample {
     transition_in_progress: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct EventProjection {
+    session: MasterSession,
+    generation: u64,
+    anchor_clock: ClockNs,
+    anchor_media_position: MediaPositionNs,
+    anchor_item: ItemPosition,
+    cue_occurrence: u64,
+    playlist_iteration: u64,
+    transport_state: TransportState,
+    debug_loop: Option<DebugLoopState>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriftAction {
     None,
@@ -1535,6 +1562,9 @@ struct Player {
     global_mute: bool,
     global_gain_db: f64,
     sequence: PlaybackSequence,
+    events: Mutex<EventRuntime>,
+    event_projection: Mutex<Option<EventProjection>>,
+    events_suppressed_until: Mutex<Option<ClockNs>>,
     cursor: Arc<Mutex<PlaylistCursor>>,
     audio_cursor: Arc<Mutex<PlaylistCursor>>,
     role: PlayerRole,
@@ -1664,6 +1694,7 @@ impl Player {
             combined_gain(args.gain_db, item.gain_db)
                 .with_context(|| format!("invalid effective gain for {}", item.path.display()))?;
         }
+        // Constructing the runtime here prepares all UDP sockets before playback starts.
         if sequence.items.iter().all(|item| !item.external_audio) {
             return Self::new_playbin(args, sequence, forced_clock);
         }
@@ -1857,6 +1888,10 @@ impl Player {
             playlist = sequence.from_playlist,
             "media sequence prerolled"
         );
+        let events = Mutex::new(EventRuntime::new(
+            sequence.player_id.clone(),
+            sequence.event_cues.clone(),
+        )?);
         Ok(Self {
             pipeline,
             video_source,
@@ -1865,6 +1900,9 @@ impl Player {
             global_mute: args.mute,
             global_gain_db: args.gain_db,
             sequence,
+            events,
+            event_projection: Mutex::new(None),
+            events_suppressed_until: Mutex::new(None),
             cursor,
             audio_cursor,
             role: PlayerRole::from_external_clock(forced_clock.is_some()),
@@ -1991,6 +2029,10 @@ impl Player {
             playlist = sequence.from_playlist,
             "embedded-media sequence prerolled"
         );
+        let events = Mutex::new(EventRuntime::new(
+            sequence.player_id.clone(),
+            sequence.event_cues.clone(),
+        )?);
         Ok(Self {
             pipeline,
             video_source: element.clone(),
@@ -1999,6 +2041,9 @@ impl Player {
             global_mute: args.mute,
             global_gain_db: args.gain_db,
             sequence,
+            events,
+            event_projection: Mutex::new(None),
+            events_suppressed_until: Mutex::new(None),
             cursor,
             audio_cursor,
             role: PlayerRole::from_external_clock(forced_clock.is_some()),
@@ -2070,6 +2115,14 @@ impl Player {
         recovery_attempt: u64,
         update_authority: bool,
     ) -> Result<()> {
+        self.events
+            .lock()
+            .map_err(|_| anyhow!("event runtime lock poisoned"))?
+            .mark_discontinuity();
+        *self
+            .events_suppressed_until
+            .lock()
+            .map_err(|_| anyhow!("event suppression lock poisoned"))? = Some(plan.release_at);
         self.cancel_scheduled_release()?;
         let item_position = self.sequence.locate(plan.media_position.get())?;
         debug!(
@@ -2250,6 +2303,22 @@ impl Player {
         let media_position = self
             .sequence
             .position_for_snapshot(item, runtime.playlist_iteration)?;
+        let debug_loop = runtime.debug_loop.map(|debug_loop| DebugLoopState {
+            start: MediaPositionNs::new(debug_loop.start_ns),
+            end: MediaPositionNs::new(debug_loop.end_ns),
+            events_enabled: debug_loop.events_enabled,
+        });
+        self.update_event_projection(EventProjection {
+            session: runtime.session,
+            generation: runtime.generation,
+            anchor_clock: runtime.anchor_clock,
+            anchor_media_position: media_position,
+            anchor_item: item,
+            cue_occurrence: runtime.cue_occurrence,
+            playlist_iteration: runtime.playlist_iteration,
+            transport_state: runtime.transport_state,
+            debug_loop,
+        })?;
         Ok(StateSnapshot {
             generation: runtime.generation,
             program_id: runtime.program_id,
@@ -2264,11 +2333,7 @@ impl Player {
             item_position: MediaPositionNs::new(item.local_ns),
             cue_duration: runtime.cue_duration,
             playlist_iteration: runtime.playlist_iteration,
-            debug_loop: runtime.debug_loop.map(|debug_loop| DebugLoopState {
-                start: MediaPositionNs::new(debug_loop.start_ns),
-                end: MediaPositionNs::new(debug_loop.end_ns),
-                events_enabled: debug_loop.events_enabled,
-            }),
+            debug_loop,
         })
     }
 
@@ -2318,6 +2383,20 @@ impl Player {
             },
             snapshot.playlist_iteration,
         )?;
+        self.update_event_projection(EventProjection {
+            session: authority.session,
+            generation: snapshot.generation,
+            anchor_clock: snapshot.anchor_clock,
+            anchor_media_position: local_media_position,
+            anchor_item: ItemPosition {
+                index: item_index,
+                local_ns: snapshot.item_position.get(),
+            },
+            cue_occurrence: snapshot.cue_occurrence,
+            playlist_iteration: snapshot.playlist_iteration,
+            transport_state: snapshot.transport_state,
+            debug_loop: snapshot.debug_loop,
+        })?;
 
         let refreshed = ReleasePlan {
             generation: snapshot.generation,
@@ -2406,6 +2485,7 @@ impl Player {
                 self.process_telemetry(initial_plan)?;
                 next_telemetry = Instant::now() + TELEMETRY_INTERVAL;
             }
+            self.tick_events()?;
             if let Some(error) = self
                 .release_error
                 .lock()
@@ -2419,6 +2499,115 @@ impl Player {
             .set_state(gst::State::Null)
             .context("failed to stop pipeline")?;
         result
+    }
+
+    fn update_event_projection(&self, projection: EventProjection) -> Result<()> {
+        *self
+            .event_projection
+            .lock()
+            .map_err(|_| anyhow!("event projection lock poisoned"))? = Some(projection);
+        self.tick_events()
+    }
+
+    fn tick_events(&self) -> Result<()> {
+        let Some(projection) = *self
+            .event_projection
+            .lock()
+            .map_err(|_| anyhow!("event projection lock poisoned"))?
+        else {
+            return Ok(());
+        };
+        let now = ClockNs::new(self.clock()?.time().nseconds());
+        let mut suppressed_until = self
+            .events_suppressed_until
+            .lock()
+            .map_err(|_| anyhow!("event suppression lock poisoned"))?;
+        if suppressed_until.is_some_and(|deadline| now < deadline) {
+            self.events
+                .lock()
+                .map_err(|_| anyhow!("event runtime lock poisoned"))?
+                .mark_discontinuity();
+            return Ok(());
+        }
+        *suppressed_until = None;
+        drop(suppressed_until);
+        let elapsed_ns = if projection.transport_state == TransportState::Playing {
+            now.get().saturating_sub(projection.anchor_clock.get())
+        } else {
+            0
+        };
+        let (item, playlist_iteration, cue_occurrence) =
+            if let Some(debug_loop) = projection.debug_loop {
+                let loop_length = debug_loop.end.get().saturating_sub(debug_loop.start.get());
+                if loop_length == 0 {
+                    return Ok(());
+                }
+                let from_start = projection
+                    .anchor_item
+                    .local_ns
+                    .saturating_sub(debug_loop.start.get());
+                let offset =
+                    (u128::from(from_start) + u128::from(elapsed_ns)) % u128::from(loop_length);
+                (
+                    ItemPosition {
+                        index: projection.anchor_item.index,
+                        local_ns: debug_loop.start.get()
+                            + u64::try_from(offset).expect("modulo-u64 result fits u64"),
+                    },
+                    projection.playlist_iteration,
+                    projection.cue_occurrence,
+                )
+            } else {
+                let Ok(position) = self
+                    .sequence
+                    .project(projection.anchor_media_position.get(), elapsed_ns)
+                else {
+                    return Ok(());
+                };
+                let Ok(item) = self.sequence.locate(position) else {
+                    return Ok(());
+                };
+                let playlist_iteration = self
+                    .sequence
+                    .timeline
+                    .as_ref()
+                    .map_or(0, |timeline| timeline.playlist_iteration(position));
+                let cue_count = u64::try_from(self.sequence.cue_ids.len())
+                    .context("cue count does not fit u64")?;
+                let anchor_index = u64::try_from(projection.anchor_item.index)
+                    .context("anchor cue index does not fit u64")?;
+                let item_index = u64::try_from(item.index).context("cue index does not fit u64")?;
+                let anchor_ordinal = projection
+                    .playlist_iteration
+                    .saturating_mul(cue_count)
+                    .saturating_add(anchor_index);
+                let ordinal = playlist_iteration
+                    .saturating_mul(cue_count)
+                    .saturating_add(item_index);
+                (
+                    item,
+                    playlist_iteration,
+                    projection
+                        .cue_occurrence
+                        .saturating_add(ordinal.saturating_sub(anchor_ordinal)),
+                )
+            };
+        self.events
+            .lock()
+            .map_err(|_| anyhow!("event runtime lock poisoned"))?
+            .observe(EventObservation {
+                session: projection.session,
+                generation: projection.generation,
+                cue_index: item.index,
+                cue_occurrence,
+                playlist_iteration,
+                cue_position_ns: item.local_ns,
+                transport_state: projection.transport_state,
+                debug_loop_events_enabled: projection
+                    .debug_loop
+                    .map(|debug_loop| debug_loop.events_enabled),
+            });
+        Ok(())
     }
 
     /// Returns true only for the authoritative end of a non-looping program.
@@ -3499,7 +3688,9 @@ mod tests {
         let sequence = |looping| PlaybackSequence {
             program_id: "show".to_owned(),
             program_hash: ProgramHash::from_bytes([1; 32]),
+            player_id: "player".to_owned(),
             cue_ids: vec!["a".to_owned(), "b".to_owned()],
+            event_cues: Vec::new(),
             items: vec![
                 MediaItem {
                     path: PathBuf::from("a"),
@@ -3551,7 +3742,9 @@ mod tests {
         let sequence = PlaybackSequence {
             program_id: "show".to_owned(),
             program_hash: ProgramHash::from_bytes([1; 32]),
+            player_id: "player".to_owned(),
             cue_ids: vec!["a".to_owned(), "b".to_owned()],
+            event_cues: Vec::new(),
             items: vec![
                 MediaItem {
                     path: PathBuf::from("a"),

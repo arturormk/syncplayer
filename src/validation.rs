@@ -232,7 +232,6 @@ fn validate_cue(
     if let Some(video) = &video {
         validate_event_times(cue, video.duration_ns, diagnostics);
     }
-    warn_on_pending_runtime(cue, diagnostics);
     let signature = video
         .as_ref()
         .map(|metadata| metadata.stream_signature.clone());
@@ -295,22 +294,6 @@ fn validate_event_times(cue: &ResolvedCue, duration_ns: u64, diagnostics: &mut V
     }
 }
 
-fn warn_on_pending_runtime(cue: &ResolvedCue, diagnostics: &mut Vec<Diagnostic>) {
-    let mut pending = Vec::new();
-    if !cue.events.is_empty() {
-        pending.push("timed events");
-    }
-    if !pending.is_empty() {
-        diagnostics.push(warning_diagnostic(
-            &cue.id,
-            format!(
-                "configured {} will be rejected by playback until its runtime engine is implemented",
-                pending.join(", ")
-            ),
-        ));
-    }
-}
-
 fn warn_on_transition(
     from: &str,
     to: &str,
@@ -334,14 +317,6 @@ fn warn_on_transition(
 fn error_diagnostic(cue_id: &str, message: String) -> Diagnostic {
     Diagnostic {
         level: DiagnosticLevel::Error,
-        cue_id: Some(cue_id.to_owned()),
-        message,
-    }
-}
-
-fn warning_diagnostic(cue_id: &str, message: String) -> Diagnostic {
-    Diagnostic {
-        level: DiagnosticLevel::Warning,
         cue_id: Some(cue_id.to_owned()),
         message,
     }
@@ -377,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_media_timing_runtime_and_transition_diagnostics() {
+    fn aggregates_media_timing_and_transition_diagnostics() {
         let video_a = PathBuf::from("/media/a.mp4");
         let audio_a = PathBuf::from("/media/a.flac");
         let missing = PathBuf::from("/media/missing.mp4");
@@ -445,12 +420,6 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|item| item.message.contains("beyond cue EOF"))
-        );
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|item| item.message.contains("runtime engine"))
         );
         assert!(
             report
