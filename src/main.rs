@@ -41,6 +41,10 @@ const DRIFT_WARN_THRESHOLD_NS: u128 = 100_000_000;
 const DRIFT_REPAIR_THRESHOLD_NS: u128 = 250_000_000;
 const DRIFT_REQUIRED_SAMPLES: u32 = 3;
 const DRIFT_RECOVERY_COOLDOWN: Duration = Duration::from_secs(10);
+const DRIFT_SLEW_SETTLE_THRESHOLD_NS: u128 = 40_000_000;
+const DRIFT_SLEW_CORRECTION_WINDOW_SECS: f64 = 10.0;
+const DRIFT_SLEW_MAX_ADJUSTMENT: f64 = 0.02;
+const DRIFT_SLEW_RATE_UPDATE_THRESHOLD: f64 = 0.001;
 const LOCAL_RECOVERY_LEAD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -136,6 +140,10 @@ struct SlaveArgs {
     /// Seconds to wait for a keepalive acknowledgement before reconnecting.
     #[arg(long, default_value_t = 8.0, value_parser = positive_seconds)]
     keepalive_timeout: f64,
+
+    /// Gently vary local playback speed to correct sustained 100-250 ms drift.
+    #[arg(long)]
+    drift_slew: bool,
 }
 
 #[derive(Debug, Args)]
@@ -258,7 +266,7 @@ fn run_master(args: &MasterArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("duration tolerance is too large"))?,
         mismatch_policy: args.duration_mismatch,
     };
-    let player = Arc::new(Player::new(&args.playback, sequence, None)?);
+    let player = Arc::new(Player::new(&args.playback, sequence, None, false)?);
     let clock = player.clock()?;
     let bind_ip = match args.bind.ip() {
         IpAddr::V4(ip) => ip.to_string(),
@@ -376,12 +384,18 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
     }
     let subscription = create_subscription(&program, &sequence, state_port)?;
     let (mut stream, clock, authority) = wait_for_master(args.master, &subscription);
-    let player = Arc::new(Player::new(&args.playback, sequence, Some(&clock))?);
+    let player = Arc::new(Player::new(
+        &args.playback,
+        sequence,
+        Some(&clock),
+        args.drift_slew,
+    )?);
     let plan = receive_release(&mut stream, &clock, authority)?;
     player.apply_control_plan(&clock, plan)?;
     report_prepared(&mut stream, authority)?;
     info!(
         release_at_ns = plan.release_at.get(),
+        drift_slew = args.drift_slew,
         "accepted shared-clock release"
     );
 
@@ -2109,6 +2123,109 @@ impl DriftPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DriftSlewAction {
+    None,
+    Apply(f64),
+    Reset,
+}
+
+#[derive(Debug)]
+struct DriftSlewController {
+    enabled: bool,
+    active: bool,
+    direction: i8,
+    qualifying_samples: u32,
+    applied_rate: f64,
+}
+
+impl DriftSlewController {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            active: false,
+            direction: 0,
+            qualifying_samples: 0,
+            applied_rate: 1.0,
+        }
+    }
+
+    fn observe(&mut self, error_ns: i128) -> DriftSlewAction {
+        if !self.enabled {
+            return DriftSlewAction::None;
+        }
+
+        let magnitude = error_ns.unsigned_abs();
+        let direction = error_ns.signum() as i8;
+        if self.active {
+            if magnitude <= DRIFT_SLEW_SETTLE_THRESHOLD_NS
+                || magnitude > DRIFT_REPAIR_THRESHOLD_NS
+                || direction != self.direction
+            {
+                self.clear();
+                return DriftSlewAction::Reset;
+            }
+            let rate = drift_slew_rate(error_ns);
+            if (rate - self.applied_rate).abs() < DRIFT_SLEW_RATE_UPDATE_THRESHOLD {
+                return DriftSlewAction::None;
+            }
+            self.applied_rate = rate;
+            return DriftSlewAction::Apply(rate);
+        }
+
+        if magnitude <= DRIFT_WARN_THRESHOLD_NS || magnitude > DRIFT_REPAIR_THRESHOLD_NS {
+            self.direction = 0;
+            self.qualifying_samples = 0;
+            return DriftSlewAction::None;
+        }
+        if self.direction == direction {
+            self.qualifying_samples = self.qualifying_samples.saturating_add(1);
+        } else {
+            self.direction = direction;
+            self.qualifying_samples = 1;
+        }
+        if self.qualifying_samples < DRIFT_REQUIRED_SAMPLES {
+            return DriftSlewAction::None;
+        }
+
+        self.active = true;
+        let rate = drift_slew_rate(error_ns);
+        self.applied_rate = rate;
+        DriftSlewAction::Apply(rate)
+    }
+
+    fn suppress(&mut self) -> bool {
+        let was_active = self.active;
+        self.clear();
+        was_active
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        self.active = false;
+        self.direction = 0;
+        self.qualifying_samples = 0;
+        self.applied_rate = 1.0;
+    }
+}
+
+fn drift_slew_rate(error_ns: i128) -> f64 {
+    let magnitude_ns = u64::try_from(error_ns.unsigned_abs()).unwrap_or(u64::MAX);
+    let magnitude = Duration::from_nanos(magnitude_ns).as_secs_f64();
+    let signed_error = if error_ns.is_negative() {
+        -magnitude
+    } else {
+        magnitude
+    };
+    let adjustment = (signed_error / DRIFT_SLEW_CORRECTION_WINDOW_SECS)
+        .clamp(-DRIFT_SLEW_MAX_ADJUSTMENT, DRIFT_SLEW_MAX_ADJUSTMENT);
+    1.0 - adjustment
+}
+
 struct Player {
     pipeline: gst::Pipeline,
     video_source: gst::Element,
@@ -2132,6 +2249,8 @@ struct Player {
     recovery_attempt: Arc<AtomicU64>,
     disconnect_count: AtomicU64,
     drift_policy: Mutex<DriftPolicy>,
+    drift_slew: Mutex<DriftSlewController>,
+    rate_control_targets: Vec<gst::Element>,
     boundary_mismatch: Mutex<Option<(usize, usize, u64)>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
@@ -2247,6 +2366,7 @@ impl Player {
         args: &PlaybackArgs,
         sequence: PlaybackSequence,
         forced_clock: Option<&gst::Clock>,
+        drift_slew: bool,
     ) -> Result<Self> {
         configure_decoder_policy(args.hwdec);
         for item in &sequence.items {
@@ -2263,7 +2383,7 @@ impl Player {
         }
         // Constructing the runtime here prepares all UDP sockets before playback starts.
         if sequence.items.iter().all(|item| !item.external_audio) {
-            return Self::new_playbin(args, sequence, forced_clock);
+            return Self::new_playbin(args, sequence, forced_clock, drift_slew);
         }
         let first = &sequence.items[0];
         let pipeline = gst::Pipeline::new();
@@ -2314,6 +2434,7 @@ impl Player {
         let video_sink = select_video_sink(args)?;
         force_clock_sync(&video_sink, "video sink")?;
         configure_video_sink(&video_sink, args)?;
+        let video_rate_control = video_sink.clone();
         video_chain.push(video_sink);
 
         let audio_queue = make_named_element("queue", "audio-queue", "audio queue")?;
@@ -2332,6 +2453,7 @@ impl Player {
             make_element("autoaudiosink", "automatic audio sink")?
         };
         force_clock_sync(&audio_sink, "audio sink")?;
+        let audio_rate_control = audio_sink.clone();
         // A cue without an audio stream must still be able to preroll its
         // video. The sink remains clock-synchronised once buffers arrive.
         if audio_sink.find_property("async").is_some() {
@@ -2479,6 +2601,8 @@ impl Player {
             recovery_attempt: Arc::new(AtomicU64::new(0)),
             disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
+            drift_slew: Mutex::new(DriftSlewController::new(drift_slew)),
+            rate_control_targets: vec![video_rate_control, audio_rate_control],
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
@@ -2490,6 +2614,7 @@ impl Player {
         args: &PlaybackArgs,
         sequence: PlaybackSequence,
         forced_clock: Option<&gst::Clock>,
+        drift_slew: bool,
     ) -> Result<Self> {
         let first = &sequence.items[0];
         let element = gst::ElementFactory::make("playbin3")
@@ -2501,6 +2626,7 @@ impl Player {
             .build()
             .context("playbin3 is unavailable")?;
         let video_sink = build_playbin_video_sink(args)?;
+        let video_rate_control = video_sink.clone();
         element.set_property("video-sink", &video_sink);
         let audio_sink = if let Some(name) = &args.audio_sink {
             make_element(name, "audio sink")?
@@ -2618,6 +2744,10 @@ impl Player {
             recovery_attempt: Arc::new(AtomicU64::new(0)),
             disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
+            drift_slew: Mutex::new(DriftSlewController::new(drift_slew)),
+            // A seek sent through one playbin sink reaches the shared
+            // demuxer, which emits the rate change to all of its streams.
+            rate_control_targets: vec![video_rate_control],
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
@@ -2726,6 +2856,10 @@ impl Player {
         self.pipeline
             .set_state(gst::State::Null)
             .context("failed to reset media for synchronization")?;
+        self.drift_slew
+            .lock()
+            .map_err(|_| anyhow!("drift slew lock poisoned"))?
+            .clear();
         wait_for_state(
             &self.pipeline,
             PREROLL_TIMEOUT,
@@ -3383,6 +3517,7 @@ impl Player {
                 .lock()
                 .map_err(|_| anyhow!("drift policy lock poisoned"))?
                 .suppress();
+            self.suppress_drift_slew()?;
             debug!("position query did not produce a reliable drift sample");
             return Ok(());
         };
@@ -3409,6 +3544,7 @@ impl Player {
                 .lock()
                 .map_err(|_| anyhow!("drift policy lock poisoned"))?
                 .suppress();
+            self.suppress_drift_slew()?;
             debug!(
                 transition_in_progress = sample.transition_in_progress,
                 clock_healthy = self.clock_healthy.load(Ordering::Acquire),
@@ -3416,6 +3552,8 @@ impl Player {
             );
             return Ok(());
         }
+
+        self.process_drift_slew(&sample)?;
 
         let action = self
             .drift_policy
@@ -3443,6 +3581,82 @@ impl Player {
                 cooldown_remaining_ms = remaining.as_millis(),
                 "drift recovery suppressed during cooldown"
             ),
+        }
+        Ok(())
+    }
+
+    fn process_drift_slew(&self, sample: &PositionSample) -> Result<()> {
+        let action = self
+            .drift_slew
+            .lock()
+            .map_err(|_| anyhow!("drift slew lock poisoned"))?
+            .observe(sample.error_ns);
+        let (rate, active) = match action {
+            DriftSlewAction::None => return Ok(()),
+            DriftSlewAction::Apply(rate) => (rate, true),
+            DriftSlewAction::Reset => (1.0, false),
+        };
+        if let Err(error) = self.set_instant_playback_rate(rate) {
+            self.drift_slew
+                .lock()
+                .map_err(|_| anyhow!("drift slew lock poisoned"))?
+                .disable();
+            warn!(
+                %error,
+                requested_rate = rate,
+                "drift slew disabled because the pipeline rejected an instant rate change"
+            );
+            if active && let Err(reset_error) = self.set_instant_playback_rate(1.0) {
+                warn!(
+                    %reset_error,
+                    "failed to restore normal playback rate after a partial drift slew"
+                );
+            }
+            return Ok(());
+        }
+        info!(
+            playback_rate = rate,
+            error_ns = sample.error_ns,
+            drift_slew_active = active,
+            "Slave drift slew rate updated"
+        );
+        Ok(())
+    }
+
+    fn suppress_drift_slew(&self) -> Result<()> {
+        let was_active = self
+            .drift_slew
+            .lock()
+            .map_err(|_| anyhow!("drift slew lock poisoned"))?
+            .suppress();
+        if !was_active || self.pipeline.current_state() != gst::State::Playing {
+            return Ok(());
+        }
+        if let Err(error) = self.set_instant_playback_rate(1.0) {
+            warn!(%error, "failed to restore normal playback rate while suppressing drift slew");
+        } else {
+            info!("Slave drift slew restored normal playback rate");
+        }
+        Ok(())
+    }
+
+    fn set_instant_playback_rate(&self, rate: f64) -> Result<()> {
+        for target in &self.rate_control_targets {
+            target
+                .seek(
+                    rate,
+                    gst::SeekFlags::INSTANT_RATE_CHANGE,
+                    gst::SeekType::None,
+                    gst::ClockTime::NONE,
+                    gst::SeekType::None,
+                    gst::ClockTime::NONE,
+                )
+                .with_context(|| {
+                    format!(
+                        "rate-control target '{}' rejected rate {rate:.5}",
+                        target.name()
+                    )
+                })?;
         }
         Ok(())
     }
@@ -4081,11 +4295,12 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 mod tests {
     use super::{
         Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction,
-        DriftPolicy, DurationMismatchPolicy, FitMode, HardwareDecoding, MasterSession, MediaItem,
-        MediaPositionNs, Operation, PlaybackSequence, ProgramCompatibility, StateSnapshot,
-        Timeline, TransportState, can_join_startup, combined_gain, finite_f64, gain_db_to_linear,
-        non_negative_seconds, recovery_attempt_is_active, validate_snapshot_generation,
-        validate_state_datagram, validate_subscription,
+        DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy, FitMode,
+        HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation, PlaybackSequence,
+        ProgramCompatibility, StateSnapshot, Timeline, TransportState, can_join_startup,
+        combined_gain, finite_f64, gain_db_to_linear, non_negative_seconds,
+        recovery_attempt_is_active, validate_snapshot_generation, validate_state_datagram,
+        validate_subscription,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -4201,6 +4416,22 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["syncplayer", "master", "--media", "a.mp4"]).is_err());
         assert!(Cli::try_parse_from(["syncplayer", "master", "show.toml", "--loop"]).is_err());
+        assert!(
+            Cli::try_parse_from(["syncplayer", "master", "show.toml", "--drift-slew"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "slave",
+            "show.toml",
+            "--master",
+            "127.0.0.1:46000",
+            "--drift-slew",
+        ])
+        .unwrap();
+        let Command::Slave(args) = cli.command else {
+            panic!("expected Slave command");
+        };
+        assert!(args.drift_slew);
     }
 
     #[test]
@@ -4380,6 +4611,30 @@ mod tests {
             policy.observe(now, 300_000_000),
             DriftAction::Repair { consecutive: 3 }
         );
+    }
+
+    #[test]
+    fn drift_slew_requires_consistent_error_and_converges_at_two_percent_or_less() {
+        let mut slew = DriftSlewController::new(true);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::Apply(1.015));
+        assert_eq!(slew.observe(-240_000_000), DriftSlewAction::Apply(1.02));
+        assert_eq!(slew.observe(-80_000_000), DriftSlewAction::Apply(1.008));
+        assert_eq!(slew.observe(-40_000_000), DriftSlewAction::Reset);
+    }
+
+    #[test]
+    fn drift_slew_ignores_disabled_noisy_and_repair_sized_errors() {
+        let mut disabled = DriftSlewController::new(false);
+        assert_eq!(disabled.observe(150_000_000), DriftSlewAction::None);
+
+        let mut slew = DriftSlewController::new(true);
+        assert_eq!(slew.observe(150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(300_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
     }
 
     #[test]

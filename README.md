@@ -177,6 +177,7 @@ startup deadline for a slow or absent Slave.
 | `--state-bind <IP:PORT>` | No | Local UDP snapshot receive address. The default `0.0.0.0:0` selects an available port and advertises it during subscription. |
 | `--keepalive-interval <SECONDS>` | No | Control keepalive cadence; defaults to 2 seconds. |
 | `--keepalive-timeout <SECONDS>` | No | Time to wait for a keepalive acknowledgement before reconnecting; defaults to 8 seconds. |
+| `--drift-slew` | No | Correct sustained 100-250 ms local drift with temporary playback-rate changes of at most 2%. Disabled by default. |
 
 The Slave retries the initial Master connection once per second until the Master is available. It
 first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
@@ -288,9 +289,11 @@ local Master rendering stall does not pull healthy Slaves backward.
 Each player samples expected versus actual sequence position once per second. Samples are ignored
 while paused, preparing, seeking, waiting for release, crossing an ambiguous cue handoff, or
 using an unhealthy clock. Syncplayer warns after error exceeds 100 ms for three valid samples and
-performs one local prepared repair after error exceeds 250 ms for three valid samples. Repairs have
-a ten-second cooldown. These conservative prototype thresholds are intended to recover obvious
-stalls; the physical-host experiment must determine whether they should change.
+performs one local prepared repair after error exceeds 250 ms for three valid samples. A Slave
+started with `--drift-slew` instead corrects sustained 100-250 ms error gradually, varying playback
+speed by at most 2% and returning to normal speed inside 40 ms. Repairs retain a ten-second
+cooldown. These conservative prototype thresholds are intended to recover obvious stalls; the
+physical-host experiment must determine whether they should change.
 
 See [`docs/prototypes/clock-sync.md`](docs/prototypes/clock-sync.md) for the measurement procedure,
 acceptance criteria, and known boundaries.

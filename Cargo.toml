@@ -14,7 +14,7 @@ categories = ["multimedia::video"]
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-gstreamer = "0.25"
+gstreamer = { version = "0.25", features = ["v1_20"] }
 gstreamer-net = "0.25"
 gstreamer-pbutils = "0.25"
 hostname = "0.4"
