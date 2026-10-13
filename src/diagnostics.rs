@@ -11,6 +11,7 @@ use std::sync::Mutex;
 pub struct DiagnosticSummary {
     pub player_id: String,
     pub samples: u64,
+    pub valid_samples: u64,
     pub latest_error_ns: i64,
     pub minimum_error_ns: i64,
     pub maximum_error_ns: i64,
@@ -29,6 +30,7 @@ pub struct DiagnosticSummary {
 struct Series {
     generation: u64,
     samples: u64,
+    valid_samples: u64,
     rate_samples: u64,
     sum: f64,
     sum_squares: f64,
@@ -42,39 +44,57 @@ struct Series {
 #[allow(clippy::cast_precision_loss)]
 impl Series {
     fn new(sample: DiagnosticTelemetry) -> Self {
-        Self {
+        let valid = Self::sample_is_valid(sample);
+        let mut series = Self {
             generation: sample.generation,
             samples: 1,
-            rate_samples: 1,
-            sum: sample.error_ns as f64,
-            sum_squares: (sample.error_ns as f64).powi(2),
-            minimum: sample.error_ns,
-            maximum: sample.error_ns,
+            valid_samples: 0,
+            rate_samples: 0,
+            sum: 0.0,
+            sum_squares: 0.0,
+            minimum: i64::MAX,
+            maximum: i64::MIN,
             first_clock_ns: sample.clock_time.get(),
             first_error_ns: sample.error_ns,
             latest: sample,
+        };
+        if valid {
+            series.record_valid_sample(sample);
         }
+        series
     }
 
     fn record(&mut self, sample: DiagnosticTelemetry) {
         let discontinuity = sample.generation != self.generation
             || sample.disconnect_count != self.latest.disconnect_count
             || sample.recovery_count != self.latest.recovery_count
-            || !sample.clock_healthy
-            || sample.transition_in_progress;
+            || !Self::sample_is_valid(sample);
         if discontinuity {
             self.generation = sample.generation;
             self.rate_samples = 0;
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.latest = sample;
+        if Self::sample_is_valid(sample) {
+            self.record_valid_sample(sample);
+        }
+    }
+
+    fn sample_is_valid(sample: DiagnosticTelemetry) -> bool {
+        sample.pipeline_playing && !sample.transition_in_progress && sample.clock_healthy
+    }
+
+    fn record_valid_sample(&mut self, sample: DiagnosticTelemetry) {
+        if self.rate_samples == 0 {
             self.first_clock_ns = sample.clock_time.get();
             self.first_error_ns = sample.error_ns;
         }
-        self.samples = self.samples.saturating_add(1);
+        self.valid_samples = self.valid_samples.saturating_add(1);
         self.rate_samples = self.rate_samples.saturating_add(1);
         self.sum += sample.error_ns as f64;
         self.sum_squares += (sample.error_ns as f64).powi(2);
         self.minimum = self.minimum.min(sample.error_ns);
         self.maximum = self.maximum.max(sample.error_ns);
-        self.latest = sample;
     }
 
     fn summary(&self, player_id: String) -> DiagnosticSummary {
@@ -89,11 +109,28 @@ impl Series {
         DiagnosticSummary {
             player_id,
             samples: self.samples,
+            valid_samples: self.valid_samples,
             latest_error_ns: self.latest.error_ns,
-            minimum_error_ns: self.minimum,
-            maximum_error_ns: self.maximum,
-            mean_error_ns: self.sum / self.samples as f64,
-            rms_error_ns: (self.sum_squares / self.samples as f64).sqrt(),
+            minimum_error_ns: if self.valid_samples > 0 {
+                self.minimum
+            } else {
+                0
+            },
+            maximum_error_ns: if self.valid_samples > 0 {
+                self.maximum
+            } else {
+                0
+            },
+            mean_error_ns: if self.valid_samples > 0 {
+                self.sum / self.valid_samples as f64
+            } else {
+                0.0
+            },
+            rms_error_ns: if self.valid_samples > 0 {
+                (self.sum_squares / self.valid_samples as f64).sqrt()
+            } else {
+                0.0
+            },
             rate_error_ppm,
             disconnect_count: self.latest.disconnect_count,
             recovery_count: self.latest.recovery_count,
@@ -270,5 +307,31 @@ mod tests {
         let summary = hub.summaries().unwrap().remove(0);
         assert_eq!(summary.samples, 2);
         assert!(summary.rate_error_ppm.is_none());
+    }
+
+    #[test]
+    fn transition_samples_do_not_pollute_statistics_or_rate() {
+        let hub = DiagnosticsHub::new(None).unwrap();
+        hub.record("left", sample(1_000_000_000, 10)).unwrap();
+
+        let mut transition = sample(2_000_000_000, 10_000_000_000);
+        transition.transition_in_progress = true;
+        hub.record("left", transition).unwrap();
+
+        hub.record("left", sample(3_000_000_000, 20)).unwrap();
+        let summary = hub.summaries().unwrap().remove(0);
+        assert_eq!(summary.samples, 3);
+        assert_eq!(summary.valid_samples, 2);
+        assert_eq!(summary.minimum_error_ns, 10);
+        assert_eq!(summary.maximum_error_ns, 20);
+        assert_eq!(summary.mean_error_ns, 15.0);
+        assert!(summary.rate_error_ppm.is_none());
+
+        hub.record("left", sample(4_000_000_000, 1_000_020))
+            .unwrap();
+        let summary = hub.summaries().unwrap().remove(0);
+        assert_eq!(summary.samples, 4);
+        assert_eq!(summary.valid_samples, 3);
+        assert!((summary.rate_error_ppm.unwrap() - 1000.0).abs() < 0.001);
     }
 }

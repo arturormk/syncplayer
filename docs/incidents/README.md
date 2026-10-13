@@ -33,3 +33,4 @@ Routine defects with an obvious cause and no reusable lesson do not need an inci
 - [`INC-0001 — Forced system clock stalls master playback after delayed startup`](INC-0001-forced-system-clock-stalls-master-after-delayed-startup.md)
 - [`INC-0002 — Current URI race panics during cue handoff`](INC-0002-current-uri-race-panics-during-cue-handoff.md)
 - [`INC-0003 — Independent decode branches break preroll and cue handoff`](INC-0003-independent-decode-branches-break-preroll-and-handoff.md)
+- [`INC-0004 — Shorter rendition disconnects at authoritative cue end`](INC-0004-shorter-rendition-disconnects-at-authoritative-cue-end.md)

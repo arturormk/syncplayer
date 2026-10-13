@@ -870,8 +870,9 @@ fn console_diagnostics(server: &SlaveServer) -> Result<String> {
                 |ppm| format!("{ppm:+.1}ppm ({:+.4}%)", ppm / 10_000.0),
             );
             format!(
-                "{} samples={} error={:+.3}ms min={:+.3}ms max={:+.3}ms rms={:.3}ms rate={} disconnects={} recoveries={} playing={} transition={} clock={}",
+                "{} samples={}/{} valid error={:+.3}ms min={:+.3}ms max={:+.3}ms rms={:.3}ms rate={} disconnects={} recoveries={} playing={} transition={} clock={}",
                 summary.player_id,
+                summary.valid_samples,
                 summary.samples,
                 summary.latest_error_ns as f64 / 1_000_000.0,
                 summary.minimum_error_ns as f64 / 1_000_000.0,
@@ -1630,6 +1631,10 @@ fn monitor_master(
             let planned_rejoin = error.downcast_ref::<GenerationChanged>().is_some();
             if !planned_rejoin {
                 player.set_clock_health(false);
+                let _ = write_message(
+                    &mut stream,
+                    &Message::Error(format!("Slave control monitor failed: {error:#}")),
+                );
             }
             if let Err(shutdown_error) = stream.shutdown(Shutdown::Both) {
                 debug!(%master, %shutdown_error, "old Master connection was already closed");
@@ -1937,6 +1942,52 @@ impl PlaybackSequence {
             None if position.index == 0 => Ok(MediaPositionNs::new(position.local_ns)),
             None => bail!("single-media playback reported item {}", position.index),
         }
+    }
+
+    fn sequence_position_near(
+        &self,
+        position: ItemPosition,
+        expected: MediaPositionNs,
+    ) -> Result<MediaPositionNs> {
+        let position_in_iteration = self.sequence_position(position)?;
+        let Some(timeline) = &self.timeline else {
+            return Ok(position_in_iteration);
+        };
+        if !timeline.is_looping() {
+            return Ok(position_in_iteration);
+        }
+        let expected_iteration = timeline.playlist_iteration(expected.get());
+        let first_iteration = expected_iteration.saturating_sub(1);
+        let last_iteration = expected_iteration.saturating_add(1);
+        (first_iteration..=last_iteration)
+            .filter_map(|iteration| {
+                timeline
+                    .absolute_position(position, iteration)
+                    .ok()
+                    .map(MediaPositionNs::new)
+            })
+            .min_by_key(|candidate| (*candidate - expected).unsigned_abs())
+            .ok_or_else(|| anyhow!("could not place item near the expected playlist occurrence"))
+    }
+
+    fn position_for_remote_snapshot(
+        &self,
+        item: ItemPosition,
+        playlist_iteration: u64,
+    ) -> Result<MediaPositionNs> {
+        let duration_ns = self
+            .cue_durations_ns
+            .get(item.index)
+            .copied()
+            .ok_or_else(|| anyhow!("snapshot cue index {} does not exist", item.index))?;
+        let local_item = ItemPosition {
+            index: item.index,
+            // A permitted duration mismatch can leave the Master briefly inside
+            // a cue after this rendition has reached its endpoint. Preserve the
+            // authoritative cue identity and hold the last representable instant.
+            local_ns: item.local_ns.min(duration_ns.saturating_sub(1)),
+        };
+        self.position_for_snapshot(local_item, playlist_iteration)
     }
 
     fn position_error(&self, actual: MediaPositionNs, expected: MediaPositionNs) -> i128 {
@@ -2965,7 +3016,17 @@ impl Player {
         if snapshot.item_position.get() > master_duration_ns {
             bail!("snapshot cue position exceeds the authoritative cue duration");
         }
-        let local_media_position = self.sequence.position_for_snapshot(
+        let local_duration_ns = self.sequence.cue_durations_ns[item_index];
+        if snapshot.item_position.get() >= local_duration_ns {
+            debug!(
+                item_index,
+                authoritative_item_position_ns = snapshot.item_position.get(),
+                local_duration_ns,
+                mismatch_ns = snapshot.item_position.get() - local_duration_ns,
+                "holding shorter local rendition at its last valid cue position"
+            );
+        }
+        let local_media_position = self.sequence.position_for_remote_snapshot(
             ItemPosition {
                 index: item_index,
                 local_ns: snapshot.item_position.get(),
@@ -3464,7 +3525,10 @@ impl Player {
             index: actual_item_index,
             local_ns: actual_local.nseconds(),
         };
-        let actual_sequence_position = match self.sequence.sequence_position(actual_item) {
+        let actual_sequence_position = match self
+            .sequence
+            .sequence_position_near(actual_item, expected_sequence_position)
+        {
             Ok(position) => position,
             Err(error) => {
                 debug!(%error, "item-local position is ambiguous at a cue boundary");
@@ -4326,9 +4390,8 @@ mod tests {
         assert!(!recovery_attempt_is_active(&active, 4));
     }
 
-    #[test]
-    fn sequence_error_is_correct_across_item_and_loop_boundaries() {
-        let sequence = |looping| PlaybackSequence {
+    fn sequence(looping: bool) -> PlaybackSequence {
+        PlaybackSequence {
             program_id: "show".to_owned(),
             program_hash: ProgramHash::from_bytes([1; 32]),
             player_id: "player".to_owned(),
@@ -4358,7 +4421,11 @@ mod tests {
             timeline: Some(Timeline::new(vec![10, 20], looping).unwrap()),
             looping,
             from_playlist: true,
-        };
+        }
+    }
+
+    #[test]
+    fn sequence_error_is_correct_across_item_and_loop_boundaries() {
         assert_eq!(
             sequence(false).position_error(MediaPositionNs::new(11), MediaPositionNs::new(9)),
             2
@@ -4382,6 +4449,35 @@ mod tests {
                 },
                 1,
             )
+        );
+        assert_eq!(
+            looping
+                .sequence_position_near(
+                    syncplayer::playlist::ItemPosition {
+                        index: 0,
+                        local_ns: 1,
+                    },
+                    MediaPositionNs::new(29),
+                )
+                .unwrap(),
+            MediaPositionNs::new(31)
+        );
+    }
+
+    #[test]
+    fn shorter_rendition_holds_its_last_in_cue_instant() {
+        let sequence = sequence(true);
+        assert_eq!(
+            sequence
+                .position_for_remote_snapshot(
+                    syncplayer::playlist::ItemPosition {
+                        index: 1,
+                        local_ns: 25,
+                    },
+                    1,
+                )
+                .unwrap(),
+            MediaPositionNs::new(59)
         );
     }
 

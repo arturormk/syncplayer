@@ -54,6 +54,10 @@ strictly newer than the last accepted packet. Wrong-session, old-generation, dup
 reordered packets are ignored. A future generation requires the reliable prepared-rejoin path.
 Malformed packets and playing anchors later than their sampled Master clock are rejected.
 
+When an accepted duration mismatch makes a Slave rendition shorter than the authoritative cue, the
+Slave holds that rendition at its last representable in-cue instant until a snapshot advances the
+authoritative cue. The bounded mismatch must not invalidate the control session.
+
 UDP state loss never stops playback and does not by itself tear down a healthy control session.
 TCP control loss also leaves playback free-running. Clock synchronization has its own endpoint and
 failure behavior.
