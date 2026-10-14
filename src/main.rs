@@ -3281,7 +3281,7 @@ impl Player {
             .bus()
             .ok_or_else(|| anyhow!("pipeline has no bus"))?;
         let mut next_telemetry = Instant::now();
-        let result = loop {
+        loop {
             if let Some(message) = bus.timed_pop_filtered(
                 gst::ClockTime::from_mseconds(100),
                 &[
@@ -3293,7 +3293,10 @@ impl Player {
                 match message.view() {
                     gst::MessageView::Error(error_message) => {
                         error!(source = ?error_message.src().map(GstObjectExt::path_string), error = %error_message.error(), debug = ?error_message.debug(), "GStreamer error");
-                        break Err(anyhow!(
+                        // A failed streaming pipeline can block indefinitely while being driven
+                        // to NULL. Return the fatal error immediately so the process supervisor
+                        // can restart us instead of leaving a blank but apparently live player.
+                        return Err(anyhow!(
                             "playback pipeline failed: {}",
                             error_message.error()
                         ));
@@ -3301,7 +3304,7 @@ impl Player {
                     gst::MessageView::Eos(..) => {
                         if self.handle_eos(master_transport)? {
                             info!("end of stream");
-                            break Ok(());
+                            break;
                         }
                         continue;
                     }
@@ -3341,13 +3344,13 @@ impl Player {
                 .map_err(|_| anyhow!("release error lock poisoned"))?
                 .take()
             {
-                break Err(anyhow!(error));
+                return Err(anyhow!(error));
             }
-        };
+        }
         self.pipeline
             .set_state(gst::State::Null)
             .context("failed to stop pipeline")?;
-        result
+        Ok(())
     }
 
     fn update_event_projection(&self, projection: EventProjection) -> Result<()> {
