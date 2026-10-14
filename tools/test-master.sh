@@ -16,6 +16,7 @@ Arguments:
   PROGRAM         Path to the program.toml file
 
 Options:
+      --debug     Enable debug-level Syncplayer logging
   -h, --help      Show this help text and exit
 
 The clock port is the master port plus one. The installation console listens
@@ -75,6 +76,8 @@ find_syncplayer() {
 main() {
     local master
     local program
+    local debug=false
+    local rust_log=syncplayer=warn
     local port
     local port_number
     local clock_port
@@ -82,11 +85,27 @@ main() {
     local -a pipeline_status
     local syncplayer_status
     local tee_status
+    local -a positional=()
 
-    if (($# == 1)) && [[ "$1" == '-h' || "$1" == '--help' ]]; then
-        usage
-        return 0
-    fi
+    while (($# > 0)); do
+        case "$1" in
+            --debug) debug=true ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            --)
+                shift
+                positional+=("$@")
+                break
+                ;;
+            -*) die "Unknown option: $1" ;;
+            *) positional+=("$1") ;;
+        esac
+        shift
+    done
+
+    set -- "${positional[@]}"
 
     (($# >= 1)) || die 'Missing required MASTER_IP:PORT argument.'
     (($# >= 2)) || die 'Missing required PROGRAM argument.'
@@ -94,6 +113,10 @@ main() {
 
     master=$1
     program=$2
+
+    if [[ "$debug" == true ]]; then
+        rust_log=syncplayer=debug
+    fi
 
     if [[ "$master" =~ ^.+:([0-9]{1,5})$ ]]; then
         port=${BASH_REMATCH[1]}
@@ -118,16 +141,16 @@ main() {
     printf 'Clock port:  %s\n' "$clock_port"
     printf 'Program:     %s\n' "$program"
     printf 'Console:     127.0.0.1:2323\n'
+    printf 'Rust log:    %s\n' "$rust_log"
     printf 'Logs:        %s/gstreamer.log, %s/master.log, and %s/output.csv\n\n' \
         "$PWD" "$PWD" "$PWD"
 
     GST_DEBUG_NO_COLOR=1 \
     GST_DEBUG_FILE="$PWD/gstreamer.log" \
     GST_DEBUG='2' \
-    RUST_LOG=syncplayer=warn \
+    RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
-    nice -n -19 \
-        "$syncplayer" \
+    "$syncplayer" \
         master \
         --bind "$master" \
         --clock-port "$clock_port" \

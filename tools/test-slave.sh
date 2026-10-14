@@ -16,6 +16,7 @@ Arguments:
   PROGRAM         Path to the program.toml file
 
 Options:
+      --debug     Enable debug-level Syncplayer logging
   -h, --help      Show this help text and exit
 
 The tool automatically selects a release build for the native target, falling
@@ -71,15 +72,33 @@ find_syncplayer() {
 main() {
     local master
     local program
+    local debug=false
+    local rust_log=syncplayer=warn
     local syncplayer
     local -a pipeline_status
     local syncplayer_status
     local tee_status
+    local -a positional=()
 
-    if (($# == 1)) && [[ "$1" == '-h' || "$1" == '--help' ]]; then
-        usage
-        return 0
-    fi
+    while (($# > 0)); do
+        case "$1" in
+            --debug) debug=true ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            --)
+                shift
+                positional+=("$@")
+                break
+                ;;
+            -*) die "Unknown option: $1" ;;
+            *) positional+=("$1") ;;
+        esac
+        shift
+    done
+
+    set -- "${positional[@]}"
 
     (($# >= 1)) || die 'Missing required MASTER_IP:PORT argument.'
     (($# >= 2)) || die 'Missing required PROGRAM argument.'
@@ -87,6 +106,10 @@ main() {
 
     master=$1
     program=$2
+
+    if [[ "$debug" == true ]]; then
+        rust_log=syncplayer=debug
+    fi
 
     [[ "$master" =~ ^.+:[0-9]+$ ]] \
         || die "Invalid master address '$master'; expected IP:PORT."
@@ -100,15 +123,15 @@ main() {
     printf 'Executable: %s\n' "$syncplayer"
     printf 'Master:     %s\n' "$master"
     printf 'Program:    %s\n' "$program"
+    printf 'Rust log:   %s\n' "$rust_log"
     printf 'Logs:       %s/gstreamer.log and %s/slave.log\n\n' "$PWD" "$PWD"
 
     GST_DEBUG_NO_COLOR=1 \
     GST_DEBUG_FILE="$PWD/gstreamer.log" \
     GST_DEBUG='2' \
-    RUST_LOG=syncplayer=debug \
+    RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
-    nice -n -19 \
-        "$syncplayer" \
+    "$syncplayer" \
         slave \
         --master "$master" \
         --mute \
