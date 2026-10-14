@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use gst::prelude::*;
+use gst_gl::prelude::ContextGLExt;
 use gstreamer as gst;
+use gstreamer_gl as gst_gl;
 use gstreamer_net as gst_net;
 use gstreamer_pbutils as gst_pbutils;
 use std::fmt;
@@ -169,6 +171,10 @@ struct PlaybackArgs {
     #[arg(long)]
     fullscreen: bool,
 
+    /// Render directly through EGL/GBM and composite the OSD on the GPU.
+    #[arg(long, conflicts_with_all = ["video_sink", "display"])]
+    kms_gl: bool,
+
     /// Width of the video output canvas in pixels.
     #[arg(long, requires = "height", value_parser = clap::value_parser!(u32).range(1..))]
     width: Option<u32>,
@@ -251,6 +257,7 @@ fn main() -> Result<()> {
 
 #[allow(clippy::too_many_lines)]
 fn run_master(args: &MasterArgs) -> Result<()> {
+    validate_playback_args(&args.playback)?;
     // Let the pipeline choose its natural clock. With a real audio sink this
     // is normally the device-backed audio clock, so the Master does not have
     // to slave its own output to an unrelated system clock.
@@ -375,6 +382,7 @@ fn run_master(args: &MasterArgs) -> Result<()> {
 }
 
 fn run_slave(args: &SlaveArgs) -> Result<()> {
+    validate_playback_args(&args.playback)?;
     let program = load_runtime_program(&args.playback)?;
     let sequence = PlaybackSequence::prepare(&program)?;
     let state_socket = UdpSocket::bind(args.state_bind)
@@ -2436,14 +2444,18 @@ impl Player {
             .context("uridecodebin3 is unavailable for audio")?;
 
         let video_queue = make_named_element("queue", "video-queue", "video queue")?;
-        let video_convert = make_named_element("videoconvert", "video-convert", "video converter")?;
-        let video_scale = gst::ElementFactory::make("videoscale")
-            .name("video-scale")
-            .property("add-borders", args.fit == FitMode::Contain)
-            .build()
-            .context("videoscale is unavailable")?;
-        let mut video_chain = vec![video_queue.clone(), video_convert, video_scale];
-        if args.fit == FitMode::Cover {
+        let mut video_chain = vec![video_queue.clone()];
+        if !args.kms_gl {
+            let video_convert =
+                make_named_element("videoconvert", "video-convert", "video converter")?;
+            let video_scale = gst::ElementFactory::make("videoscale")
+                .name("video-scale")
+                .property("add-borders", args.fit == FitMode::Contain)
+                .build()
+                .context("videoscale is unavailable")?;
+            video_chain.extend([video_convert, video_scale]);
+        }
+        if !args.kms_gl && args.fit == FitMode::Cover {
             let (width, height) = output_size(args)?;
             let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
             let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
@@ -2454,7 +2466,9 @@ impl Player {
                 .context("cover mode requires the aspectratiocrop GStreamer element")?;
             video_chain.push(crop);
         }
-        if let Some((width, height)) = optional_output_size(args) {
+        if !args.kms_gl
+            && let Some((width, height)) = optional_output_size(args)
+        {
             let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
             let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
             let caps = gst::Caps::builder("video/x-raw")
@@ -2516,6 +2530,8 @@ impl Player {
         select_decoded_streams(&audio_source, gst::StreamType::AUDIO);
         connect_decoded_pad(&video_source, &video_queue, "video_", "video");
         connect_decoded_pad(&audio_source, &audio_queue, "audio_", "audio");
+
+        configure_kms_gl_context(&pipeline, args)?;
 
         let cursor = Arc::new(Mutex::new(PlaylistCursor::new(
             sequence.items.len(),
@@ -2579,16 +2595,18 @@ impl Player {
         }
         pipeline
             .set_state(gst::State::Paused)
-            .context("failed to request PAUSED")?;
+            .with_context(|| preroll_request_error(args))?;
         wait_for_state(
             &pipeline,
             PREROLL_TIMEOUT,
             "media did not preroll before timeout",
-        )?;
+        )
+        .with_context(|| preroll_wait_error(args))?;
         if forced_clock.is_some() {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
+        log_and_validate_video_negotiation(&osd_overlay, args)?;
         let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
         // Pin the clock selected during preroll so the one exported by the
         // Master is exactly the one used once the pipeline starts playing.
@@ -2611,6 +2629,7 @@ impl Player {
             output_width = args.width,
             output_height = args.height,
             display = args.display.as_deref(),
+            kms_gl = args.kms_gl,
             hwdec = ?args.hwdec,
             looped = sequence.looping,
             playlist = sequence.from_playlist,
@@ -2719,6 +2738,7 @@ impl Player {
             .clone()
             .downcast::<gst::Pipeline>()
             .map_err(|_| anyhow!("playbin3 did not create a GstPipeline"))?;
+        configure_kms_gl_context(&pipeline, args)?;
         if let Some(clock) = forced_clock {
             pipeline.use_clock(Some(clock));
         } else if args.clock == ClockPolicy::System {
@@ -2726,16 +2746,18 @@ impl Player {
         }
         pipeline
             .set_state(gst::State::Paused)
-            .context("failed to request PAUSED")?;
+            .with_context(|| preroll_request_error(args))?;
         wait_for_state(
             &pipeline,
             PREROLL_TIMEOUT,
             "media did not preroll before timeout",
-        )?;
+        )
+        .with_context(|| preroll_wait_error(args))?;
         if forced_clock.is_some() {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
+        log_and_validate_video_negotiation(&osd_overlay, args)?;
         let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
         pipeline.use_clock(Some(&clock));
         info!(
@@ -2757,6 +2779,7 @@ impl Player {
             output_width = args.width,
             output_height = args.height,
             display = args.display.as_deref(),
+            kms_gl = args.kms_gl,
             hwdec = ?args.hwdec,
             looped = sequence.looping,
             playlist = sequence.from_playlist,
@@ -4102,6 +4125,43 @@ fn optional_output_size(args: &PlaybackArgs) -> Option<(u32, u32)> {
     args.width.zip(args.height)
 }
 
+fn validate_playback_args(args: &PlaybackArgs) -> Result<()> {
+    if !args.kms_gl {
+        return Ok(());
+    }
+    if args.fit == FitMode::Cover {
+        bail!("--kms-gl does not yet support --fit cover; use contain or stretch");
+    }
+    if args.width.is_some() || args.height.is_some() {
+        bail!("--kms-gl does not yet support --width/--height canvas sizing");
+    }
+    if args.display.is_some() {
+        bail!(
+            "--kms-gl cannot be combined with --display; use GST_GL_GBM_DRM_DEVICE and GST_GL_GBM_DRM_CONNECTOR"
+        );
+    }
+    if args.video_sink.is_some() {
+        bail!("--kms-gl cannot be combined with --video-sink");
+    }
+    Ok(())
+}
+
+fn preroll_request_error(args: &PlaybackArgs) -> &'static str {
+    if args.kms_gl {
+        "--kms-gl could not initialize EGL/GBM output; verify the GStreamer GL plugins, Mesa EGL/GBM drivers, and DRM permissions"
+    } else {
+        "failed to request PAUSED"
+    }
+}
+
+fn preroll_wait_error(args: &PlaybackArgs) -> &'static str {
+    if args.kms_gl {
+        "--kms-gl EGL/GBM output failed during preroll; verify the DRM device/connector and GPU driver"
+    } else {
+        "playback preroll failed"
+    }
+}
+
 fn output_size(args: &PlaybackArgs) -> Result<(u32, u32)> {
     optional_output_size(args).ok_or_else(|| {
         anyhow!("--fit cover requires both --width and --height to define the crop aspect ratio")
@@ -4109,6 +4169,9 @@ fn output_size(args: &PlaybackArgs) -> Result<(u32, u32)> {
 }
 
 fn select_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
+    if args.kms_gl {
+        return make_kms_gl_sink("glimagesink");
+    }
     if let Some(factory) = &args.video_sink {
         return make_element(factory, "video sink");
     }
@@ -4132,6 +4195,13 @@ fn select_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
     make_element("autovideosink", "automatic video sink")
 }
 
+fn make_kms_gl_sink(factory: &str) -> Result<gst::Element> {
+    make_element(
+        factory,
+        "EGL/GBM GL video sink (install the GStreamer GL runtime plugins)",
+    )
+}
+
 fn make_osd_overlay() -> Result<gst::Element> {
     gst::ElementFactory::make("timeoverlay")
         .name("diagnostic-osd")
@@ -4151,15 +4221,18 @@ fn make_osd_overlay() -> Result<gst::Element> {
 }
 
 fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<(gst::Element, gst::Element)> {
-    let video_convert =
-        make_named_element("videoconvert", "embedded-video-convert", "video converter")?;
-    let video_scale = gst::ElementFactory::make("videoscale")
-        .name("embedded-video-scale")
-        .property("add-borders", args.fit == FitMode::Contain)
-        .build()
-        .context("videoscale is unavailable")?;
-    let mut video_chain = vec![video_convert, video_scale];
-    if args.fit == FitMode::Cover {
+    let mut video_chain = Vec::new();
+    if !args.kms_gl {
+        let video_convert =
+            make_named_element("videoconvert", "embedded-video-convert", "video converter")?;
+        let video_scale = gst::ElementFactory::make("videoscale")
+            .name("embedded-video-scale")
+            .property("add-borders", args.fit == FitMode::Contain)
+            .build()
+            .context("videoscale is unavailable")?;
+        video_chain.extend([video_convert, video_scale]);
+    }
+    if !args.kms_gl && args.fit == FitMode::Cover {
         let (width, height) = output_size(args)?;
         let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
         let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
@@ -4170,7 +4243,9 @@ fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<(gst::Element, gst::E
             .context("cover mode requires the aspectratiocrop GStreamer element")?;
         video_chain.push(crop);
     }
-    if let Some((width, height)) = optional_output_size(args) {
+    if !args.kms_gl
+        && let Some((width, height)) = optional_output_size(args)
+    {
         let width = i32::try_from(width).context("output width exceeds GStreamer limits")?;
         let height = i32::try_from(height).context("output height exceeds GStreamer limits")?;
         let caps = gst::Caps::builder("video/x-raw")
@@ -4196,7 +4271,8 @@ fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<(gst::Element, gst::E
     gst::Element::link_many(&video_chain)?;
     let sink_pad = video_chain[0]
         .static_pad("sink")
-        .context("video converter has no sink pad")?;
+        .or_else(|| video_chain[0].static_pad("video_sink"))
+        .context("video output bin's first element has no video sink pad")?;
     let ghost_pad = gst::GhostPad::builder_with_target(&sink_pad)?
         .name("sink")
         .build();
@@ -4208,7 +4284,7 @@ fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> 
     if sink.find_property("force-aspect-ratio").is_some() {
         sink.set_property("force-aspect-ratio", args.fit == FitMode::Contain);
     }
-    if args.fullscreen {
+    if args.fullscreen && !args.kms_gl {
         if sink.find_property("fullscreen").is_none() {
             bail!(
                 "video sink '{}' cannot be made fullscreen directly; select a fullscreen-capable sink such as waylandsink",
@@ -4231,6 +4307,66 @@ fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> 
                 sink.name()
             );
         }
+    }
+    Ok(())
+}
+
+fn configure_kms_gl_context(pipeline: &gst::Pipeline, args: &PlaybackArgs) -> Result<()> {
+    if !args.kms_gl {
+        return Ok(());
+    }
+    let display = gst_gl::GLDisplay::with_type(gst_gl::GLDisplayType::GBM).context(
+        "--kms-gl requires GStreamer GL built with Mesa GBM support and an accessible DRM device",
+    )?;
+    let mut context = gst::Context::new(gst_gl::GL_DISPLAY_CONTEXT_TYPE, true);
+    context
+        .get_mut()
+        .expect("a newly-created GStreamer context is writable")
+        .set_gl_display(Some(&display));
+    pipeline.set_context(&context);
+    info!(
+        compositor = "gpu-egl-gbm",
+        sink = "glimagesink",
+        fullscreen = true,
+        "selected video compositor"
+    );
+    Ok(())
+}
+
+fn log_and_validate_video_negotiation(
+    osd_overlay: &gst::Element,
+    args: &PlaybackArgs,
+) -> Result<()> {
+    let caps = osd_overlay
+        .static_pad("src")
+        .and_then(|pad| pad.current_caps());
+    let features: Vec<String> = caps
+        .as_ref()
+        .map(|caps| {
+            caps.iter_with_features()
+                .flat_map(|(_, features)| features.iter().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    info!(
+        compositor = if args.kms_gl { "gpu-egl-gbm" } else { "inline" },
+        caps = caps.as_ref().map(ToString::to_string),
+        memory_features = ?features,
+        "negotiated video output"
+    );
+    if !args.kms_gl {
+        return Ok(());
+    }
+    let has_dmabuf = features.iter().any(|feature| feature == "memory:DMABuf");
+    let has_overlay = features
+        .iter()
+        .any(|feature| feature == "meta:GstVideoOverlayComposition");
+    if !has_dmabuf || !has_overlay {
+        bail!(
+            "--kms-gl requires negotiated DMA-BUF video with overlay-composition metadata; negotiated caps were {}",
+            caps.as_ref()
+                .map_or_else(|| "unavailable".to_owned(), ToString::to_string)
+        );
     }
     Ok(())
 }
@@ -4437,12 +4573,15 @@ mod tests {
         Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction,
         DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy, FitMode,
         HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation, PlaybackSequence,
-        ProgramCompatibility, StateSnapshot, Timeline, TransportState, can_join_startup,
-        combined_gain, finite_f64, gain_db_to_linear, non_negative_seconds,
-        recovery_attempt_is_active, validate_snapshot_generation, validate_state_datagram,
+        ProgramCompatibility, StateSnapshot, Timeline, TransportState, build_playbin_video_sink,
+        can_join_startup, combined_gain, finite_f64, gain_db_to_linear, make_kms_gl_sink,
+        non_negative_seconds, recovery_attempt_is_active, select_video_sink,
+        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
         validate_subscription,
     };
     use clap::Parser;
+    use gst::prelude::*;
+    use gstreamer as gst;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -4609,6 +4748,122 @@ mod tests {
         assert!(
             Cli::try_parse_from(["syncplayer", "master", "show.toml", "--width", "1920"]).is_err()
         );
+    }
+
+    #[test]
+    fn command_line_accepts_kms_gl_and_rejects_ambiguous_sink_selection() {
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "master",
+            "show.toml",
+            "--kms-gl",
+            "--fullscreen",
+            "--fit",
+            "stretch",
+        ])
+        .unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        assert!(args.playback.kms_gl);
+        assert!(validate_playback_args(&args.playback).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "syncplayer",
+                "master",
+                "show.toml",
+                "--kms-gl",
+                "--video-sink",
+                "fakesink",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "syncplayer",
+                "master",
+                "show.toml",
+                "--kms-gl",
+                "--display",
+                "42",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kms_gl_rejects_software_scaling_modes_with_actionable_errors() {
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "master",
+            "show.toml",
+            "--kms-gl",
+            "--fit",
+            "cover",
+        ])
+        .unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        assert!(
+            validate_playback_args(&args.playback)
+                .unwrap_err()
+                .to_string()
+                .contains("does not yet support --fit cover")
+        );
+
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "slave",
+            "show.toml",
+            "--master",
+            "127.0.0.1:46000",
+            "--kms-gl",
+            "--width",
+            "1920",
+            "--height",
+            "1080",
+        ])
+        .unwrap();
+        let Command::Slave(args) = cli.command else {
+            panic!("expected Slave command");
+        };
+        assert!(
+            validate_playback_args(&args.playback)
+                .unwrap_err()
+                .to_string()
+                .contains("does not yet support --width/--height")
+        );
+    }
+
+    #[test]
+    fn kms_gl_output_bin_uses_gl_sink_without_software_video_transforms() {
+        gst::init().unwrap();
+        let missing = make_kms_gl_sink("syncplayer-intentionally-missing-gl-sink")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("install the GStreamer GL runtime plugins"));
+        let cli = Cli::try_parse_from(["syncplayer", "master", "show.toml", "--kms-gl"]).unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        if gst::ElementFactory::find("glimagesink").is_none() {
+            let error = select_video_sink(&args.playback).unwrap_err().to_string();
+            assert!(error.contains("install the GStreamer GL runtime plugins"));
+            return;
+        }
+        let (output, _) = build_playbin_video_sink(&args.playback).unwrap();
+        let output = output.downcast::<gst::Bin>().unwrap();
+        let factories: Vec<String> = output
+            .iterate_recurse()
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter_map(|element| element.factory())
+            .map(|factory| factory.name().to_string())
+            .collect();
+        assert!(factories.iter().any(|factory| factory == "glimagesink"));
+        assert!(!factories.iter().any(|factory| factory == "videoconvert"));
+        assert!(!factories.iter().any(|factory| factory == "videoscale"));
     }
 
     #[test]

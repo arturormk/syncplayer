@@ -19,11 +19,13 @@ external cue audio.
 ## Prerequisites
 
 - Rust 1.95 (selected by `rust-toolchain.toml`)
-- GStreamer 1.20 or newer, including base/playback, pbutils, and network libraries
+- GStreamer 1.20 or newer, including base/playback, pbutils, network, and GL libraries
 - GStreamer plugins needed to decode the chosen test media and drive the selected sinks
 
 On Ubuntu, development packages typically include `libgstreamer1.0-dev` and
 `libgstreamer-plugins-base1.0-dev`. Runtime plugin selection depends on the media and machine.
+The Raspberry Pi GPU-composited KMS mode additionally needs `gstreamer1.0-gl` and Mesa's EGL/GBM
+runtime libraries.
 
 ## Quickstart
 
@@ -98,6 +100,7 @@ These options are accepted by both `master` and `slave`:
 | `--mute` | No | Silence the selected audio stream. The audio pipeline remains active, so its timing behavior is preserved. |
 | `--gain-db <DB>` | No | Add gain in decibels to the cue's configured gain. Positive effective gain is allowed but warns because it may clip. |
 | `--fullscreen` | No | Request fullscreen output. The selected sink must expose fullscreen control; `waylandsink` is selected automatically in a Wayland session. |
+| `--kms-gl` | No | On Raspberry Pi 3 or newer, use direct EGL/GBM output and composite the diagnostic OSD with `glimagesink`. This mode is inherently fullscreen. |
 | `--width <PX> --height <PX>` | No | Set the output canvas size. The two options must be supplied together. |
 | `--display <ID>` | No | Select a Wayland/X11 display name or numeric DRM/KMS connector. An explicit `--video-sink` takes precedence. |
 | `--fit <contain|cover|stretch>` | No | Choose aspect-preserving letterbox, aspect-preserving crop, or unconstrained scaling. `cover` requires width and height. |
@@ -105,6 +108,21 @@ These options are accepted by both `master` and `slave`:
 | `--hwdec <auto|off>` | No | Let GStreamer rank hardware decoders normally or disable factories classified as hardware video decoders. |
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
+
+### GPU-composited OSD on Raspberry Pi
+
+Pass `--kms-gl` to opt into direct DRM/KMS output through EGL/GBM. In this mode `timeoverlay`
+attaches overlay-composition metadata to DMA-BUF video frames and `glimagesink` composites it on
+the GPU. Syncplayer verifies the negotiated memory and metadata features after preroll and exits
+with an error instead of silently using CPU composition. The default path remains unchanged.
+
+The initial GL mode supports `--fit contain` (the default) and `--fit stretch`, without explicit
+`--width`/`--height`. It rejects `cover`, canvas sizing, `--video-sink`, and `--display`.
+`--fullscreen` is accepted but redundant because GBM output is inherently fullscreen.
+
+GBM chooses the first connected DRM output by default. For multi-output systems, set
+`GST_GL_GBM_DRM_DEVICE` and `GST_GL_GBM_DRM_CONNECTOR` in the player environment. GStreamer's
+public GBM API does not provide Syncplayer with a portable numeric connector selector.
 
 The program defines ordered logical cues and maps each cue to host-local media:
 
