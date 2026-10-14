@@ -191,7 +191,7 @@ continues playing from its last disciplined clock estimate, and attempts to reco
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
 
-Protocol version 8 is intentionally incompatible with older prototype binaries. Deploy the same
+Protocol version 9 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
 ### Installation console and centralized diagnostics
@@ -206,13 +206,17 @@ nc 127.0.0.1 2323
 ```
 
 Commands are `help`, `status`, `diagnostics`, `pause`, `play [DELAY]`, `stop`,
-`goto [CUE] TIME`, `loop SECONDS`, and `unloop`. Times accept seconds, `ms`/`s`/`m`/`h`
+`goto [CUE] TIME`, `loop SECONDS`, `unloop`, and `osd on|off|toggle`. Times accept seconds, `ms`/`s`/`m`/`h`
 suffixes, and `MM:SS` or `HH:MM:SS` notation. Transport text is interpreted only by the Master;
 Slaves receive structured generation and release state through the normal protocol. A participant
 that misses a shared deadline performs a separately prepared late rejoin instead of delaying ready
 players. Console operations reserve two release-delay windows by default—one to detect and prepare
 the generation change and one for the final shared-clock release. An explicit `play DELAY` must be
 at least that large.
+
+The OSD is off by default. When enabled, every player renders a large, centered, frame-timestamped
+diagnostic panel with its player ID, role, program, cue, transport state, and connection state. A
+translucent shaded rectangle and outlined text keep it legible over both bright and dark video.
 
 Every player measures expected versus actual playback position. Slaves report bounded telemetry on
 their existing reliable control sessions, and the Master includes its own samples. `diagnostics`

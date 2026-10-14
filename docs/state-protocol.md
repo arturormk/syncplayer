@@ -1,4 +1,4 @@
-# State protocol version 8
+# State protocol version 9
 
 Syncplayer separates three network responsibilities:
 
@@ -13,7 +13,7 @@ Every control frame and state datagram begins with this 12-byte network-byte-ord
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `SYNP` |
-| 4 | 2 | protocol version (`8`) |
+| 4 | 2 | protocol version (`9`) |
 | 6 | 1 | message kind |
 | 7 | 1 | reserved flags, currently zero |
 | 8 | 4 | payload length |
@@ -46,7 +46,9 @@ diagnostic: it never changes authoritative transport state and its loss never st
 
 Each UDP packet is a complete snapshot containing the Master session, packet sequence, sampled
 Master clock, generation, program identity/hash, transport state and operation, sequence and cue
-anchors, cue identity/occurrence/duration, playlist iteration, and optional debug-loop state.
+anchors, cue identity/occurrence/duration, playlist iteration, optional debug-loop state, and the
+installation OSD enabled state. This lets `osd on`, `osd off`, and `osd toggle` converge through
+the normal complete-snapshot path without introducing a second ad-hoc command channel.
 
 The default Master cadence is 10 Hz and the default distribution is unicast fan-out to ready
 registry participants. Within the current session and generation, a Slave accepts only a sequence

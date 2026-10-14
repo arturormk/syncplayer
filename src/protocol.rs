@@ -6,7 +6,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 16_384;
 pub const MAX_STATE_PACKET_BYTES: usize = 1_024;
 pub const MAX_SUBSCRIPTION_CUES: usize = 128;
@@ -184,6 +184,7 @@ pub struct StateSnapshot {
     pub cue_duration: MediaPositionNs,
     pub playlist_iteration: u64,
     pub debug_loop: Option<DebugLoopState>,
+    pub osd_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -469,6 +470,7 @@ pub fn encode_state_datagram(packet: &StateDatagram) -> Result<Vec<u8>, ParseErr
             out.push(u8::from(v.events_enabled));
         }
     }
+    out.push(u8::from(s.osd_enabled));
     if HEADER_BYTES + out.len() > MAX_STATE_PACKET_BYTES {
         return Err(ParseError::TooLong);
     }
@@ -533,6 +535,7 @@ pub fn decode_state_datagram(packet: &[u8]) -> Result<StateDatagram, ParseError>
         }
         _ => return Err(ParseError::InvalidValue("debug loop presence")),
     };
+    let osd_enabled = d.boolean("OSD enabled")?;
     d.finish()?;
     Ok(StateDatagram {
         session,
@@ -553,6 +556,7 @@ pub fn decode_state_datagram(packet: &[u8]) -> Result<StateDatagram, ParseError>
             cue_duration,
             playlist_iteration,
             debug_loop,
+            osd_enabled,
         },
     })
 }
@@ -756,6 +760,7 @@ mod tests {
             cue_duration: MediaPositionNs::new(10),
             playlist_iteration: 0,
             debug_loop: None,
+            osd_enabled: false,
         }
     }
     #[test]
@@ -824,11 +829,13 @@ mod tests {
     }
     #[test]
     fn state_round_trip() {
+        let mut state = snapshot();
+        state.osd_enabled = true;
         let value = StateDatagram {
             session: session(),
             sequence: 4,
             master_clock: ClockNs::new(9),
-            state: snapshot(),
+            state,
         };
         let bytes = encode_state_datagram(&value).unwrap();
         assert!(bytes.len() <= MAX_STATE_PACKET_BYTES);

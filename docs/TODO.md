@@ -59,7 +59,7 @@ Implement:
 - [x] Defined behavior for local duration differences and early/late EOS.
 - [x] Recovery when the Master pipeline reports CLOCK_LOST.
 
-The version 8 snapshot carries complete program/cue transport identity. `TransportController`
+The version 9 snapshot carries complete program/cue transport identity. `TransportController`
 projects cue boundaries and playlist wraps from the exported Master clock, while the local decode
 branches prepare the known next video and audio URIs. Cue duration mismatches are rejected by
 default (or explicitly warned), local Slave EOS is held and diagnosed, and Master clock loss
@@ -81,7 +81,7 @@ Implement:
 - [x] Configurable control/state ports and keepalive intervals.
 - [x] Continue free-running when only state/control traffic is lost.
 
-Protocol version 8 uses bounded binary framing for reliable TCP control and independent complete
+Protocol version 9 uses bounded binary framing for reliable TCP control and independent complete
 binary UDP state snapshots. The Master fans snapshots out to registered unicast endpoints at 10 Hz
 by default; Slaves reject wrong-session, stale-generation, duplicate, and reordered packets. Slaves
 originate configurable control keepalives, registry expiry is configurable, and loss of either
@@ -133,7 +133,7 @@ while normal cue and playlist traversal changes re-enable each cue's events.
 
 ### P1 — Installation transport controls and console
 
-Status: implemented, except for the explicitly optional OSD.
+Status: implemented.
 
 Build the transport operations on top of the new controller, then expose them through an opt-in TCP console:
 
@@ -141,7 +141,7 @@ Build the transport operations on top of the new controller, then expose them th
 - [x] Human-friendly time parsing.
 - [x] In-cue diagnostic loop SECONDS and unloop.
 - [x] Ready/preparing status and late-participant policy.
-- [ ] Optional OSD with player, role, program, cue, time, and connection state.
+- [x] Optional OSD with player, role, program, cue, time, and connection state.
 - [x] Safe bind defaults; console disabled unless explicitly enabled.
 - [x] Console text translated into structured operations rather than forwarded to Slaves.
 - [x] Structured Slave telemetry centralized by the Master with console statistics and optional

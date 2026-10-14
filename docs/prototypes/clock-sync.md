@@ -14,7 +14,7 @@ pipeline, receives the Master's projected media position at a future absolute cl
 acknowledges after its local pipeline has prepared that release. This lets a late Slave join without
 interrupting existing playback.
 
-The bounded binary protocol is currently version 8. Before clock calibration, a Slave
+The bounded binary protocol is currently version 9. Before clock calibration, a Slave
 subscribes with its player identity, program identity and hash, software version, capabilities,
 state endpoint, and probed cue durations. The Master rejects incompatible or duplicate active
 participants and returns its authoritative cue durations on success. A Master session UUID
@@ -32,7 +32,7 @@ have the same protocol version.
   clock, calibrates it, and uses the normal prepared pause/seek/future-release path.
 - Snapshots contain session context, program identity/hash, transport generation and state,
   operation, sequence-position and clock anchors, cue index/ID/occurrence/duration, item-local
-  position, playlist iteration, and optional debug-loop state. Each host maps that cue-local anchor
+  position, playlist iteration, optional debug-loop state, and diagnostic OSD state. Each host maps that cue-local anchor
   through its own rendition durations, avoiding false identity failures at playlist boundaries.
   Unchanged state does not seek; stale state is ignored; a newer generation requires a prepared
   rejoin.

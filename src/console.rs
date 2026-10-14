@@ -14,6 +14,14 @@ pub enum ConsoleCommand {
     Goto { cue: Option<String>, time: Duration },
     Loop { duration: Duration },
     Unloop,
+    Osd(OsdCommand),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OsdCommand {
+    On,
+    Off,
+    Toggle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +64,9 @@ pub fn parse_command(line: &str) -> Result<ConsoleCommand, ConsoleParseError> {
             duration: parse_time(duration)?,
         }),
         ["unloop"] => Ok(ConsoleCommand::Unloop),
+        ["osd", "on"] => Ok(ConsoleCommand::Osd(OsdCommand::On)),
+        ["osd", "off"] => Ok(ConsoleCommand::Osd(OsdCommand::Off)),
+        ["osd", "toggle"] => Ok(ConsoleCommand::Osd(OsdCommand::Toggle)),
         [] => Err(ConsoleParseError("empty command".to_owned())),
         _ => Err(ConsoleParseError(format!(
             "unknown command or invalid arguments: {line}"
@@ -115,7 +126,7 @@ fn invalid_time(value: &str) -> ConsoleParseError {
     ConsoleParseError(format!("invalid time '{value}'"))
 }
 
-pub const HELP: &str = "commands: help, status, diagnostics, pause, play [DELAY], stop, goto [CUE] TIME, loop SECONDS, unloop";
+pub const HELP: &str = "commands: help, status, diagnostics, pause, play [DELAY], stop, goto [CUE] TIME, loop SECONDS, unloop, osd on|off|toggle";
 
 #[cfg(test)]
 mod tests {
@@ -138,6 +149,22 @@ mod tests {
                 cue: Some("main".to_owned()),
                 time: Duration::from_secs(62)
             }
+        );
+    }
+
+    #[test]
+    fn parses_osd_commands() {
+        assert_eq!(
+            parse_command("osd on").unwrap(),
+            ConsoleCommand::Osd(OsdCommand::On)
+        );
+        assert_eq!(
+            parse_command("osd off").unwrap(),
+            ConsoleCommand::Osd(OsdCommand::Off)
+        );
+        assert_eq!(
+            parse_command("osd toggle").unwrap(),
+            ConsoleCommand::Osd(OsdCommand::Toggle)
         );
     }
 }

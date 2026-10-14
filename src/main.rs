@@ -4,6 +4,7 @@ use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_net as gst_net;
 use gstreamer_pbutils as gst_pbutils;
+use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, parse_command};
+use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, OsdCommand, parse_command};
 use syncplayer::diagnostics::DiagnosticsHub;
 use syncplayer::events::{EventCue, EventObservation, EventRuntime};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
@@ -788,6 +789,18 @@ fn execute_console_command(server: &SlaveServer, command: ConsoleCommand) -> Res
             }
             Ok("diagnostic loop disabled".to_owned())
         }
+        ConsoleCommand::Osd(command) => {
+            let enabled = match command {
+                OsdCommand::On => true,
+                OsdCommand::Off => false,
+                OsdCommand::Toggle => !server.player.osd_enabled(),
+            };
+            server.player.set_osd_enabled(enabled)?;
+            Ok(format!(
+                "OSD {} on all players",
+                if enabled { "enabled" } else { "disabled" }
+            ))
+        }
     }
 }
 
@@ -841,13 +854,18 @@ fn console_status(server: &SlaveServer) -> Result<String> {
         .registry
         .snapshot(Instant::now(), server.keepalive_timeout)?;
     let mut lines = vec![format!(
-        "master session={} generation={} state={:?} cue={} time={:.3}s loop={}",
+        "master session={} generation={} state={:?} cue={} time={:.3}s loop={} osd={}",
         runtime.session,
         runtime.generation,
         runtime.transport_state,
         runtime.cue_id,
         runtime.anchor_cue_position.get() as f64 / 1_000_000_000.0,
-        runtime.debug_loop.is_some()
+        runtime.debug_loop.is_some(),
+        if server.player.osd_enabled() {
+            "on"
+        } else {
+            "off"
+        }
     )];
     if participants.is_empty() {
         lines.push("slaves: none".to_owned());
@@ -2020,6 +2038,22 @@ enum PlayerRole {
     Slave,
 }
 
+impl fmt::Display for PlayerRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Master => "MASTER",
+            Self::Slave => "SLAVE",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OsdMetadata {
+    cue_index: usize,
+    cue_id: String,
+    transport_state: TransportState,
+}
+
 impl PlayerRole {
     const fn from_external_clock(externally_driven: bool) -> Self {
         if externally_driven {
@@ -2240,6 +2274,9 @@ struct Player {
     cursor: Arc<Mutex<PlaylistCursor>>,
     audio_cursor: Arc<Mutex<PlaylistCursor>>,
     role: PlayerRole,
+    osd_overlay: gst::Element,
+    osd_enabled: AtomicBool,
+    osd_metadata: Mutex<Option<OsdMetadata>>,
     clock_healthy: AtomicBool,
     clock: Mutex<gst::Clock>,
     plan: Mutex<Option<ReleasePlan>>,
@@ -2431,6 +2468,8 @@ impl Player {
                 .context("capsfilter is unavailable")?;
             video_chain.push(caps_filter);
         }
+        let osd_overlay = make_osd_overlay()?;
+        video_chain.push(osd_overlay.clone());
         let video_sink = select_video_sink(args)?;
         force_clock_sync(&video_sink, "video sink")?;
         configure_video_sink(&video_sink, args)?;
@@ -2592,6 +2631,9 @@ impl Player {
             cursor,
             audio_cursor,
             role: PlayerRole::from_external_clock(forced_clock.is_some()),
+            osd_overlay,
+            osd_enabled: AtomicBool::new(false),
+            osd_metadata: Mutex::new(None),
             clock_healthy: AtomicBool::new(true),
             clock: Mutex::new(clock),
             plan: Mutex::new(None),
@@ -2625,7 +2667,7 @@ impl Player {
             .property("force-aspect-ratio", args.fit == FitMode::Contain)
             .build()
             .context("playbin3 is unavailable")?;
-        let video_sink = build_playbin_video_sink(args)?;
+        let (video_sink, osd_overlay) = build_playbin_video_sink(args)?;
         let video_rate_control = video_sink.clone();
         element.set_property("video-sink", &video_sink);
         let audio_sink = if let Some(name) = &args.audio_sink {
@@ -2735,6 +2777,9 @@ impl Player {
             cursor,
             audio_cursor,
             role: PlayerRole::from_external_clock(forced_clock.is_some()),
+            osd_overlay,
+            osd_enabled: AtomicBool::new(false),
+            osd_metadata: Mutex::new(None),
             clock_healthy: AtomicBool::new(true),
             clock: Mutex::new(clock),
             plan: Mutex::new(None),
@@ -3074,6 +3119,11 @@ impl Player {
             index: runtime.cue_index,
             local_ns: runtime.anchor_cue_position.get(),
         };
+        self.update_osd_metadata(OsdMetadata {
+            cue_index: runtime.cue_index,
+            cue_id: runtime.cue_id.clone(),
+            transport_state: runtime.transport_state,
+        })?;
         let media_position = self
             .sequence
             .position_for_snapshot(item, runtime.playlist_iteration)?;
@@ -3108,6 +3158,7 @@ impl Player {
             cue_duration: runtime.cue_duration,
             playlist_iteration: runtime.playlist_iteration,
             debug_loop,
+            osd_enabled: self.osd_enabled(),
         })
     }
 
@@ -3167,6 +3218,12 @@ impl Player {
             },
             snapshot.playlist_iteration,
         )?;
+        self.set_osd_enabled(snapshot.osd_enabled)?;
+        self.update_osd_metadata(OsdMetadata {
+            cue_index: item_index,
+            cue_id: snapshot.cue_id.clone(),
+            transport_state: snapshot.transport_state,
+        })?;
         self.update_event_projection(EventProjection {
             session: authority.session,
             generation: snapshot.generation,
@@ -3863,8 +3920,68 @@ impl Player {
         result
     }
 
+    fn osd_enabled(&self) -> bool {
+        self.osd_enabled.load(Ordering::Acquire)
+    }
+
+    fn set_osd_enabled(&self, enabled: bool) -> Result<()> {
+        let changed = self.osd_enabled.swap(enabled, Ordering::AcqRel) != enabled;
+        if changed {
+            self.osd_overlay.set_property("silent", !enabled);
+        }
+        if enabled {
+            self.refresh_osd_text()?;
+        }
+        Ok(())
+    }
+
+    fn update_osd_metadata(&self, metadata: OsdMetadata) -> Result<()> {
+        *self
+            .osd_metadata
+            .lock()
+            .map_err(|_| anyhow!("OSD metadata lock poisoned"))? = Some(metadata);
+        if self.osd_enabled() {
+            self.refresh_osd_text()?;
+        }
+        Ok(())
+    }
+
+    fn refresh_osd_text(&self) -> Result<()> {
+        let metadata = self
+            .osd_metadata
+            .lock()
+            .map_err(|_| anyhow!("OSD metadata lock poisoned"))?
+            .clone();
+        let Some(metadata) = metadata else {
+            return Ok(());
+        };
+        let link = match self.role {
+            PlayerRole::Master => "AUTHORITY",
+            PlayerRole::Slave if self.clock_healthy.load(Ordering::Acquire) => "CONNECTED",
+            PlayerRole::Slave => "FREE-RUNNING",
+        };
+        let text = format!(
+            "PLAYER {}   ROLE {}\nPROGRAM {}   CUE {:02}/{} {}\nSTATE {:?}   LINK {}\nTIME ",
+            self.sequence.player_id,
+            self.role,
+            self.sequence.program_id,
+            metadata.cue_index + 1,
+            self.sequence.cue_ids.len(),
+            metadata.cue_id,
+            metadata.transport_state,
+            link
+        );
+        self.osd_overlay.set_property("text", text);
+        Ok(())
+    }
+
     fn set_clock_health(&self, healthy: bool) {
         self.clock_healthy.store(healthy, Ordering::Release);
+        if self.osd_enabled()
+            && let Err(error) = self.refresh_osd_text()
+        {
+            warn!(%error, "failed to refresh OSD connection state");
+        }
     }
 
     fn clock(&self) -> Result<gst::Clock> {
@@ -4012,7 +4129,25 @@ fn select_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
     make_element("autovideosink", "automatic video sink")
 }
 
-fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
+fn make_osd_overlay() -> Result<gst::Element> {
+    gst::ElementFactory::make("timeoverlay")
+        .name("diagnostic-osd")
+        .property("silent", true)
+        .property("auto-resize", false)
+        .property("font-desc", "Sans Bold 32")
+        .property("shaded-background", true)
+        .property("shading-value", 120_u32)
+        .property("draw-outline", true)
+        .property("draw-shadow", true)
+        .property_from_str("halignment", "center")
+        .property_from_str("valignment", "center")
+        .property_from_str("line-alignment", "center")
+        .property_from_str("time-mode", "stream-time")
+        .build()
+        .context("diagnostic OSD requires the GStreamer timeoverlay element")
+}
+
+fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<(gst::Element, gst::Element)> {
     let video_convert =
         make_named_element("videoconvert", "embedded-video-convert", "video converter")?;
     let video_scale = gst::ElementFactory::make("videoscale")
@@ -4046,6 +4181,8 @@ fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
             .context("capsfilter is unavailable")?;
         video_chain.push(caps_filter);
     }
+    let osd_overlay = make_osd_overlay()?;
+    video_chain.push(osd_overlay.clone());
     let video_sink = select_video_sink(args)?;
     force_clock_sync(&video_sink, "video sink")?;
     configure_video_sink(&video_sink, args)?;
@@ -4061,7 +4198,7 @@ fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<gst::Element> {
         .name("sink")
         .build();
     bin.add_pad(&ghost_pad)?;
-    Ok(bin.upcast())
+    Ok((bin.upcast(), osd_overlay))
 }
 
 fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> {
@@ -4341,6 +4478,7 @@ mod tests {
             cue_duration: MediaPositionNs::new(1_000),
             playlist_iteration: 0,
             debug_loop: None,
+            osd_enabled: false,
         }
     }
 
