@@ -309,13 +309,14 @@ derived from its logical plan and playback clock rather than its renderer's quer
 local Master rendering stall does not pull healthy Slaves backward.
 
 Each player samples expected versus actual sequence position once per second. Samples are ignored
-while paused, preparing, seeking, waiting for release, crossing an ambiguous cue handoff, or
+while paused, preparing, seeking, waiting for release, preparing or crossing a cue handoff, or
 using an unhealthy clock. Syncplayer warns after error exceeds 100 ms for three valid samples and
 performs one local prepared repair after error exceeds 250 ms for three valid samples. A Slave
 started with `--drift-slew` instead corrects sustained 100-250 ms error gradually, varying playback
-speed by at most 2% and returning to normal speed inside 40 ms. Repairs retain a ten-second
-cooldown. These conservative prototype thresholds are intended to recover obvious stalls; the
-physical-host experiment must determine whether they should change.
+speed by at most 2%. Outside cue handoffs it returns to normal speed inside 40 ms; during a handoff
+the reset is deferred until the new item is stable. Repairs retain a ten-second cooldown. These
+conservative prototype thresholds are intended to recover obvious stalls; the physical-host
+experiment must determine whether they should change.
 
 See [`docs/prototypes/clock-sync.md`](docs/prototypes/clock-sync.md) for the measurement procedure,
 acceptance criteria, and known boundaries.

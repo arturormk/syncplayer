@@ -2176,6 +2176,7 @@ enum DriftSlewAction {
 struct DriftSlewController {
     enabled: bool,
     active: bool,
+    reset_pending: bool,
     direction: i8,
     qualifying_samples: u32,
     applied_rate: f64,
@@ -2186,6 +2187,7 @@ impl DriftSlewController {
         Self {
             enabled,
             active: false,
+            reset_pending: false,
             direction: 0,
             qualifying_samples: 0,
             applied_rate: 1.0,
@@ -2195,6 +2197,10 @@ impl DriftSlewController {
     fn observe(&mut self, error_ns: i128) -> DriftSlewAction {
         if !self.enabled {
             return DriftSlewAction::None;
+        }
+        if self.reset_pending {
+            self.reset_pending = false;
+            return DriftSlewAction::Reset;
         }
 
         let magnitude = error_ns.unsigned_abs();
@@ -2238,7 +2244,8 @@ impl DriftSlewController {
 
     fn suppress(&mut self) -> bool {
         let was_active = self.active;
-        self.clear();
+        self.reset_pending |= was_active;
+        self.clear_tracking();
         was_active
     }
 
@@ -2248,6 +2255,11 @@ impl DriftSlewController {
     }
 
     fn clear(&mut self) {
+        self.reset_pending = false;
+        self.clear_tracking();
+    }
+
+    fn clear_tracking(&mut self) {
         self.active = false;
         self.direction = 0;
         self.qualifying_samples = 0;
@@ -2296,6 +2308,8 @@ struct Player {
     drift_policy: Mutex<DriftPolicy>,
     drift_slew: Mutex<DriftSlewController>,
     rate_control_targets: Vec<gst::Element>,
+    handoff_in_progress: Arc<AtomicBool>,
+    separate_audio_handoff: bool,
     boundary_mismatch: Mutex<Option<(usize, usize, u64)>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
@@ -2543,10 +2557,12 @@ impl Player {
             sequence.looping,
             0,
         )));
+        let handoff_in_progress = Arc::new(AtomicBool::new(false));
         let weak_video_source = video_source.downgrade();
         let weak_audio_source = audio_source.downgrade();
         let weak_volume = audio_volume.downgrade();
         let callback_cursor = cursor.clone();
+        let video_handoff_in_progress = handoff_in_progress.clone();
         let video_uris: Vec<String> = sequence.items.iter().map(|item| item.uri.clone()).collect();
         video_source.connect("about-to-finish", false, move |_| {
             let next = callback_cursor
@@ -2554,12 +2570,14 @@ impl Player {
                 .ok()
                 .and_then(|mut cursor| cursor.queue_next());
             if let (Some(index), Some(source)) = (next, weak_video_source.upgrade()) {
+                video_handoff_in_progress.store(true, Ordering::Release);
                 debug!(next_item_index = index, next_uri = %video_uris[index], "queueing prepared video item");
                 source.set_property("uri", &video_uris[index]);
             }
             None
         });
         let callback_audio_cursor = audio_cursor.clone();
+        let audio_handoff_in_progress = handoff_in_progress.clone();
         let audio_items: Vec<(String, bool, f64)> = sequence
             .items
             .iter()
@@ -2577,6 +2595,7 @@ impl Player {
                 .ok()
                 .and_then(|mut cursor| cursor.queue_next());
             if let Some(index) = next {
+                audio_handoff_in_progress.store(true, Ordering::Release);
                 if let Some(source) = weak_audio_source.upgrade() {
                     source.set_property("uri", &audio_items[index].0);
                 }
@@ -2664,6 +2683,8 @@ impl Player {
             drift_policy: Mutex::new(DriftPolicy::default()),
             drift_slew: Mutex::new(DriftSlewController::new(drift_slew)),
             rate_control_targets: vec![video_rate_control, audio_rate_control],
+            handoff_in_progress,
+            separate_audio_handoff: true,
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
@@ -2707,7 +2728,9 @@ impl Player {
             sequence.looping,
             0,
         )));
+        let handoff_in_progress = Arc::new(AtomicBool::new(false));
         let callback_cursor = cursor.clone();
+        let callback_handoff_in_progress = handoff_in_progress.clone();
         let weak_element = element.downgrade();
         let items: Vec<(String, bool, f64)> = sequence
             .items
@@ -2726,6 +2749,7 @@ impl Player {
                 .ok()
                 .and_then(|mut cursor| cursor.queue_next());
             if let (Some(index), Some(element)) = (next, weak_element.upgrade()) {
+                callback_handoff_in_progress.store(true, Ordering::Release);
                 element.set_property("mute", items[index].1);
                 element.set_property("volume", items[index].2);
                 element.set_property("uri", &items[index].0);
@@ -2816,6 +2840,8 @@ impl Player {
             // A seek sent through one playbin sink reaches the shared
             // demuxer, which emits the rate change to all of its streams.
             rate_control_targets: vec![video_rate_control],
+            handoff_in_progress,
+            separate_audio_handoff: false,
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
@@ -3621,6 +3647,7 @@ impl Player {
             "position telemetry"
         );
         self.diagnose_boundary_mismatch(&sample)?;
+        self.finish_safe_handoff(&sample)?;
 
         if sample.transition_in_progress || !self.clock_healthy.load(Ordering::Acquire) {
             self.drift_policy
@@ -3668,7 +3695,69 @@ impl Player {
         Ok(())
     }
 
+    fn finish_safe_handoff(&self, sample: &PositionSample) -> Result<()> {
+        if !self.handoff_in_progress.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let video_item = self
+            .cursor
+            .lock()
+            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+            .current();
+        let audio_settled = !self.separate_audio_handoff
+            || self
+                .audio_cursor
+                .lock()
+                .map_err(|_| anyhow!("audio playlist cursor lock poisoned"))?
+                .current()
+                == sample.expected_item.index;
+        let settled = !self.recovery_in_progress.load(Ordering::Acquire)
+            && self
+                .scheduled_release
+                .lock()
+                .map_err(|_| anyhow!("scheduled release lock poisoned"))?
+                .is_none()
+            && sample.pipeline_state == gst::State::Playing
+            && self.pipeline.pending_state() == gst::State::VoidPending
+            && sample.actual_item.index == sample.expected_item.index
+            && video_item == sample.expected_item.index
+            && audio_settled;
+        if settled {
+            self.handoff_in_progress.store(false, Ordering::Release);
+            debug!(
+                item_index = sample.expected_item.index,
+                "playlist handoff settled; drift slew may resume after this sample"
+            );
+        }
+        Ok(())
+    }
+
     fn process_drift_slew(&self, sample: &PositionSample) -> Result<()> {
+        let current_item = self
+            .cursor
+            .lock()
+            .map_err(|_| anyhow!("playlist cursor lock poisoned"))?
+            .current();
+        let audio_current = !self.separate_audio_handoff
+            || self
+                .audio_cursor
+                .lock()
+                .map_err(|_| anyhow!("audio playlist cursor lock poisoned"))?
+                .current()
+                == sample.expected_item.index;
+        if self.handoff_in_progress.load(Ordering::Acquire)
+            || current_item != sample.expected_item.index
+            || !audio_current
+            || self.pipeline.current_state() != gst::State::Playing
+            || self.pipeline.pending_state() != gst::State::VoidPending
+        {
+            self.drift_slew
+                .lock()
+                .map_err(|_| anyhow!("drift slew lock poisoned"))?
+                .suppress();
+            debug!("drift slew rate update deferred across playlist handoff");
+            return Ok(());
+        }
         let action = self
             .drift_slew
             .lock()
@@ -3712,13 +3801,10 @@ impl Player {
             .lock()
             .map_err(|_| anyhow!("drift slew lock poisoned"))?
             .suppress();
-        if !was_active || self.pipeline.current_state() != gst::State::Playing {
-            return Ok(());
-        }
-        if let Err(error) = self.set_instant_playback_rate(1.0) {
-            warn!(%error, "failed to restore normal playback rate while suppressing drift slew");
-        } else {
-            info!("Slave drift slew restored normal playback rate");
+        if was_active {
+            debug!(
+                "drift slew restoration deferred until the pipeline is safely outside a transition"
+            );
         }
         Ok(())
     }
@@ -3834,6 +3920,7 @@ impl Player {
         };
         let pipeline_state = self.pipeline.current_state();
         let transition_in_progress = self.recovery_in_progress.load(Ordering::Acquire)
+            || self.handoff_in_progress.load(Ordering::Acquire)
             || self
                 .scheduled_release
                 .lock()
@@ -5030,6 +5117,17 @@ mod tests {
         assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
         assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
         assert_eq!(slew.observe(300_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+    }
+
+    #[test]
+    fn drift_slew_defers_transition_reset_until_observation_resumes() {
+        let mut slew = DriftSlewController::new(true);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::Apply(1.015));
+        assert!(slew.suppress());
+        assert_eq!(slew.observe(-150_000_000), DriftSlewAction::Reset);
         assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
     }
 
