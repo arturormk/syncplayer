@@ -1,4 +1,5 @@
 /target/
+/__stuff/
 *.log
 .DS_Store
 *.swp

@@ -109,6 +109,12 @@ These options are accepted by both `master` and `slave`:
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
 
+While the transport and pipeline are both playing, an independent watchdog requires video buffers
+to keep crossing the final output path. It force-exits with status 70 if no frame passes for ten
+seconds, allowing the service supervisor to restart a wedged process without waiting for GStreamer
+teardown. The watchdog is disarmed while stopped, paused, preparing, seeking, or waiting for
+release.
+
 ### GPU-composited OSD on Raspberry Pi
 
 Pass `--kms-gl` to opt into direct DRM/KMS output through EGL/GBM. In this mode `timeoverlay`

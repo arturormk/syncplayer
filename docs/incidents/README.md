@@ -35,3 +35,4 @@ Routine defects with an obvious cause and no reusable lesson do not need an inci
 - [`INC-0003 — Independent decode branches break preroll and cue handoff`](INC-0003-independent-decode-branches-break-preroll-and-handoff.md)
 - [`INC-0004 — Shorter rendition disconnects at authoritative cue end`](INC-0004-shorter-rendition-disconnects-at-authoritative-cue-end.md)
 - [`INC-0005 — Drift-slew rate reset races playlist handoff`](INC-0005-drift-slew-rate-reset-races-playlist-handoff.md)
+- [`INC-0006 — Master video freezes mid-cue without pipeline error`](INC-0006-master-video-freezes-mid-cue-without-pipeline-error.md)

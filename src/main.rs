@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, OsdCommand, parse_command};
@@ -49,6 +49,9 @@ const DRIFT_SLEW_CORRECTION_WINDOW_SECS: f64 = 10.0;
 const DRIFT_SLEW_MAX_ADJUSTMENT: f64 = 0.02;
 const DRIFT_SLEW_RATE_UPDATE_THRESHOLD: f64 = 0.001;
 const LOCAL_RECOVERY_LEAD: Duration = Duration::from_secs(5);
+const PLAYBACK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const PLAYBACK_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PLAYBACK_WATCHDOG_EXIT_CODE: i32 = 70;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Syncplayer two-host shared-clock experiment")]
@@ -2055,6 +2058,164 @@ impl fmt::Display for PlayerRole {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PlaybackWatchdogEvent {
+    ExpectProgress,
+    Frames(u64),
+    Disarm,
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct PlaybackWatchdogController {
+    armed: bool,
+    last_frame_count: Option<u64>,
+    last_progress: Instant,
+}
+
+impl PlaybackWatchdogController {
+    const fn new(now: Instant) -> Self {
+        Self {
+            armed: false,
+            last_frame_count: None,
+            last_progress: now,
+        }
+    }
+
+    fn apply(&mut self, event: PlaybackWatchdogEvent, now: Instant) {
+        match event {
+            PlaybackWatchdogEvent::ExpectProgress => {
+                if !self.armed {
+                    self.armed = true;
+                    self.last_frame_count = None;
+                    self.last_progress = now;
+                }
+            }
+            PlaybackWatchdogEvent::Frames(frame_count) => {
+                if !self.armed || self.last_frame_count != Some(frame_count) {
+                    self.last_progress = now;
+                }
+                self.armed = true;
+                self.last_frame_count = Some(frame_count);
+            }
+            PlaybackWatchdogEvent::Disarm | PlaybackWatchdogEvent::Shutdown => {
+                self.armed = false;
+                self.last_frame_count = None;
+                self.last_progress = now;
+            }
+        }
+    }
+
+    fn stalled_for(&self, now: Instant, timeout: Duration) -> Option<Duration> {
+        let elapsed = now.saturating_duration_since(self.last_progress);
+        (self.armed && elapsed >= timeout).then_some(elapsed)
+    }
+}
+
+#[derive(Debug)]
+struct PlaybackWatchdog {
+    sender: mpsc::Sender<PlaybackWatchdogEvent>,
+    last_queried_position_ns: Arc<AtomicU64>,
+}
+
+impl PlaybackWatchdog {
+    fn new(role: PlayerRole, video_overlay: &gst::Element) -> Result<Self> {
+        let frame_count = Arc::new(AtomicU64::new(0));
+        let probe_frame_count = frame_count.clone();
+        let last_frame_pts_ns = Arc::new(AtomicU64::new(u64::MAX));
+        let probe_frame_pts = last_frame_pts_ns.clone();
+        video_overlay
+            .static_pad("src")
+            .ok_or_else(|| anyhow!("video overlay has no source pad for the playback watchdog"))?
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                probe_frame_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(pts) = info.buffer().and_then(|buffer| buffer.pts()) {
+                    probe_frame_pts.store(pts.nseconds(), Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or_else(|| anyhow!("failed to install the playback watchdog video probe"))?;
+        let last_queried_position_ns = Arc::new(AtomicU64::new(0));
+        let thread_position = last_queried_position_ns.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("syncplayer-watchdog".to_owned())
+            .spawn(move || {
+                run_playback_watchdog(
+                    &receiver,
+                    role,
+                    &frame_count,
+                    &last_frame_pts_ns,
+                    &thread_position,
+                );
+            })
+            .context("failed to spawn playback watchdog")?;
+        Ok(Self {
+            sender,
+            last_queried_position_ns,
+        })
+    }
+
+    fn expect_progress(&self) {
+        let _ = self.sender.send(PlaybackWatchdogEvent::ExpectProgress);
+    }
+
+    fn record_position(&self, position_ns: u64) {
+        self.last_queried_position_ns
+            .store(position_ns, Ordering::Relaxed);
+    }
+
+    fn disarm(&self) {
+        let _ = self.sender.send(PlaybackWatchdogEvent::Disarm);
+    }
+}
+
+impl Drop for PlaybackWatchdog {
+    fn drop(&mut self) {
+        let _ = self.sender.send(PlaybackWatchdogEvent::Shutdown);
+    }
+}
+
+fn run_playback_watchdog(
+    receiver: &mpsc::Receiver<PlaybackWatchdogEvent>,
+    role: PlayerRole,
+    frame_count: &AtomicU64,
+    last_frame_pts_ns: &AtomicU64,
+    last_queried_position_ns: &AtomicU64,
+) {
+    let mut controller = PlaybackWatchdogController::new(Instant::now());
+    loop {
+        match receiver.recv_timeout(PLAYBACK_WATCHDOG_POLL_INTERVAL) {
+            Ok(PlaybackWatchdogEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return;
+            }
+            Ok(event) => controller.apply(event, Instant::now()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let now = Instant::now();
+        if controller.armed {
+            controller.apply(
+                PlaybackWatchdogEvent::Frames(frame_count.load(Ordering::Relaxed)),
+                now,
+            );
+        }
+        if let Some(stalled_for) = controller.stalled_for(now, PLAYBACK_STALL_TIMEOUT) {
+            let frame_pts_ns = last_frame_pts_ns.load(Ordering::Relaxed);
+            error!(
+                player_role = %role,
+                timeout_s = PLAYBACK_STALL_TIMEOUT.as_secs(),
+                stalled_for_ms = stalled_for.as_millis(),
+                last_frame_count = controller.last_frame_count,
+                last_frame_pts_ns = (frame_pts_ns != u64::MAX).then_some(frame_pts_ns),
+                last_queried_position_ns = last_queried_position_ns.load(Ordering::Relaxed),
+                exit_code = PLAYBACK_WATCHDOG_EXIT_CODE,
+                "playback watchdog detected no video frames while playing; forcing process exit"
+            );
+            std::process::exit(PLAYBACK_WATCHDOG_EXIT_CODE);
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct OsdMetadata {
     cue_index: usize,
@@ -2294,6 +2455,7 @@ struct Player {
     cursor: Arc<Mutex<PlaylistCursor>>,
     audio_cursor: Arc<Mutex<PlaylistCursor>>,
     role: PlayerRole,
+    playback_watchdog: PlaybackWatchdog,
     osd_overlay: gst::Element,
     osd_enabled: AtomicBool,
     osd_metadata: Mutex<Option<OsdMetadata>>,
@@ -2655,6 +2817,8 @@ impl Player {
             "media sequence prerolled"
         );
         let events = make_event_runtime(&sequence)?;
+        let role = PlayerRole::from_external_clock(forced_clock.is_some());
+        let playback_watchdog = PlaybackWatchdog::new(role, &osd_overlay)?;
         Ok(Self {
             pipeline,
             video_source,
@@ -2668,7 +2832,8 @@ impl Player {
             events_suppressed_until: Mutex::new(None),
             cursor,
             audio_cursor,
-            role: PlayerRole::from_external_clock(forced_clock.is_some()),
+            role,
+            playback_watchdog,
             osd_overlay,
             osd_enabled: AtomicBool::new(false),
             osd_metadata: Mutex::new(None),
@@ -2810,6 +2975,8 @@ impl Player {
             "embedded-media sequence prerolled"
         );
         let events = make_event_runtime(&sequence)?;
+        let role = PlayerRole::from_external_clock(forced_clock.is_some());
+        let playback_watchdog = PlaybackWatchdog::new(role, &osd_overlay)?;
         Ok(Self {
             pipeline,
             video_source: element.clone(),
@@ -2823,7 +2990,8 @@ impl Player {
             events_suppressed_until: Mutex::new(None),
             cursor,
             audio_cursor,
-            role: PlayerRole::from_external_clock(forced_clock.is_some()),
+            role,
+            playback_watchdog,
             osd_overlay,
             osd_enabled: AtomicBool::new(false),
             osd_metadata: Mutex::new(None),
@@ -2871,6 +3039,7 @@ impl Player {
         plan: ReleasePlan,
         reason: &'static str,
     ) -> Result<()> {
+        self.playback_watchdog.disarm();
         let _recovery = self
             .recovery_lock
             .lock()
@@ -3067,6 +3236,7 @@ impl Player {
     }
 
     fn schedule_pause(&self, plan: ReleasePlan) -> Result<()> {
+        self.playback_watchdog.disarm();
         self.cancel_scheduled_release()?;
         *self
             .plan
@@ -3585,6 +3755,7 @@ impl Player {
         &self,
         master_transport: Option<&Arc<Mutex<TransportController>>>,
     ) -> Result<()> {
+        self.playback_watchdog.disarm();
         let _recovery = self
             .recovery_lock
             .lock()
@@ -3877,6 +4048,14 @@ impl Player {
             .transport_state
             .lock()
             .map_err(|_| anyhow!("transport state lock poisoned"))?;
+        let watchdog_expected = self.watchdog_expects_progress(transport_state)?;
+        if watchdog_expected {
+            // Arm before querying so the independent watchdog remains able
+            // to detect stopped video buffers if this thread blocks here.
+            self.playback_watchdog.expect_progress();
+        } else {
+            self.playback_watchdog.disarm();
+        }
         let elapsed_ns = if transport_state == TransportState::Playing {
             clock_now.saturating_sub(plan.release_at.get())
         } else {
@@ -3893,6 +4072,15 @@ impl Player {
         let Some(actual_local) = self.pipeline.query_position::<gst::ClockTime>() else {
             return Ok(None);
         };
+        if watchdog_expected && self.watchdog_expects_progress(transport_state)? {
+            // Retain the raw item-local query for the watchdog's final log.
+            // Actual liveness comes from video buffers crossing the output
+            // overlay, so a clock-derived position cannot hide a frozen image.
+            self.playback_watchdog
+                .record_position(actual_local.nseconds());
+        } else {
+            self.playback_watchdog.disarm();
+        }
         // `uridecodebin3` mutates its `current-uri` storage on a streaming
         // thread during gapless handoff. Reading that GObject string from the
         // monitor thread can race with the mutation (and has produced invalid
@@ -3944,6 +4132,18 @@ impl Player {
             pipeline_state,
             transition_in_progress,
         }))
+    }
+
+    fn watchdog_expects_progress(&self, transport_state: TransportState) -> Result<bool> {
+        Ok(transport_state == TransportState::Playing
+            && !self.recovery_in_progress.load(Ordering::Acquire)
+            && self
+                .scheduled_release
+                .lock()
+                .map_err(|_| anyhow!("scheduled release lock poisoned"))?
+                .is_none()
+            && self.pipeline.current_state() == gst::State::Playing
+            && self.pipeline.pending_state() == gst::State::VoidPending)
     }
 
     fn diagnostic_telemetry(&self) -> Result<Option<DiagnosticTelemetry>> {
@@ -4660,11 +4860,11 @@ mod tests {
         Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction,
         DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy, FitMode,
         HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation, PlaybackSequence,
-        ProgramCompatibility, StateSnapshot, Timeline, TransportState, build_playbin_video_sink,
-        can_join_startup, combined_gain, finite_f64, gain_db_to_linear, make_kms_gl_sink,
-        non_negative_seconds, recovery_attempt_is_active, select_video_sink,
-        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
-        validate_subscription,
+        PlaybackWatchdogController, PlaybackWatchdogEvent, ProgramCompatibility, StateSnapshot,
+        Timeline, TransportState, build_playbin_video_sink, can_join_startup, combined_gain,
+        finite_f64, gain_db_to_linear, make_kms_gl_sink, non_negative_seconds,
+        recovery_attempt_is_active, select_video_sink, validate_playback_args,
+        validate_snapshot_generation, validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -5129,6 +5329,51 @@ mod tests {
         assert!(slew.suppress());
         assert_eq!(slew.observe(-150_000_000), DriftSlewAction::Reset);
         assert_eq!(slew.observe(-150_000_000), DriftSlewAction::None);
+    }
+
+    #[test]
+    fn playback_watchdog_requires_new_frames_and_disarms() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut watchdog = PlaybackWatchdogController::new(start);
+        assert!(
+            watchdog
+                .stalled_for(start + Duration::from_secs(20), timeout)
+                .is_none()
+        );
+
+        watchdog.apply(PlaybackWatchdogEvent::ExpectProgress, start);
+        watchdog.apply(
+            PlaybackWatchdogEvent::Frames(7),
+            start + Duration::from_secs(1),
+        );
+        watchdog.apply(
+            PlaybackWatchdogEvent::Frames(7),
+            start + Duration::from_secs(9),
+        );
+        assert_eq!(
+            watchdog.stalled_for(start + Duration::from_secs(11), timeout),
+            Some(timeout)
+        );
+
+        watchdog.apply(
+            PlaybackWatchdogEvent::Frames(8),
+            start + Duration::from_secs(11),
+        );
+        assert!(
+            watchdog
+                .stalled_for(start + Duration::from_secs(20), timeout)
+                .is_none()
+        );
+        watchdog.apply(
+            PlaybackWatchdogEvent::Disarm,
+            start + Duration::from_secs(20),
+        );
+        assert!(
+            watchdog
+                .stalled_for(start + Duration::from_secs(40), timeout)
+                .is_none()
+        );
     }
 
     #[test]
