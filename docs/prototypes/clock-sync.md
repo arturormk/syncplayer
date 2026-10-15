@@ -40,8 +40,10 @@ have the same protocol version.
   position. A Master renderer stall is therefore repaired locally instead of being published as a
   timeline for Slaves to chase.
 - Every player samples drift once per second. Three valid samples above 100 ms produce a warning;
-  three valid samples above 250 ms perform one prepared local repair. A repair starts a ten-second
-  cooldown.
+  the Master also slews automatically in the 100-250 ms range, while Slave slewing remains opt-in.
+  Three valid samples above 250 ms perform a local repair and start a ten-second cooldown. The
+  Master seeks in place so it cannot destroy the audio clock that schedules its own recovery; a
+  Slave retains the prepared reset and future shared-clock release.
 - Slaves report periodic observations over their existing reliable control sessions. The Master
   aggregates current/minimum/maximum/RMS error, health and recovery counters, and error slope in
   parts per million; it can append the complete sample stream to CSV for later physical analysis.
@@ -51,6 +53,8 @@ have the same protocol version.
 - Reconnect and local-drift recovery share one serialized coordinator. Starting a newer recovery
   cancels its predecessor's scheduled release, and attempt IDs prevent late workers from starting
   playback.
+- Scheduled releases have a separate monotonic deadline and fail fatally if the shared clock cannot
+  reach the requested timestamp, allowing the service supervisor to recover the process.
 - A Slave's local EOS is held and treated as diagnostic rather than logical cue authority. Master
   cue boundaries and playlist wraps are projected from the exported clock, and `CLOCK_LOST` on the
   Master pauses, re-pins that clock, resumes, and re-anchors the logical transport.

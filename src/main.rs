@@ -2283,6 +2283,23 @@ enum PlayerRole {
     Slave,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalDriftRecovery {
+    InPlaceSeek,
+    PreparedReset,
+}
+
+const fn local_drift_recovery(role: PlayerRole) -> LocalDriftRecovery {
+    match role {
+        PlayerRole::Master => LocalDriftRecovery::InPlaceSeek,
+        PlayerRole::Slave => LocalDriftRecovery::PreparedReset,
+    }
+}
+
+fn drift_slew_enabled(role: PlayerRole, requested: bool) -> bool {
+    role == PlayerRole::Master || requested
+}
+
 impl fmt::Display for PlayerRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -2720,6 +2737,8 @@ struct Player {
 
 struct ScheduledRelease {
     release_id: gst::SingleShotClockId,
+    release_at: ClockNs,
+    deadline: Instant,
 }
 
 impl ScheduledRelease {
@@ -2799,6 +2818,17 @@ fn release_is_active(
 
 fn recovery_attempt_is_active(active: &AtomicU64, expected: u64) -> bool {
     active.load(Ordering::Acquire) == expected
+}
+
+fn scheduled_release_deadline(
+    now: Instant,
+    clock_now: ClockNs,
+    release_at: ClockNs,
+) -> Result<Instant> {
+    let remaining = Duration::from_nanos(release_at.get().saturating_sub(clock_now.get()));
+    now.checked_add(remaining)
+        .and_then(|deadline| deadline.checked_add(PLAYBACK_STALL_TIMEOUT))
+        .ok_or_else(|| anyhow!("scheduled release deadline overflow"))
 }
 
 fn wait_for_clock_id(id: &gst::SingleShotClockId, description: &str) -> Result<bool> {
@@ -3088,7 +3118,9 @@ impl Player {
             recovery_attempt: Arc::new(AtomicU64::new(0)),
             disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
-            drift_slew: Mutex::new(DriftSlewController::new(drift_slew)),
+            drift_slew: Mutex::new(DriftSlewController::new(drift_slew_enabled(
+                role, drift_slew,
+            ))),
             rate_control_targets: vec![video_rate_control, audio_rate_control],
             handoff_in_progress,
             separate_audio_handoff: true,
@@ -3247,7 +3279,9 @@ impl Player {
             recovery_attempt: Arc::new(AtomicU64::new(0)),
             disconnect_count: AtomicU64::new(0),
             drift_policy: Mutex::new(DriftPolicy::default()),
-            drift_slew: Mutex::new(DriftSlewController::new(drift_slew)),
+            drift_slew: Mutex::new(DriftSlewController::new(drift_slew_enabled(
+                role, drift_slew,
+            ))),
             // A seek sent through one playbin sink reaches the shared
             // demuxer, which emits the rate change to all of its streams.
             rate_control_targets: vec![video_rate_control],
@@ -3449,11 +3483,14 @@ impl Player {
 
         let release_id =
             clock.new_single_shot_id(gst::ClockTime::from_nseconds(plan.release_at.get()));
+        let deadline = scheduled_release_deadline(Instant::now(), now, plan.release_at)?;
         *self
             .scheduled_release
             .lock()
             .map_err(|_| anyhow!("scheduled release lock poisoned"))? = Some(ScheduledRelease {
             release_id: release_id.clone(),
+            release_at: plan.release_at,
+            deadline,
         });
 
         let release_worker = ReleaseWorker {
@@ -3500,11 +3537,14 @@ impl Player {
         let recovery_attempt = self.next_recovery_attempt();
         let release_id =
             clock.new_single_shot_id(gst::ClockTime::from_nseconds(plan.release_at.get()));
+        let deadline = scheduled_release_deadline(Instant::now(), now, plan.release_at)?;
         *self
             .scheduled_release
             .lock()
             .map_err(|_| anyhow!("scheduled release lock poisoned"))? = Some(ScheduledRelease {
             release_id: release_id.clone(),
+            release_at: plan.release_at,
+            deadline,
         });
         let worker = ReleaseWorker {
             pipeline: self.pipeline.clone(),
@@ -3805,6 +3845,7 @@ impl Player {
                 }
                 next_telemetry = Instant::now() + TELEMETRY_INTERVAL;
             }
+            self.check_scheduled_release_deadline()?;
             if Instant::now() >= next_playback_report {
                 log_runtime_playback_report(
                     &self.pipeline,
@@ -3829,6 +3870,32 @@ impl Player {
             .set_state(gst::State::Null)
             .context("failed to stop pipeline")?;
         Ok(())
+    }
+
+    fn check_scheduled_release_deadline(&self) -> Result<()> {
+        let expired = {
+            let mut scheduled = self
+                .scheduled_release
+                .lock()
+                .map_err(|_| anyhow!("scheduled release lock poisoned"))?;
+            if scheduled
+                .as_ref()
+                .is_some_and(|release| Instant::now() >= release.deadline)
+            {
+                scheduled.take()
+            } else {
+                None
+            }
+        };
+        let Some(expired) = expired else {
+            return Ok(());
+        };
+        expired.release_id.unschedule();
+        let clock_now_ns = self.clock()?.time().nseconds();
+        bail!(
+            "scheduled release did not fire before its monotonic deadline (release_at_ns={}, clock_now_ns={clock_now_ns})",
+            expired.release_at.get()
+        );
     }
 
     fn update_event_projection(&self, projection: EventProjection) -> Result<()> {
@@ -4217,10 +4284,11 @@ impl Player {
             return Ok(());
         }
         info!(
+            player_role = %self.role,
             playback_rate = rate,
             error_ns = sample.error_ns,
             drift_slew_active = active,
-            "Slave drift slew rate updated"
+            "drift slew rate updated"
         );
         Ok(())
     }
@@ -4459,6 +4527,10 @@ impl Player {
             return Ok(());
         }
 
+        if local_drift_recovery(self.role) == LocalDriftRecovery::InPlaceSeek {
+            return self.repair_master_drift(sample);
+        }
+
         let clock = self.clock()?;
         let release_at = ClockNs::new(clock.time().nseconds())
             .checked_add(LOCAL_RECOVERY_LEAD)
@@ -4489,6 +4561,57 @@ impl Player {
         );
         let result = self.resynchronize_inner(&clock, plan, recovery_attempt, false);
         self.recovery_in_progress.store(false, Ordering::Release);
+        result
+    }
+
+    fn repair_master_drift(&self, sample: &PositionSample) -> Result<()> {
+        if sample.pipeline_state != gst::State::Playing
+            || sample.transition_in_progress
+            || sample.actual_item.index != sample.expected_item.index
+        {
+            debug!(
+                actual_item_index = sample.actual_item.index,
+                expected_item_index = sample.expected_item.index,
+                pipeline_state = ?sample.pipeline_state,
+                transition_in_progress = sample.transition_in_progress,
+                "Master drift repair skipped because playback is not stable within one cue"
+            );
+            return Ok(());
+        }
+
+        let recovery_attempt = self.next_recovery_attempt();
+        self.recovery_in_progress.store(true, Ordering::Release);
+        info!(
+            recovery_attempt,
+            recovery_reason = "local-drift",
+            position_before_ns = sample.actual_sequence_position.get(),
+            target_item_index = sample.expected_item.index,
+            target_item_local_ns = sample.expected_item.local_ns,
+            error_before_ns = sample.error_ns,
+            "preparing in-place Master drift recovery"
+        );
+        let result = (|| {
+            if let Some(events) = &self.events {
+                events
+                    .lock()
+                    .map_err(|_| anyhow!("event runtime lock poisoned"))?
+                    .mark_discontinuity();
+            }
+            self.pipeline
+                .seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    gst::ClockTime::from_nseconds(sample.expected_item.local_ns),
+                )
+                .context("failed to seek Master to the expected local position")
+        })();
+        self.recovery_in_progress.store(false, Ordering::Release);
+        if result.is_ok() {
+            info!(
+                recovery_attempt,
+                recovery_reason = "local-drift",
+                "in-place Master drift recovery requested"
+            );
+        }
         result
     }
 
@@ -5248,13 +5371,14 @@ mod tests {
     use super::{
         ActiveConnections, Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN,
         DriftAction, DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy,
-        FitMode, HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation,
-        PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, ProgramCompatibility,
-        ShutdownSignal, StateSnapshot, Timeline, TransportState, build_playbin_video_sink,
-        can_join_startup, combined_gain, finite_f64, gain_db_to_linear, interruptible_sleep,
-        make_kms_gl_sink, non_negative_seconds, recovery_attempt_is_active, select_video_sink,
-        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
-        validate_subscription,
+        FitMode, HardwareDecoding, LocalDriftRecovery, MasterSession, MediaItem, MediaPositionNs,
+        Operation, PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, PlayerRole,
+        ProgramCompatibility, ShutdownSignal, StateSnapshot, Timeline, TransportState,
+        build_playbin_video_sink, can_join_startup, combined_gain, drift_slew_enabled, finite_f64,
+        gain_db_to_linear, interruptible_sleep, local_drift_recovery, make_kms_gl_sink,
+        non_negative_seconds, recovery_attempt_is_active, scheduled_release_deadline,
+        select_video_sink, validate_playback_args, validate_snapshot_generation,
+        validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -5729,6 +5853,36 @@ mod tests {
         assert_eq!(slew.observe(-240_000_000), DriftSlewAction::Apply(1.02));
         assert_eq!(slew.observe(-80_000_000), DriftSlewAction::Apply(1.008));
         assert_eq!(slew.observe(-40_000_000), DriftSlewAction::Reset);
+    }
+
+    #[test]
+    fn master_drift_uses_slew_and_never_uses_a_prepared_reset() {
+        assert!(drift_slew_enabled(PlayerRole::Master, false));
+        assert_eq!(
+            local_drift_recovery(PlayerRole::Master),
+            LocalDriftRecovery::InPlaceSeek
+        );
+        assert!(!drift_slew_enabled(PlayerRole::Slave, false));
+        assert!(drift_slew_enabled(PlayerRole::Slave, true));
+        assert_eq!(
+            local_drift_recovery(PlayerRole::Slave),
+            LocalDriftRecovery::PreparedReset
+        );
+    }
+
+    #[test]
+    fn scheduled_release_deadline_uses_monotonic_time_and_stall_grace() {
+        let now = Instant::now();
+        let deadline = scheduled_release_deadline(
+            now,
+            ClockNs::new(1_000_000_000),
+            ClockNs::new(6_000_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            deadline.duration_since(now),
+            Duration::from_secs(5) + super::PLAYBACK_STALL_TIMEOUT
+        );
     }
 
     #[test]

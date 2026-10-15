@@ -9,27 +9,27 @@
 
 The Master and Raspberry Pi Slave played a looping three-video program through their real playback
 sinks for an all-day, public-facing projection. After approximately eight hours, the Master's image
-froze during ordinary playback. Syncplayer logging was set to `WARN` at the time.
+froze during ordinary playback. Syncplayer logging was set to `WARN` at the time, so the first
+occurrence did not identify the failing layer.
 
 The visible frame showed the number 3 in a ten-second countdown. The countdown had progressed for
 approximately seven seconds and had about three seconds remaining, placing the freeze within the
 cue rather than near the transition to another video.
 
-The Raspberry Pi Slave did not freeze and did not need to be restarted. It continued operating
-through the Master interruption and recovery. This also provides further real-system evidence that
-the separate `--drift-slew` handoff failure recorded in INC-0005 remains resolved.
+A second run on 2026-10-15 reproduced the same visible countdown frame with DEBUG application logs,
+centralized diagnostics, GStreamer logs, and resource sampling. This time the Slave also stopped
+because the Master's exported clock stopped. Its independent playback watchdog exited with status
+70 after ten seconds without a video frame.
 
 ## Symptom
 
 - The Master's displayed video stopped changing and remained on one countdown frame.
-- The process remained alive instead of reporting a fatal pipeline error or exiting.
-- The `WARN`-level application log contained nothing unusual before or during the freeze.
-- No GStreamer bus error, clock-lost message, EOS diagnosis, or other decisive cause was captured.
-- The freeze was noticed visually after several hours; its exact onset time and the state of audio
-  playback were not recorded.
-
-The next endurance run uses `DEBUG` logging to retain per-second position telemetry and cue-handoff
-messages if the failure recurs.
+- The Master process remained alive without a GStreamer bus error or `CLOCK_LOST` message.
+- Its pipeline stayed in `Paused` with a synchronization transition permanently in progress.
+- Its selected `GstPulseSinkClock`, expected position, and actual position all stopped changing.
+- The Slave's network-derived clock and media position then stopped, causing the watchdog exit.
+- Master CPU fell to approximately 0-2% and RSS remained stable around 1.17 GiB, excluding CPU,
+  memory, and I/O pressure as the immediate cause.
 
 ## Impact
 
@@ -43,34 +43,51 @@ if its network control and clock-provider threads remain responsive.
 
 ## Investigation
 
-The current evidence establishes the following:
+The second run established a deterministic sequence:
 
-1. The failure occurred well inside the countdown cue, not at a known playlist boundary.
-2. It affected the Master while the Slave continued, so it was not a simultaneous failure of the
-   shared program or both hosts' media files.
-3. Syncplayer received no fatal GStreamer bus message at `WARN` level.
-4. The process did not terminate on its own.
-5. The available log does not show whether the pipeline position, selected playback clock, audio
-   stream, decoder, video sink, compositor, or physical display output continued advancing.
+1. Master position error increased by almost exactly 1 ms per playlist iteration: approximately
+   221 ms at iteration 221 through 250 ms at iteration 250. The media metadata also contains a
+   one-millisecond container/longest-stream endpoint difference, consistent with this slope.
+2. At 21:17:37.516, three samples exceeded the 250 ms repair threshold and triggered local drift
+   recovery while the countdown cue was at 4.191 seconds.
+3. Recovery selected a position five seconds ahead (`8.941504 s`) and a shared-clock release at
+   `24579693048000 ns`, then reset the pipeline to `NULL` and prerolled it in `PAUSED`.
+4. The reset destroyed the PulseAudio sink supplying the exported `GstPulseSinkClock`. That clock
+   stopped permanently at `24574693533000 ns`, about five seconds before its own release deadline.
+5. The release worker waited on that stopped clock, so it could never return the pipeline to
+   `PLAYING`. The watchdog was intentionally disarmed during the scheduled transition.
+6. The exported clock stopped the Slave as well. Its last queried position was 4.866 seconds; its
+   watchdog then reported no frames for ten seconds and exited with status 70.
 
-These facts do not identify whether the stall began in decoding, scheduling, a sink or device
-clock, the graphics stack, or the display compositor. The mid-cue location makes the previously
-resolved drift-slew/playlist-handoff race an implausible explanation: drift slewing is Slave-only,
-and no handoff was in progress on the frozen Master.
+The repeated visible frame is therefore expected rather than coincidental: the same accumulated
+error crosses the same threshold in the same playlist iteration, and recovery prerolls the same
+future part of the countdown before waiting forever.
 
 ## Root Cause
 
-Unknown. There is not yet enough diagnostic evidence to distinguish a stalled GStreamer streaming
-thread from a decoder, video-sink, clock, graphics-driver, compositor, or hardware-output failure.
+Local drift recovery used the same clock both as the wait condition for a future release and as a
+resource owned by the pipeline being reset. On a Master using `GstPulseSinkClock`, moving the
+pipeline to `NULL` destroyed the clock provider. The clock could no longer reach the timestamp that
+would move the replacement pipeline from `PAUSED` to `PLAYING`, creating a circular wait.
 
-The absence of a warning is not evidence that GStreamer remained healthy; it only shows that the
-failure did not produce one of the bus messages or application warnings monitored at that logging
-level. This report must be updated if a future reproduction supplies enough evidence to identify
-the failing layer.
+The deterministic trigger was ordinary timeline error accumulating by roughly one millisecond per
+playlist iteration until it crossed the hard-repair threshold. This was not a decoder, graphics,
+resource-exhaustion, or watchdog failure.
 
 ## Mitigation
 
-Syncplayer now installs an independent playback watchdog on both Master and Slave pipelines:
+Syncplayer retains the independent playback watchdog on both Master and Slave pipelines and adds
+three recovery safeguards:
+
+- The Master uses bounded drift slewing by default, correcting sustained 100-250 ms error without
+  stopping the pipeline or changing the exported clock.
+- A hard Master correction performs an accurate flushing seek within the current cue. The Slave
+  retains the reset, preroll, and future shared-clock release because its network clock is external
+  to its media pipeline.
+- Every scheduled release has an independent monotonic deadline. A stopped shared clock therefore
+  produces a fatal error and supervisor restart instead of an unlimited wait.
+
+The existing playback watchdog behavior remains:
 
 - A pad probe counts decoded video buffers after the final diagnostic overlay and immediately
   before the selected video sink.
@@ -85,41 +102,28 @@ Syncplayer now installs an independent playback watchdog on both Master and Slav
   teardown, which may itself block when the pipeline is wedged, and allows the service supervisor
   to restart the player.
 
-This is operational containment, not a root-cause fix. It limits a future frozen image to roughly
-ten seconds plus supervisor restart time, but it does not prevent the underlying stall.
+The incident remains Mitigated until the corrective behavior survives a representative real-sink
+endurance run. It may then be marked Resolved.
 
 ## Verification
 
-- A deterministic controller test verifies that new frame counts refresh the deadline, repeated
-  counts trigger the ten-second stall condition, and disarming suppresses detection.
-- All 66 unit tests pass.
-- Formatting, Clippy with warnings denied, and `git diff --check` pass.
-- The release binary builds successfully.
-- The watchdog has not yet been validated against a reproduction of the original eight-hour
-  Master freeze. Real-sink endurance testing remains required.
-
-## Evidence needed for resolution
-
-If the freeze recurs, preserve and correlate:
-
-- the watchdog's final error record, especially last frame PTS and queried media position;
-- Syncplayer `DEBUG` logs covering at least the last several telemetry samples;
-- the complete GStreamer log from process start through watchdog exit;
-- the Master service journal and supervisor exit/restart record;
-- kernel, DRM/KMS, GPU, display-server, and audio-device messages near the failure time;
-- whether audio, OSD time, remote control, state publication, and the Slave continued advancing;
-- GStreamer, kernel, graphics-driver, sink, decoder, and hardware versions;
-- if practical, native thread backtraces captured while the Master is frozen and before it is
-  terminated.
-
-Once this evidence identifies the failed layer, update this report's investigation, root cause,
-corrective change, verification matrix, and status. Mark it Resolved only after the underlying fix,
-not merely the watchdog, survives representative real-sink endurance testing.
+- Unit tests cover watchdog liveness, role-specific drift recovery, Master-default slewing, and the
+  monotonic scheduled-release deadline.
+- Formatting, all 70 unit tests, Clippy with warnings denied, `git diff --check`, and a release build
+  pass for this change.
+- A real PulseAudio Master and network-clock Slave must run for at least 300 playlist iterations.
+  Master error must converge below 40 ms without a destructive reset, both clocks must remain
+  monotonic, and neither watchdog may exit.
+- A forced hard Master error above 250 ms must recover through an in-place seek while the Slave
+  continues rendering.
 
 ## Prevention and guardrails
 
 - Supervise Master and Slave processes and restart them on nonzero exit, including status 70.
 - Treat continued process existence as insufficient proof of presentation health.
+- Never schedule a Master recovery against a future timestamp on a clock provider destroyed by
+  that recovery.
+- Keep scheduled-transition liveness deadlines in an independent monotonic clock domain.
 - Keep actual frame-flow liveness independent from clock-derived position telemetry; a queried
   position may advance even when the visible output is frozen.
 - Run optional control features and real physical sinks in multi-hour loop tests before unattended
