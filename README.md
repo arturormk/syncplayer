@@ -225,6 +225,11 @@ prepared pause/seek/release.
 Protocol version 9 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.
 
+Send `SIGINT` (normally Ctrl-C) or `SIGTERM` to stop a player cleanly. Shutdown stops accepting
+control and console clients, closes active sockets, cancels scheduled releases, joins networking,
+event, and watchdog workers, and drives the GStreamer pipeline to `NULL` before exiting. A clean
+shutdown ends with `shutdown complete` in the application log.
+
 ### Installation console and centralized diagnostics
 
 The Master console is disabled by default. Enable it on an explicit address, preferably loopback

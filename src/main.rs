@@ -12,7 +12,7 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, OsdCommand, parse_command};
 use syncplayer::diagnostics::DiagnosticsHub;
@@ -253,14 +253,38 @@ fn main() -> Result<()> {
     gst::init().context("failed to initialize GStreamer")?;
 
     match Cli::parse().command {
-        Command::Master(args) => run_master(&args),
-        Command::Slave(args) => run_slave(&args),
+        Command::Master(args) => run_master(&args, &ShutdownSignal::install()?),
+        Command::Slave(args) => run_slave(&args, &ShutdownSignal::install()?),
         Command::Validate(args) => run_validate(&args),
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ShutdownSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    fn install() -> Result<Self> {
+        let shutdown = Self::default();
+        signal_hook::flag::register(signal_hook::consts::SIGINT, shutdown.requested.clone())
+            .context("failed to install SIGINT handler")?;
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.requested.clone())
+            .context("failed to install SIGTERM handler")?;
+        Ok(shutdown)
+    }
+
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn run_master(args: &MasterArgs) -> Result<()> {
+fn run_master(args: &MasterArgs, shutdown: &ShutdownSignal) -> Result<()> {
     validate_playback_args(&args.playback)?;
     // Let the pipeline choose its natural clock. With a real audio sink this
     // is normally the device-backed audio clock, so the Master does not have
@@ -371,21 +395,37 @@ fn run_master(args: &MasterArgs) -> Result<()> {
         keepalive_timeout,
         diagnostics: diagnostics.clone(),
         operator_lock: Mutex::new(()),
+        shutdown: shutdown.clone(),
+        connections: ActiveConnections::default(),
+        sessions: BackgroundThreads::default(),
     });
-    broadcast_state(server.clone());
-    serve_slaves(listener, server.clone());
-    if let Some(console_listener) = console_listener {
+    let broadcaster = broadcast_state(server.clone())?;
+    let slave_listener = serve_slaves(listener, server.clone())?;
+    let console_listener = if let Some(console_listener) = console_listener {
         info!(console = %console_listener.local_addr()?, "installation console enabled");
-        serve_console(console_listener, server.clone());
-    }
-    player.monitor(
+        Some(serve_console(console_listener, server.clone())?)
+    } else {
+        None
+    };
+    let result = player.monitor(
         initial_plan,
         Some(&server.transport),
         Some((diagnostics.as_ref(), program.player_id.as_str())),
-    )
+        shutdown,
+    );
+    shutdown.request();
+    join_background("Slave listener", slave_listener);
+    if let Some(console_listener) = console_listener {
+        join_background("console listener", console_listener);
+    }
+    server.connections.shutdown_all();
+    join_background("state broadcaster", broadcaster);
+    server.sessions.join_all();
+    info!("shutdown complete");
+    result
 }
 
-fn run_slave(args: &SlaveArgs) -> Result<()> {
+fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
     validate_playback_args(&args.playback)?;
     let program = load_runtime_program(&args.playback)?;
     let sequence = PlaybackSequence::prepare(&program)?;
@@ -396,7 +436,12 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
         bail!("state receive socket did not obtain a usable UDP port");
     }
     let subscription = create_subscription(&program, &sequence, state_port)?;
-    let (mut stream, clock, authority) = wait_for_master(args.master, &subscription);
+    let Some((mut stream, clock, authority)) =
+        wait_for_master(args.master, &subscription, shutdown)
+    else {
+        info!("shutdown complete");
+        return Ok(());
+    };
     let player = Arc::new(Player::new(
         &args.playback,
         sequence,
@@ -412,7 +457,10 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
         "accepted shared-clock release"
     );
 
-    monitor_master(
+    let shutdown_stream = stream
+        .try_clone()
+        .context("failed to clone Master connection")?;
+    let monitor = monitor_master(
         stream,
         state_socket,
         args.master,
@@ -423,8 +471,14 @@ fn run_slave(args: &SlaveArgs) -> Result<()> {
             interval: Duration::from_secs_f64(args.keepalive_interval),
             timeout: Duration::from_secs_f64(args.keepalive_timeout),
         },
-    );
-    player.monitor(plan, None, None)
+        shutdown.clone(),
+    )?;
+    let result = player.monitor(plan, None, None, shutdown);
+    shutdown.request();
+    let _ = shutdown_stream.shutdown(Shutdown::Both);
+    join_background("Master monitor", monitor);
+    info!("shutdown complete");
+    result
 }
 
 fn create_subscription(
@@ -521,10 +575,11 @@ fn run_validate(args: &ValidateArgs) -> Result<()> {
 fn wait_for_master(
     master: SocketAddr,
     subscription: &Subscription,
-) -> (TcpStream, gst::Clock, Authority) {
-    loop {
+    shutdown: &ShutdownSignal,
+) -> Option<(TcpStream, gst::Clock, Authority)> {
+    while !shutdown.is_requested() {
         match connect_to_master(master, subscription) {
-            Ok(connection) => return connection,
+            Ok(connection) => return Some(connection),
             Err(error) => {
                 warn!(
                     %master,
@@ -532,72 +587,134 @@ fn wait_for_master(
                     retry_in_s = MASTER_RETRY_INTERVAL.as_secs(),
                     "Master connection attempt failed; retrying"
                 );
-                thread::sleep(MASTER_RETRY_INTERVAL);
+                interruptible_sleep(MASTER_RETRY_INTERVAL, shutdown);
             }
         }
     }
+    None
 }
 
-fn serve_slaves(listener: TcpListener, server: Arc<SlaveServer>) {
-    thread::spawn(move || {
-        for accepted in listener.incoming() {
-            let stream = match accepted {
-                Ok(connection) => connection,
-                Err(error) => {
-                    error!(%error, "failed to accept Slave");
-                    continue;
+fn serve_slaves(listener: TcpListener, server: Arc<SlaveServer>) -> Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    thread::Builder::new()
+        .name("syncplayer-slave-listener".to_owned())
+        .spawn(move || {
+            while !server.shutdown.is_requested() {
+                let stream = match listener.accept() {
+                    Ok((connection, _)) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        interruptible_sleep(Duration::from_millis(50), &server.shutdown);
+                        continue;
+                    }
+                    Err(error) => {
+                        error!(%error, "failed to accept Slave");
+                        continue;
+                    }
+                };
+                let peer = match stream.peer_addr() {
+                    Ok(peer) => peer,
+                    Err(error) => {
+                        warn!(%error, "could not identify connected Slave");
+                        continue;
+                    }
+                };
+                info!(%peer, "Slave connected; sending synchronization welcome");
+                let connection = match server.connections.track(&stream) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        warn!(%peer, %error, "could not track Slave connection");
+                        continue;
+                    }
+                };
+                let sessions = server.sessions.clone();
+                let server = server.clone();
+                let session = thread::Builder::new()
+                    .name("syncplayer-slave-session".to_owned())
+                    .spawn(move || {
+                        let _connection = connection;
+                        if let Err(error) = welcome_slave(stream, peer, &server)
+                            && !server.shutdown.is_requested()
+                        {
+                            warn!(%peer, %error, "Slave synchronization session ended");
+                        }
+                    });
+                match session {
+                    Ok(session) => sessions.push(session),
+                    Err(error) => error!(%error, "failed to start Slave session"),
                 }
-            };
-            let peer = match stream.peer_addr() {
-                Ok(peer) => peer,
-                Err(error) => {
-                    warn!(%error, "could not identify connected Slave");
-                    continue;
-                }
-            };
-            info!(%peer, "Slave connected; sending synchronization welcome");
-            let server = server.clone();
-            thread::spawn(move || {
-                if let Err(error) = welcome_slave(stream, peer, &server) {
-                    warn!(%peer, %error, "Slave synchronization session ended");
-                }
-            });
-        }
-    });
+            }
+        })
+        .context("failed to start Slave listener")
 }
 
-fn serve_console(listener: TcpListener, server: Arc<SlaveServer>) {
-    thread::spawn(move || {
-        for accepted in listener.incoming() {
-            let stream = match accepted {
-                Ok(stream) => stream,
-                Err(error) => {
-                    warn!(%error, "failed to accept console connection");
-                    continue;
+fn serve_console(listener: TcpListener, server: Arc<SlaveServer>) -> Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    thread::Builder::new()
+        .name("syncplayer-console-listener".to_owned())
+        .spawn(move || {
+            while !server.shutdown.is_requested() {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        interruptible_sleep(Duration::from_millis(50), &server.shutdown);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to accept console connection");
+                        continue;
+                    }
+                };
+                let peer = stream.peer_addr().ok();
+                let connection = match server.connections.track(&stream) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        warn!(?peer, %error, "could not track console connection");
+                        continue;
+                    }
+                };
+                let sessions = server.sessions.clone();
+                let server = server.clone();
+                let session = thread::Builder::new()
+                    .name("syncplayer-console-session".to_owned())
+                    .spawn(move || {
+                        let _connection = connection;
+                        if let Err(error) = run_console_session(stream, &server)
+                            && !server.shutdown.is_requested()
+                        {
+                            warn!(?peer, %error, "console session ended with an error");
+                        }
+                    });
+                match session {
+                    Ok(session) => sessions.push(session),
+                    Err(error) => error!(%error, "failed to start console session"),
                 }
-            };
-            let peer = stream.peer_addr().ok();
-            let server = server.clone();
-            thread::spawn(move || {
-                if let Err(error) = run_console_session(stream, &server) {
-                    warn!(?peer, %error, "console session ended with an error");
-                }
-            });
-        }
-    });
+            }
+        })
+        .context("failed to start console listener")
 }
 
 fn run_console_session(mut stream: TcpStream, server: &SlaveServer) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
     writeln!(stream, "Syncplayer installation console")?;
     writeln!(stream, "{CONSOLE_HELP}")?;
     write!(stream, "> ")?;
     stream.flush()?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
-    loop {
+    while !server.shutdown.is_requested() {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
+        match reader.read_line(&mut line) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         }
         let response = if line.len() > 4096 {
             "error: command exceeds 4096 bytes".to_owned()
@@ -612,6 +729,7 @@ fn run_console_session(mut stream: TcpStream, server: &SlaveServer) -> Result<()
         write!(stream, "> ")?;
         stream.flush()?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -948,6 +1066,102 @@ struct SlaveServer {
     keepalive_timeout: Duration,
     diagnostics: Arc<DiagnosticsHub>,
     operator_lock: Mutex<()>,
+    shutdown: ShutdownSignal,
+    connections: ActiveConnections,
+    sessions: BackgroundThreads,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActiveConnections {
+    inner: Arc<ActiveConnectionsInner>,
+}
+
+#[derive(Debug, Default)]
+struct ActiveConnectionsInner {
+    next_id: AtomicU64,
+    streams: Mutex<Vec<(u64, TcpStream)>>,
+}
+
+impl ActiveConnections {
+    fn track(&self, stream: &TcpStream) -> Result<ActiveConnection> {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .streams
+            .lock()
+            .map_err(|_| anyhow!("active connection lock poisoned"))?
+            .push((id, stream.try_clone()?));
+        Ok(ActiveConnection {
+            id,
+            connections: self.clone(),
+        })
+    }
+
+    fn shutdown_all(&self) {
+        let Ok(streams) = self.inner.streams.lock() else {
+            error!("active connection lock poisoned during shutdown");
+            return;
+        };
+        for (_, stream) in streams.iter() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+struct ActiveConnection {
+    id: u64,
+    connections: ActiveConnections,
+}
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        if let Ok(mut streams) = self.connections.inner.streams.lock() {
+            streams.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct BackgroundThreads {
+    handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+}
+
+impl BackgroundThreads {
+    fn push(&self, handle: JoinHandle<()>) {
+        if let Ok(mut handles) = self.handles.lock() {
+            handles.push(handle);
+        } else {
+            error!("background thread lock poisoned");
+        }
+    }
+
+    fn join_all(&self) {
+        let handles = if let Ok(mut handles) = self.handles.lock() {
+            std::mem::take(&mut *handles)
+        } else {
+            error!("background thread lock poisoned during shutdown");
+            return;
+        };
+        for handle in handles {
+            join_background("client session", handle);
+        }
+    }
+}
+
+fn join_background(name: &str, handle: JoinHandle<()>) {
+    if handle.join().is_err() {
+        error!(thread = name, "background thread panicked during shutdown");
+    }
+}
+
+fn interruptible_sleep(duration: Duration, shutdown: &ShutdownSignal) {
+    let deadline = Instant::now() + duration;
+    while !shutdown.is_requested() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
 }
 
 impl SlaveServer {
@@ -1320,11 +1534,13 @@ fn log_registry(registry: &ParticipantRegistry, stale_after: Duration) -> Result
     Ok(())
 }
 
-fn broadcast_state(server: Arc<SlaveServer>) {
-    thread::spawn(move || {
+fn broadcast_state(server: Arc<SlaveServer>) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("syncplayer-state-broadcaster".to_owned())
+        .spawn(move || {
         let mut generation = None;
         let mut sequence = 0_u64;
-        loop {
+        while !server.shutdown.is_requested() {
             let started = Instant::now();
             let result = (|| -> Result<()> {
                 let master_clock = ClockNs::new(server.clock.time().nseconds());
@@ -1367,9 +1583,13 @@ fn broadcast_state(server: Arc<SlaveServer>) {
             if let Err(error) = result {
                 error!(%error, "state broadcaster iteration failed");
             }
-            thread::sleep(server.state_interval.saturating_sub(started.elapsed()));
+            interruptible_sleep(
+                server.state_interval.saturating_sub(started.elapsed()),
+                &server.shutdown,
+            );
         }
-    });
+    })
+    .context("failed to start state broadcaster")
 }
 
 fn run_master_keepalives(
@@ -1382,7 +1602,7 @@ fn run_master_keepalives(
     stream.set_write_timeout(Some(server.keepalive_timeout))?;
     let mut last_sequence = None;
     let mut last_keepalive = Instant::now();
-    loop {
+    while !server.shutdown.is_requested() {
         let remaining = server
             .keepalive_timeout
             .saturating_sub(last_keepalive.elapsed());
@@ -1419,8 +1639,10 @@ fn run_master_keepalives(
             other => bail!("expected KEEPALIVE from Slave, received {other:?}"),
         }
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn monitor_master_session(
     stream: &mut TcpStream,
     state_socket: &UdpSocket,
@@ -1429,6 +1651,7 @@ fn monitor_master_session(
     player: &Player,
     keepalive_interval: Duration,
     keepalive_timeout: Duration,
+    shutdown: &ShutdownSignal,
 ) -> Result<()> {
     stream.set_read_timeout(Some(keepalive_timeout))?;
     stream.set_write_timeout(Some(keepalive_timeout))?;
@@ -1437,7 +1660,7 @@ fn monitor_master_session(
     let mut next_diagnostic = Instant::now();
     let mut last_state_sequence = None;
     let mut bytes = [0_u8; MAX_STATE_PACKET_BYTES];
-    loop {
+    while !shutdown.is_requested() {
         if Instant::now() >= next_keepalive {
             keepalive_sequence = keepalive_sequence
                 .checked_add(1)
@@ -1507,6 +1730,7 @@ fn monitor_master_session(
             Err(error) => return Err(error).context("failed to receive state datagram"),
         }
     }
+    Ok(())
 }
 
 fn validate_state_datagram(
@@ -1650,6 +1874,7 @@ fn report_prepared(stream: &mut TcpStream, authority: Authority) -> Result<()> {
     .context("failed to report prepared release")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn monitor_master(
     mut stream: TcpStream,
     state_socket: UdpSocket,
@@ -1658,9 +1883,12 @@ fn monitor_master(
     player: Arc<Player>,
     subscription: Subscription,
     keepalive: KeepaliveConfig,
-) {
-    thread::spawn(move || {
-        loop {
+    shutdown: ShutdownSignal,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("syncplayer-master-monitor".to_owned())
+        .spawn(move || {
+        while !shutdown.is_requested() {
             let error = monitor_master_session(
                 &mut stream,
                 &state_socket,
@@ -1669,9 +1897,13 @@ fn monitor_master(
                 &player,
                 keepalive.interval,
                 keepalive.timeout,
+                &shutdown,
             )
             .err()
             .unwrap_or_else(|| anyhow!("Master protocol monitor stopped"));
+            if shutdown.is_requested() {
+                break;
+            }
             let planned_rejoin = error.downcast_ref::<GenerationChanged>().is_some();
             if !planned_rejoin {
                 player.set_clock_health(false);
@@ -1703,7 +1935,7 @@ fn monitor_master(
                 player.disconnect_count.fetch_add(1, Ordering::AcqRel);
             }
 
-            loop {
+            while !shutdown.is_requested() {
                 match connect_to_master(master, &subscription).and_then(
                     |(mut new_stream, clock, new_authority)| {
                         let plan = receive_release(&mut new_stream, &clock, new_authority)?;
@@ -1727,12 +1959,13 @@ fn monitor_master(
                     }
                     Err(error) => {
                         warn!(%master, %error, "Master reconnect attempt failed; still free-running");
-                        thread::sleep(MASTER_RETRY_INTERVAL);
+                        interruptible_sleep(MASTER_RETRY_INTERVAL, &shutdown);
                     }
                 }
             }
         }
-    });
+    })
+    .context("failed to start Master monitor")
 }
 
 #[derive(Clone, Debug)]
@@ -2117,6 +2350,7 @@ impl PlaybackWatchdogController {
 struct PlaybackWatchdog {
     sender: mpsc::Sender<PlaybackWatchdogEvent>,
     last_queried_position_ns: Arc<AtomicU64>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl PlaybackWatchdog {
@@ -2139,7 +2373,7 @@ impl PlaybackWatchdog {
         let last_queried_position_ns = Arc::new(AtomicU64::new(0));
         let thread_position = last_queried_position_ns.clone();
         let (sender, receiver) = mpsc::channel();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("syncplayer-watchdog".to_owned())
             .spawn(move || {
                 run_playback_watchdog(
@@ -2154,6 +2388,7 @@ impl PlaybackWatchdog {
         Ok(Self {
             sender,
             last_queried_position_ns,
+            worker: Some(worker),
         })
     }
 
@@ -2174,6 +2409,11 @@ impl PlaybackWatchdog {
 impl Drop for PlaybackWatchdog {
     fn drop(&mut self) {
         let _ = self.sender.send(PlaybackWatchdogEvent::Shutdown);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            error!("playback watchdog panicked during shutdown");
+        }
     }
 }
 
@@ -3497,6 +3737,7 @@ impl Player {
         initial_plan: ReleasePlan,
         master_transport: Option<&Arc<Mutex<TransportController>>>,
         diagnostics: Option<(&DiagnosticsHub, &str)>,
+        shutdown: &ShutdownSignal,
     ) -> Result<()> {
         let bus = self
             .pipeline
@@ -3505,6 +3746,10 @@ impl Player {
         let mut next_telemetry = Instant::now();
         let mut next_playback_report = Instant::now() + PLAYBACK_REPORT_INTERVAL;
         loop {
+            if shutdown.is_requested() {
+                info!("shutdown requested; stopping playback");
+                break;
+            }
             if let Some(message) = bus.timed_pop_filtered(
                 gst::ClockTime::from_mseconds(100),
                 &[
@@ -3578,6 +3823,8 @@ impl Player {
                 return Err(anyhow!(error));
             }
         }
+        self.cancel_scheduled_release()?;
+        self.playback_watchdog.disarm();
         self.pipeline
             .set_state(gst::State::Null)
             .context("failed to stop pipeline")?;
@@ -4999,20 +5246,24 @@ fn non_negative_seconds(value: &str) -> Result<f64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN, DriftAction,
-        DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy, FitMode,
-        HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation, PlaybackSequence,
-        PlaybackWatchdogController, PlaybackWatchdogEvent, ProgramCompatibility, StateSnapshot,
-        Timeline, TransportState, build_playbin_video_sink, can_join_startup, combined_gain,
-        finite_f64, gain_db_to_linear, make_kms_gl_sink, non_negative_seconds,
-        recovery_attempt_is_active, select_video_sink, validate_playback_args,
-        validate_snapshot_generation, validate_state_datagram, validate_subscription,
+        ActiveConnections, Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN,
+        DriftAction, DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy,
+        FitMode, HardwareDecoding, MasterSession, MediaItem, MediaPositionNs, Operation,
+        PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, ProgramCompatibility,
+        ShutdownSignal, StateSnapshot, Timeline, TransportState, build_playbin_video_sink,
+        can_join_startup, combined_gain, finite_f64, gain_db_to_linear, interruptible_sleep,
+        make_kms_gl_sink, non_negative_seconds, recovery_attempt_is_active, select_video_sink,
+        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
+        validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
     use gstreamer as gst;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
     use std::time::{Duration, Instant};
     use syncplayer::program::ProgramHash;
     use syncplayer::protocol::{Capabilities, StateDatagram, Subscription};
@@ -5022,6 +5273,37 @@ mod tests {
             session: MasterSession::new(1),
             generation: 7,
         }
+    }
+
+    #[test]
+    fn shutdown_signal_interrupts_waits() {
+        let shutdown = ShutdownSignal::default();
+        let requester = shutdown.clone();
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            requester.request();
+        });
+        interruptible_sleep(Duration::from_secs(5), &shutdown);
+        worker.join().unwrap();
+        assert!(shutdown.is_requested());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn active_connections_are_closed_and_unregistered() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let connections = ActiveConnections::default();
+        let connection = connections.track(&server).unwrap();
+        assert_eq!(connections.inner.streams.lock().unwrap().len(), 1);
+
+        connections.shutdown_all();
+        let mut byte = [0_u8; 1];
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        drop(connection);
+        assert!(connections.inner.streams.lock().unwrap().is_empty());
     }
 
     fn state_packet(session: MasterSession, sequence: u64) -> StateDatagram {

@@ -184,8 +184,8 @@ Implement/test:
   test launchers.
 - Hours/days of loop and reconnect soak testing using the resource sampler; qualification results
   still need to be recorded.
-- Graceful SIGINT/SIGTERM shutdown.
-- Clean shutdown of listeners, subscriber tasks, event workers, sockets, and pipelines.
+- [x] Graceful SIGINT/SIGTERM shutdown.
+- [x] Clean shutdown of listeners, subscriber tasks, event workers, sockets, and pipelines.
 - Packaging or a clearly supported native runtime bundle.
 - [x] Structured startup reporting for decoder, sinks, clock, and hardware acceleration, plus
   periodic clock health and video-sink rendered/dropped-frame statistics.
