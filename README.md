@@ -76,6 +76,13 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+For repeatable physical or endurance runs, use `tools/test-master.sh` and
+`tools/test-slave.sh`. In addition to the application and GStreamer logs, each launcher writes a
+resource CSV (`master-resources.csv` or `slave-resources.csv`) with elapsed time, process CPU,
+resident/peak/virtual memory, threads, open file descriptors, and read/write byte counters. The
+default interval is one second; change it with `--resource-interval SECONDS`. The Slave launcher
+enables gradual drift correction unconditionally.
+
 ## Command-line reference
 
 Syncplayer has three subcommands:
@@ -167,8 +174,8 @@ Run `syncplayer validate show.toml [--player-id NAME]` on each host before playb
 resolved video and external-audio file, verifies required streams, checks durations and cue-relative
 event times, warns about suspicious stream-format transitions, and prints the program hash. An
 external audio duration more than 50 ms from its video is rejected. External audio, cue-local
-mute/gain, and the corresponding global CLI controls are active at runtime. Timed events are still
-rejected until their P1 event engine is implemented.
+mute/gain, and the corresponding global CLI controls are active at runtime. Typed process and UDP
+events are executed by the host-local timeline-crossing scheduler.
 
 ### Master options
 
@@ -256,7 +263,11 @@ transport-rejoin events are recorded in the same file.
 Set `RUST_LOG` to control diagnostic output. Normal operation defaults to informational messages;
 `RUST_LOG=syncplayer=debug` additionally emits clock release and expected-versus-actual position
 telemetry, keepalive round-trip times, authoritative snapshots, recovery attempts, and cooldown
-decisions. Routine keepalives and state packets are not logged at info level.
+decisions. At startup, the informational log records a consolidated playback stack containing the
+selected audio/video decoders and sinks, hardware-decoder classification, and clock details. Once
+per minute it records clock health and cumulative rendered/dropped-frame counters for video sinks
+that expose GStreamer sink statistics. Routine keepalives and state packets are not logged at info
+level.
 
 ## Two-host experiment
 

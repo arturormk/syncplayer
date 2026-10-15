@@ -16,12 +16,14 @@ Arguments:
   PROGRAM         Path to the program.toml file
 
 Options:
-      --debug     Enable debug-level Syncplayer logging
-  -h, --help      Show this help text and exit
+      --debug                        Enable debug-level Syncplayer logging
+      --resource-interval <SECONDS>  Sampling interval (default: 1)
+  -h, --help                         Show this help text and exit
 
 The tool automatically selects a release build for the native target, falling
-back to a native debug build. It writes GStreamer logs to gstreamer.log and the
-combined player output to slave.log in the current directory.
+back to a native debug build. It writes GStreamer logs to gstreamer.log, the
+combined player output to slave.log, and CPU/memory/thread/file-descriptor/I/O
+samples to slave-resources.csv in the current directory.
 EOF
 }
 
@@ -74,6 +76,7 @@ main() {
     local program
     local debug=false
     local rust_log=syncplayer=warn
+    local resource_interval=1
     local syncplayer
     local -a pipeline_status
     local syncplayer_status
@@ -83,6 +86,11 @@ main() {
     while (($# > 0)); do
         case "$1" in
             --debug) debug=true ;;
+            --resource-interval)
+                (($# >= 2)) || die 'Missing value for --resource-interval.'
+                resource_interval=$2
+                shift
+                ;;
             -h | --help)
                 usage
                 return 0
@@ -124,16 +132,21 @@ main() {
     printf 'Master:     %s\n' "$master"
     printf 'Program:    %s\n' "$program"
     printf 'Rust log:   %s\n' "$rust_log"
-    printf 'Logs:       %s/gstreamer.log and %s/slave.log\n\n' "$PWD" "$PWD"
+    printf 'Resources:  every %ss\n' "$resource_interval"
+    printf 'Logs:       %s/gstreamer.log, %s/slave.log, and %s/slave-resources.csv\n\n' \
+        "$PWD" "$PWD" "$PWD"
 
     GST_DEBUG_NO_COLOR=1 \
     GST_DEBUG_FILE="$PWD/gstreamer.log" \
     GST_DEBUG='2' \
     RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
-    "$syncplayer" \
+    "$PROJECT_ROOT/tools/run-with-resource-sampling.sh" \
+        slave-resources.csv "$resource_interval" -- \
+        "$syncplayer" \
         slave \
         --master "$master" \
+        --drift-slew \
         --mute \
         "$program" \
         2>&1 | tee slave.log

@@ -40,6 +40,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MASTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REJOIN_PREPARATION_TIMEOUT: Duration = Duration::from_secs(95);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYBACK_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const DRIFT_WARN_THRESHOLD_NS: u128 = 100_000_000;
 const DRIFT_REPAIR_THRESHOLD_NS: u128 = 250_000_000;
 const DRIFT_REQUIRED_SAMPLES: u32 = 3;
@@ -2798,6 +2799,7 @@ impl Player {
             externally_driven = forced_clock.is_some(),
             "playback clock selected"
         );
+        log_playback_stack(&pipeline, &clock, args, forced_clock.is_some());
         let duration = pipeline.query_duration::<gst::ClockTime>();
         info!(
             media = %sequence.items[0].path.display(),
@@ -2955,6 +2957,7 @@ impl Player {
             externally_driven = forced_clock.is_some(),
             "playback clock selected"
         );
+        log_playback_stack(&pipeline, &clock, args, forced_clock.is_some());
         let duration = pipeline.query_duration::<gst::ClockTime>();
         info!(
             engine = "playbin3",
@@ -3500,6 +3503,7 @@ impl Player {
             .bus()
             .ok_or_else(|| anyhow!("pipeline has no bus"))?;
         let mut next_telemetry = Instant::now();
+        let mut next_playback_report = Instant::now() + PLAYBACK_REPORT_INTERVAL;
         loop {
             if let Some(message) = bus.timed_pop_filtered(
                 gst::ClockTime::from_mseconds(100),
@@ -3555,6 +3559,14 @@ impl Player {
                         .context("failed to record Master diagnostics")?;
                 }
                 next_telemetry = Instant::now() + TELEMETRY_INTERVAL;
+            }
+            if Instant::now() >= next_playback_report {
+                log_runtime_playback_report(
+                    &self.pipeline,
+                    &self.clock()?,
+                    self.clock_healthy.load(Ordering::Acquire),
+                );
+                next_playback_report = Instant::now() + PLAYBACK_REPORT_INTERVAL;
             }
             self.tick_events()?;
             if let Some(error) = self
@@ -4702,6 +4714,136 @@ fn log_selected_pipeline_elements(pipeline: &gst::Pipeline) {
                 "selected playback element"
             );
         }
+    }
+}
+
+#[derive(Default)]
+struct PlaybackStackSummary {
+    video_decoders: Vec<String>,
+    audio_decoders: Vec<String>,
+    video_sinks: Vec<String>,
+    audio_sinks: Vec<String>,
+    hardware_video_decoders: Vec<String>,
+}
+
+fn playback_element_label(element: &gst::Element, factory: &gst::ElementFactory) -> String {
+    format!("{}({})", factory.name(), element.name())
+}
+
+fn playback_stack_summary(pipeline: &gst::Pipeline) -> PlaybackStackSummary {
+    let mut summary = PlaybackStackSummary::default();
+    for result in pipeline.iterate_recurse() {
+        let Ok(element) = result else {
+            continue;
+        };
+        let Some(factory) = element.factory() else {
+            continue;
+        };
+        let Some(klass) = factory.metadata(gst::ELEMENT_METADATA_KLASS) else {
+            continue;
+        };
+        let classes: Vec<&str> = klass.split('/').collect();
+        let is_decoder = classes.contains(&"Decoder");
+        let is_sink = classes.contains(&"Sink");
+        let is_video = classes.contains(&"Video");
+        let is_audio = classes.contains(&"Audio");
+        let is_hardware = classes.contains(&"Hardware");
+        let label = playback_element_label(&element, &factory);
+
+        if is_decoder && is_video {
+            summary.video_decoders.push(label.clone());
+            if is_hardware {
+                summary.hardware_video_decoders.push(label.clone());
+            }
+        }
+        if is_decoder && is_audio {
+            summary.audio_decoders.push(label.clone());
+        }
+        if is_sink && is_video {
+            summary.video_sinks.push(label.clone());
+        }
+        if is_sink && is_audio {
+            summary.audio_sinks.push(label);
+        }
+    }
+    summary
+}
+
+fn log_playback_stack(
+    pipeline: &gst::Pipeline,
+    clock: &gst::Clock,
+    args: &PlaybackArgs,
+    externally_driven: bool,
+) {
+    let summary = playback_stack_summary(pipeline);
+    info!(
+        video_decoders = ?summary.video_decoders,
+        audio_decoders = ?summary.audio_decoders,
+        video_sinks = ?summary.video_sinks,
+        audio_sinks = ?summary.audio_sinks,
+        hardware_video_decoders = ?summary.hardware_video_decoders,
+        hardware_video_decode = !summary.hardware_video_decoders.is_empty(),
+        hardware_policy = ?args.hwdec,
+        video_sink_override = args.video_sink.as_deref(),
+        audio_sink_override = args.audio_sink.as_deref(),
+        gpu_compositor = args.kms_gl,
+        clock = %clock.name(),
+        clock_type = %clock.type_().name(),
+        clock_resolution_ns = clock.resolution().nseconds(),
+        clock_synchronized = clock.is_synced(),
+        externally_driven,
+        "playback stack selected"
+    );
+}
+
+fn log_runtime_playback_report(pipeline: &gst::Pipeline, clock: &gst::Clock, clock_healthy: bool) {
+    let summary = playback_stack_summary(pipeline);
+    info!(
+        video_decoders = ?summary.video_decoders,
+        audio_decoders = ?summary.audio_decoders,
+        video_sinks = ?summary.video_sinks,
+        audio_sinks = ?summary.audio_sinks,
+        hardware_video_decoders = ?summary.hardware_video_decoders,
+        hardware_video_decode = !summary.hardware_video_decoders.is_empty(),
+        clock = %clock.name(),
+        clock_type = %clock.type_().name(),
+        clock_time_ns = clock.time().nseconds(),
+        clock_internal_time_ns = clock.internal_time().nseconds(),
+        clock_resolution_ns = clock.resolution().nseconds(),
+        clock_synchronized = clock.is_synced(),
+        clock_healthy,
+        "playback clock status"
+    );
+
+    for result in pipeline.iterate_recurse() {
+        let Ok(element) = result else {
+            continue;
+        };
+        let Some(factory) = element.factory() else {
+            continue;
+        };
+        let Some(klass) = factory.metadata(gst::ELEMENT_METADATA_KLASS) else {
+            continue;
+        };
+        let classes: Vec<&str> = klass.split('/').collect();
+        if !classes.contains(&"Video")
+            || !classes.contains(&"Sink")
+            || element.find_property("stats").is_none()
+        {
+            continue;
+        }
+        let value = element.property_value("stats");
+        let Ok(stats) = value.get::<gst::Structure>() else {
+            continue;
+        };
+        info!(
+            element = %element.name(),
+            factory = %factory.name(),
+            rendered_frames = stats.get::<u64>("rendered").ok(),
+            dropped_frames = stats.get::<u64>("dropped").ok(),
+            average_rate = stats.get::<f64>("average-rate").ok(),
+            "video sink frame statistics"
+        );
     }
 }
 

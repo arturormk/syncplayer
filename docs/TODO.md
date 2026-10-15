@@ -1,4 +1,7 @@
-The repository has a solid synchronization prototype, but it is not yet the complete player described by the blueprint. The clock/recovery, configuration, subscription, and authoritative transport layers are comparatively advanced; the production state protocol, events, and installation controls are the main missing layers.
+The repository has implemented the core V1 configuration, playback, synchronization, state
+protocol, event, and installation-control layers described by the blueprint. The remaining work is
+primarily physical validation, unattended-operation hardening, platform qualification, and
+deployment support.
 
 I treated explicitly optional/future items and the V1 exclusions in BLUEPRINT.md (docs/BLUEPRINT.md:3061) as non-blocking.
 
@@ -177,11 +180,15 @@ Implement/test:
 
 - Ubuntu x86-64 and Raspberry Pi AArch64 hardware decoding/output.
 - Display selection across the supported Wayland/X11/DRM deployment paths.
-- Hours/days of loop and reconnect soak testing, including memory and resource monitoring.
+- [x] Repeatable CPU, memory, thread, file-descriptor, and I/O sampling in the Master and Slave
+  test launchers.
+- Hours/days of loop and reconnect soak testing using the resource sampler; qualification results
+  still need to be recorded.
 - Graceful SIGINT/SIGTERM shutdown.
 - Clean shutdown of listeners, subscriber tasks, event workers, sockets, and pipelines.
 - Packaging or a clearly supported native runtime bundle.
-- Better runtime reporting for decoder, sinks, clock, dropped frames, and hardware acceleration.
+- [x] Structured startup reporting for decoder, sinks, clock, and hardware acceleration, plus
+  periodic clock health and video-sink rendered/dropped-frame statistics.
 
 Quickstart scripts and media preparation are already present, but Phase 8 and long-duration qualification remain incomplete (BLUEPRINT.md (docs/BLUEPRINT.md:3282)).
 
@@ -216,5 +223,6 @@ The following should be evolved rather than rebuilt:
 - Multiple concurrent Slaves.
 - Linux/Pi build assistance and media-normalization tooling.
 
-All current unit tests pass. The next implementation milestone is the production state protocol,
-followed by local playback/output completion and host-local timed events.
+The next milestone is physical and long-duration qualification, supported by lifecycle hardening
+and operational diagnostics. Optional deployment modes remain deferred until unicast V1 has been
+validated on representative installation hardware.

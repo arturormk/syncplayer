@@ -16,13 +16,15 @@ Arguments:
   PROGRAM         Path to the program.toml file
 
 Options:
-      --debug     Enable debug-level Syncplayer logging
-  -h, --help      Show this help text and exit
+      --debug                        Enable debug-level Syncplayer logging
+      --resource-interval <SECONDS>  Sampling interval (default: 1)
+  -h, --help                         Show this help text and exit
 
 The clock port is the master port plus one. The installation console listens
 on 127.0.0.1:2323. The tool writes GStreamer logs to gstreamer.log, combined
-player output to master.log, and synchronization diagnostics to output.csv in
-the current directory.
+player output to master.log, synchronization diagnostics to output.csv, and
+CPU/memory/thread/file-descriptor/I/O samples to master-resources.csv in the
+current directory.
 
 The tool automatically selects a release build for the native target, falling
 back to a native debug build.
@@ -78,6 +80,7 @@ main() {
     local program
     local debug=false
     local rust_log=syncplayer=warn
+    local resource_interval=1
     local port
     local port_number
     local clock_port
@@ -90,6 +93,11 @@ main() {
     while (($# > 0)); do
         case "$1" in
             --debug) debug=true ;;
+            --resource-interval)
+                (($# >= 2)) || die 'Missing value for --resource-interval.'
+                resource_interval=$2
+                shift
+                ;;
             -h | --help)
                 usage
                 return 0
@@ -142,15 +150,18 @@ main() {
     printf 'Program:     %s\n' "$program"
     printf 'Console:     127.0.0.1:2323\n'
     printf 'Rust log:    %s\n' "$rust_log"
-    printf 'Logs:        %s/gstreamer.log, %s/master.log, and %s/output.csv\n\n' \
-        "$PWD" "$PWD" "$PWD"
+    printf 'Resources:   every %ss\n' "$resource_interval"
+    printf 'Logs:        %s/gstreamer.log, %s/master.log, %s/output.csv, and %s/master-resources.csv\n\n' \
+        "$PWD" "$PWD" "$PWD" "$PWD"
 
     GST_DEBUG_NO_COLOR=1 \
     GST_DEBUG_FILE="$PWD/gstreamer.log" \
     GST_DEBUG='2' \
     RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
-    "$syncplayer" \
+    "$PROJECT_ROOT/tools/run-with-resource-sampling.sh" \
+        master-resources.csv "$resource_interval" -- \
+        "$syncplayer" \
         master \
         --bind "$master" \
         --clock-port "$clock_port" \
