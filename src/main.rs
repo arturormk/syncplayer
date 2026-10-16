@@ -40,7 +40,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MASTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REJOIN_PREPARATION_TIMEOUT: Duration = Duration::from_secs(95);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
-const PLAYBACK_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const PLAYBACK_REPORT_INTERVAL: Duration = Duration::from_mins(1);
 const DRIFT_WARN_THRESHOLD_NS: u128 = 100_000_000;
 const DRIFT_REPAIR_THRESHOLD_NS: u128 = 250_000_000;
 const DRIFT_REQUIRED_SAMPLES: u32 = 3;
@@ -5575,7 +5575,7 @@ mod tests {
         let Command::Master(args) = cli.command else {
             panic!("expected Master command");
         };
-        assert_eq!(args.playback.gain_db, 3.0);
+        assert!((args.playback.gain_db - 3.0).abs() < f64::EPSILON);
         assert!(args.playback.fullscreen);
         assert_eq!(args.playback.fit, FitMode::Cover);
         assert_eq!(args.playback.clock, ClockPolicy::Audio);

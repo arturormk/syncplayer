@@ -136,7 +136,7 @@ mod tests {
     fn accepts_human_friendly_times() {
         assert_eq!(parse_time("1.5").unwrap(), Duration::from_millis(1500));
         assert_eq!(parse_time("250ms").unwrap(), Duration::from_millis(250));
-        assert_eq!(parse_time("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_time("2m").unwrap(), Duration::from_mins(2));
         assert_eq!(parse_time("1:02.5").unwrap(), Duration::from_millis(62_500));
         assert_eq!(parse_time("1:02:03").unwrap(), Duration::from_secs(3723));
     }

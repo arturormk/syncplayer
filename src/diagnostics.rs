@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(summary.valid_samples, 2);
         assert_eq!(summary.minimum_error_ns, 10);
         assert_eq!(summary.maximum_error_ns, 20);
-        assert_eq!(summary.mean_error_ns, 15.0);
+        assert!((summary.mean_error_ns - 15.0).abs() < f64::EPSILON);
         assert!(summary.rate_error_ppm.is_none());
 
         hub.record("left", sample(4_000_000_000, 1_000_020))

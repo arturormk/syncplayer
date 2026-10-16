@@ -803,7 +803,7 @@ payload_hex = "01 02 ff"
             Path::new("/shows/demo/media/intro.mp4")
         );
         assert!(!resolved.cues[0].mute);
-        assert_eq!(resolved.cues[1].gain_db, 1.5);
+        assert!((resolved.cues[1].gain_db - 1.5).abs() < f64::EPSILON);
         assert_eq!(
             resolved.cues[1].events[0].timing,
             EventTiming::BeforeEnd(62_500_000_000)
