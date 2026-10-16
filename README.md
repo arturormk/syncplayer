@@ -8,13 +8,11 @@ decodes independent local media against one Master-derived timeline. The accepte
 recorded in [`docs/adr/`](docs/adr/); [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) provides the broader
 design context.
 
-The repository currently contains a risk-reduction prototype, not the production player. It proves
-that Linux pipelines can use one exported monotonic clock, join at a future clock release, detect a
-stalled Master control process, refresh authoritative transport state, and repair sustained local
-drift. The production state protocol now separates bounded binary TCP control, UDP snapshots, and
-clock synchronization. Local playback uses `playbin3`'s coordinated gapless handoff for ordinary
-embedded-audio media, and synchronized `uridecodebin3` video/audio branches when a program maps
-external cue audio.
+The repository contains an MVP-complete v1.0 candidate. It provides the versioned shared program
+model, validation, synchronized local playback, authoritative transport, host-local events,
+installation controls, centralized diagnostics, and lifecycle handling described below. Physical
+hardware, endurance, and deployment qualification remain in progress; see
+[`docs/TODO.md`](docs/TODO.md).
 
 ## Prerequisites
 
@@ -263,6 +261,26 @@ recoveries, unhealthy-clock periods, or transitions. The optional CSV log flushe
 long-running physical tests retain useful evidence after an abnormal exit; connection and planned
 transport-rejoin events are recorded in the same file.
 
+A recovery means a corrective resynchronization after playback has started. Initial synchronized
+startup is not counted as a recovery. The CSV retains the internal monotonic recovery-attempt
+counter—whose first value is one—so offline tools can detect discontinuities; the console and
+analyzer subtract that initial preparation when presenting recovery totals.
+
+Analyze the complete CSV after or during a run with:
+
+```sh
+python3 tools/analyze-diagnostics.py output.csv --settle-seconds 5
+```
+
+The primary statistics use the same validity rule as the console: the pipeline must be playing,
+outside a declared transition, with a healthy clock. The report adds signed and absolute averages,
+standard deviation, absolute-error percentiles and threshold counts, current rate error, lifecycle
+events, and the worst samples with cue/transition context. It also interpolates neighboring samples
+onto common clock instants to report pairwise player separation directly. The optional settling
+population excludes a stated interval after transitions or other discontinuities, is reported
+separately, and never hides the unfiltered worst cases. The default 40 ms threshold is one frame for
+25 fps test media; override or repeat `--threshold-ms` for other frame rates.
+
 ### Logging
 
 Set `RUST_LOG` to control diagnostic output. Normal operation defaults to informational messages;
@@ -348,7 +366,7 @@ acceptance criteria, and known boundaries.
 
 ## Contributing
 
-This is an early-stage project, but focused bug reports and pull requests are welcome. Read
+This is a release-candidate project, and focused bug reports and pull requests are welcome. Read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) before proposing a change. Security issues should be reported
 privately as described in [`SECURITY.md`](SECURITY.md).
 

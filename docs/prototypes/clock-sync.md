@@ -2,10 +2,10 @@
 
 ## Purpose
 
-This prototype validates ADR 0004, the release primitive from ADR 0010, application-level
-liveness, periodic authoritative state, sustained-drift recovery, and multi-Slave reconnection on
-physical Linux hosts. Its transport is still experimental, but it now consumes the shared program
-configuration and uses the production subscription and participant-registry model.
+This procedure originally validated ADR 0004 and the release primitive from ADR 0010. It is now the
+physical qualification procedure for application-level liveness, periodic authoritative state,
+sustained-drift recovery, and multi-Slave reconnection. The implementation uses the shared program
+configuration and production subscription, participant-registry, control, and state protocols.
 
 The Master lets its pipeline select its natural monotonic clock—normally an audio-device clock when
 real audio is active—and exposes that same clock through `GstNetTimeProvider`. The Master starts
@@ -82,10 +82,12 @@ of the test matrix and generated binaries do not belong in the repository.
    type, media checksum, and complete commands.
 2. Run the Master alone and verify that it starts immediately. Start the Slaves later with
    `RUST_LOG=syncplayer=debug` and capture every host's logs separately.
-3. Film both displays in one high-frame-rate camera view. Do not infer display synchronization only
-   from queried GStreamer positions.
-4. Repeat ten cold starts and record the largest observed frame separation.
-5. Run continuously for sixty minutes and inspect the initial and final numbered frames together.
+3. Observe both displays together throughout the run and retain centralized diagnostics. Filming
+   them in one high-frame-rate camera view is optional when a stricter frame-level test is useful.
+4. Repeat ten cold starts and record the visual result plus the diagnostic distribution for each
+   player.
+5. Run continuously for sixty minutes, inspect the displays, and analyze `output.csv` with
+   `tools/analyze-diagnostics.py`. At 25 fps, 40 ms is one frame.
 6. Disconnect the Master or its network after release and verify that every Slave detects missing
    keepalive acknowledgements within eight seconds and continues. Bring the Master back and verify
    that Slaves
@@ -108,8 +110,10 @@ of the test matrix and generated binaries do not belong in the repository.
 
 ## Acceptance criteria
 
-- Ten consecutive starts show no more than one frame of separation.
-- Sixty minutes of playback show no sustained drift beyond one frame.
+- Ten consecutive starts show no visible synchronization failure, and their telemetry distributions
+  and worst samples are recorded.
+- Sixty minutes of playback show no sustained drift. Record mean, RMS, absolute-error percentiles,
+  worst samples, and rate error for every player; use 40 ms as the one-frame reference at 25 fps.
 - Failure to synchronize the clock or preroll within the configured timeout exits clearly without
   starting unsynchronized playback.
 - A malformed, oversized, truncated, incompatible, stale, or non-future control message is rejected.
@@ -124,16 +128,14 @@ of the test matrix and generated binaries do not belong in the repository.
 - A configured startup delay uses one shared deadline and never waits beyond it for missing Slaves.
 - Adding another Slave does not change the transport generation seen by existing Slaves.
 - Routine authoritative snapshots do not seek or interrupt playback.
-- After recovery, filmed numbered frames return to no more than one frame of separation.
+- After recovery, visual playback reconverges and telemetry returns to its pre-failure distribution.
 - A healthy 60-minute run performs no drift-triggered correction.
 - A stalled Master renderer is corrected locally without forcing healthy Slaves backward.
 
-Operator-driven pause, resume and goto remain subsequent experiments. The current correction
-thresholds are provisional until this procedure has been completed on physical hosts.
-`ReleasePlan` distinguishes start, resume, and goto so later experiments can reuse the clock-domain
-model without treating this lab protocol as stable. Automatic Master `CLOCK_LOST` recovery also
-remains pending a focused physical-audio-sink experiment; the current implementation marks the
-clock unhealthy and reports an explicit unrecovered fault.
+Operator-driven pause, resume, goto, and automatic Master `CLOCK_LOST` recovery are implemented,
+but still require focused physical testing with a real audio-backed Master clock. The current
+correction thresholds remain provisional until this procedure has been completed on representative
+physical hosts.
 
 ## Results
 

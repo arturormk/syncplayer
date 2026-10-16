@@ -29,6 +29,26 @@ Media is never streamed from the Master to the Slaves.
 
 The network carries synchronization, control, clock, health, and installation-debug information only.
 
+## 1.1 Current implementation and release boundary
+
+This blueprint is the architectural specification, not the live backlog. The release checklist and
+qualification record live in [`TODO.md`](TODO.md).
+
+As of 2026-10-16, development phases 1–7 are implemented: local playback, the shared program
+model, Master/Slave clock synchronization, the production control/state protocol, authoritative
+cue transitions, host-local events, and the installation console. Phase 8—platform hardening—is
+in progress.
+
+For the first MVP, the implemented unicast topology, one startup-supplied program, explicit Master
+addressing, and opt-in unauthenticated installation console are sufficient. The optional features
+listed in section 103 and the later enhancements described elsewhere in this document do not block
+the MVP or v1.0.
+
+The remaining release work is qualification and deployment rather than another playback feature
+milestone: demonstrate synchronization and recovery on representative physical hosts, establish
+that resource use is bounded during an endurance run, qualify the promised Linux/Raspberry Pi
+output paths, and document a reproducible installation/runtime strategy.
+
 ---
 
 # 2. Core Design Principles
@@ -3175,6 +3195,10 @@ join synchronized playback
 
 # 107. Recommended Development Phases
 
+At the current repository state, phases 1–7 are implemented and phase 8 is the active release
+workstream. The lists below retain the intended delivery order and are not a substitute for the
+current checklist in [`TODO.md`](TODO.md).
+
 ## Phase 1 — Local Playback
 
 Implement:
@@ -3309,6 +3333,15 @@ Watch for:
 - decoder instability.
 
 The system is intended for unattended installations and must survive repeated looping.
+
+An endurance run is not considered successful merely because video is still advancing. Record the
+software revision, host and media details, commands, elapsed time, playlist iterations, clean
+shutdown result, and the generated diagnostic/resource logs. Review those logs for bounded memory,
+thread and file-descriptor use, drift corrections, disconnects, recoveries, frame drops, and error
+events. A rising metric must either reach a defensible plateau or be investigated before release.
+
+The first v1.0 candidate should complete at least one overnight multi-host run on representative
+deployment hardware. Longer runs remain desirable for installation qualification.
 
 ---
 

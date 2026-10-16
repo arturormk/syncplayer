@@ -20,6 +20,7 @@ pub struct DiagnosticSummary {
     /// Error slope relative to shared-clock elapsed time. 1000 ppm is 0.1%.
     pub rate_error_ppm: Option<f64>,
     pub disconnect_count: u64,
+    /// Corrective resynchronizations after initial startup synchronization.
     pub recovery_count: u64,
     pub pipeline_playing: bool,
     pub transition_in_progress: bool,
@@ -133,7 +134,8 @@ impl Series {
             },
             rate_error_ppm,
             disconnect_count: self.latest.disconnect_count,
-            recovery_count: self.latest.recovery_count,
+            // Attempt 1 prepares initial playback and is synchronization, not recovery.
+            recovery_count: self.latest.recovery_count.saturating_sub(1),
             pipeline_playing: self.latest.pipeline_playing,
             transition_in_progress: self.latest.transition_in_progress,
             clock_healthy: self.latest.clock_healthy,
@@ -307,6 +309,20 @@ mod tests {
         let summary = hub.summaries().unwrap().remove(0);
         assert_eq!(summary.samples, 2);
         assert!(summary.rate_error_ppm.is_none());
+    }
+
+    #[test]
+    fn summary_excludes_initial_synchronization_from_recoveries() {
+        let hub = DiagnosticsHub::new(None).unwrap();
+        let mut initial = sample(1, 0);
+        initial.recovery_count = 1;
+        hub.record("left", initial).unwrap();
+        assert_eq!(hub.summaries().unwrap()[0].recovery_count, 0);
+
+        let mut recovered = sample(2, 0);
+        recovered.recovery_count = 2;
+        hub.record("left", recovered).unwrap();
+        assert_eq!(hub.summaries().unwrap()[0].recovery_count, 1);
     }
 
     #[test]

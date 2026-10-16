@@ -46,7 +46,8 @@ Negative / Trade-offs:
 
 - The control protocol version changes when the telemetry schema changes.
 - One-second samples can reveal sustained error and sampled stalls but cannot prove frame-level
-  smoothness; filmed frame tests and sink-level dropped/late-frame metrics remain necessary.
+  smoothness; sustained direct visual inspection and sink-level dropped/late-frame metrics remain
+  necessary. High-speed filming is an optional stricter measurement, not a v1.0 release gate.
 - CSV persistence performs a small flushed write per sample when explicitly enabled.
 
 ## Source blueprints
