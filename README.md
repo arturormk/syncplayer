@@ -22,10 +22,10 @@ external cue audio.
 - GStreamer 1.20 or newer, including base/playback, pbutils, network, and GL libraries
 - GStreamer plugins needed to decode the chosen test media and drive the selected sinks
 
-On Ubuntu, development packages typically include `libgstreamer1.0-dev` and
-`libgstreamer-plugins-base1.0-dev`. Runtime plugin selection depends on the media and machine.
-The Raspberry Pi GPU-composited KMS mode additionally needs `gstreamer1.0-gl` and Mesa's EGL/GBM
-runtime libraries.
+On Ubuntu, install `libgstreamer1.0-dev`, `libgstreamer-plugins-base1.0-dev`, and
+`gstreamer1.0-x`; the last package provides the `timeoverlay` element used by the diagnostic OSD.
+Runtime plugin selection otherwise depends on the media and machine. The Raspberry Pi
+GPU-composited KMS mode additionally needs `gstreamer1.0-gl` and Mesa's EGL/GBM runtime libraries.
 
 ## Quickstart
 
