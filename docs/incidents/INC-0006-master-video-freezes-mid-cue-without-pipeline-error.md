@@ -116,6 +116,13 @@ endurance run. It may then be marked Resolved.
   monotonic, and neither watchdog may exit.
 - A forced hard Master error above 250 ms must recover through an in-place seek while the Slave
   continues rendering.
+- A 2026-10-16/17 four-Raspberry-Pi soak reached 17.62 observed hours and 645 iterations, with
+  17.16 hours and 629 iterations in the copied logs, without a Master freeze, hard correction,
+  unhealthy clock, or watchdog exit. Its Master selected
+  `GstSystemClock`, with no audio decoder or audio sink, so the run is strong evidence for sustained
+  system-clock playback but does not satisfy the required audio-backed Master-clock verification
+  above. See the
+  [`soak report`](../reports/2026-10-17-four-raspberry-pi-soak-test.md).
 
 ## Prevention and guardrails
 

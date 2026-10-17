@@ -34,7 +34,7 @@ The network carries synchronization, control, clock, health, and installation-de
 This blueprint is the architectural specification, not the live backlog. The release checklist and
 qualification record live in [`TODO.md`](TODO.md).
 
-As of 2026-10-16, development phases 1–7 are implemented: local playback, the shared program
+As of 2026-10-17, development phases 1–7 are implemented: local playback, the shared program
 model, Master/Slave clock synchronization, the production control/state protocol, authoritative
 cue transitions, host-local events, and the installation console. Phase 8—platform hardening—is
 in progress.
@@ -45,9 +45,13 @@ listed in section 103 and the later enhancements described elsewhere in this doc
 the MVP or v1.0.
 
 The remaining release work is qualification and deployment rather than another playback feature
-milestone: demonstrate synchronization and recovery on representative physical hosts, establish
-that resource use is bounded during an endurance run, qualify the promised Linux/Raspberry Pi
-output paths, and document a reproducible installation/runtime strategy.
+milestone. A four-Raspberry-Pi topology has demonstrated excellent synchronization and bounded
+resources during a 17.62-hour observed steady-state run with 17.16 hours of analyzed evidence,
+documented in
+[`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
+The unexplained first-start player04 SIGSEGV, deliberate recovery testing, the Master's
+launcher-mediated SIGPIPE on Ctrl-C, complete platform qualification, and a reproducible
+installation/runtime strategy remain open.
 
 ---
 
@@ -3342,6 +3346,14 @@ events. A rising metric must either reach a defensible plateau or be investigate
 
 The first v1.0 candidate should complete at least one overnight multi-host run on representative
 deployment hardware. Longer runs remain desirable for installation qualification.
+
+The 2026-10-16/17 four-Raspberry-Pi run supplies the first overnight steady-state result: 17.62
+observed hours and 645 iterations, including 17.16 hours and 629 iterations in the analyzed
+artifact set; no corrective recovery or steady-state disconnect, sub-millisecond
+pairwise p99 separation, and bounded resources. It does not fully close this requirement because
+one Slave's first launch segfaulted without retained crash evidence and Ctrl-C ended the Master
+with SIGPIPE instead of a clean exit. See the
+[`dated report`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
 
 ---
 

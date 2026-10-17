@@ -1,6 +1,6 @@
 # MVP and v1.0 release checklist
 
-Last reviewed: 2026-10-16.
+Last reviewed: 2026-10-17.
 
 Syncplayer is feature-complete for the MVP described by [`BLUEPRINT.md`](BLUEPRINT.md). The core
 configuration, playback, synchronization, state protocol, event, diagnostic, and installation
@@ -14,48 +14,75 @@ explicit V1 exclusions in blueprint section 103 are non-blocking.
 - **MVP feature scope:** complete.
 - **Automated checks:** 71 tests pass on the current revision; CI also checks formatting, all
   targets, and Clippy.
-- **Endurance:** in progress. On 2026-10-16 the current physical run passed 402 playlist iterations
-  and continued playing. It required one corrective Slave resynchronization after roughly 5.5
-  hours while the laptop Master was also exposed to screen locking and desktop power management.
-  This is encouraging evidence, not a completed result: stop/shutdown and final log analysis still
-  need to be recorded.
+- **Endurance:** the four-Raspberry-Pi production-topology run was observed for 17.62 hours and 645
+  playlist iterations; the copied diagnostics/resources cover 17.16 hours and 629 iterations.
+  It produced excellent steady-state results: no corrective recovery, no
+  steady-state disconnect, no unhealthy clock, no process exit after successful startup, bounded
+  resources, and no valid or pairwise diagnostic error above 4.5 ms. The first player04 launch did
+  terminate with an unexplained SIGSEGV before the operator manually restarted the unchanged
+  program. Ctrl-C later ended the Master with `syncplayer=141` rather than a clean exit, while
+  all three Slaves returned zero; player04 had also continued free-running after Master loss. See
+  [`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
 - **v1.0 readiness:** release candidate, pending the P0 gates below.
 
 ## P0 — v1.0 release gates
 
-### Finish and evaluate the endurance run
+### Close the remaining endurance qualification gaps
 
-- [ ] Let the current run reach its chosen end condition and verify graceful shutdown.
-- [ ] Record revision, host/platform details, media and commands, elapsed time, playlist iteration
-  count, disconnect/recovery count, and any warnings or corrections.
-- [ ] Archive or summarize the Master/Slave logs, diagnostics CSV, and resource CSVs in a dated
+- [x] Complete an overnight production-topology run. Four Raspberry Pis were observed for 17.62
+  hours and 645 playlist iterations; the copied analyzable artifacts cover 17.16 hours and 629
+  iterations, and the successful processes stayed alive throughout playback.
+- [x] Record commands, elapsed time, playlist iterations, disconnect/recovery counts, warnings,
+  synchronization distributions, GStreamer messages, and resource behavior in a dated
   qualification record.
-- [ ] Explain or fix the observed memory profile before release. At the 402-iteration checkpoint,
-  the available Master resource log had reached roughly 1.36 GiB RSS (about 1.40 GiB peak) after
-  approximately 11 hours. It appeared broadly flat over the last four hours, and thread/file
-  descriptor counts were stable, but the earlier growth is too large to ignore without a baseline
-  comparison and a documented plateau.
-- [ ] Review diagnostic outliers rather than judging only visible playback. Confirm that large
-  errors correspond to expected startup/recovery events or investigate them.
+- [x] Archive or summarize the Master/Slave logs, diagnostics CSV, and resource CSVs. The report
+  also identifies the four stale `sampling.csv` files and excludes them from its conclusions.
+- [x] Analyze the complete centralized diagnostics rather than relying on visible playback. Across
+  227,615 samples, individual RMS error was 0.099–0.133 ms, pairwise p99 was at most 0.384 ms,
+  the worst valid pairwise estimate was 4.414 ms, and no sample exceeded the 40 ms one-frame
+  reference threshold.
+- [x] Establish a bounded resource profile for the four-Pi topology. Final RSS was
+  133.4–141.6 MiB; only 0.23–0.31 MiB was added from hour 8 to hour 17; thread, descriptor, and
+  virtual-memory counts remained bounded. The earlier approximately 1.36 GiB laptop-Master result
+  did not recur on this topology and remains relevant if Ubuntu x86-64 is claimed for v1.0.
+- [ ] Record the tested Git revision, exact Pi models, OS/GStreamer versions, media checksums, and
+  display/audio topology. The launch commands and Raspberry Pi OS Lite/Debian 13 family are known,
+  but the full reproducibility manifest is incomplete.
+- [ ] Fix and requalify launcher-mediated shutdown. Ctrl-C ended the Master with
+  `syncplayer=141 tee=130`, so its shutdown was not clean. Players 02, 03, and 04 all returned
+  `syncplayer=0`; the Slave process-exit check therefore passes. Verify that the Master reaches
+  `shutdown complete` and returns zero through the test launcher.
+- [ ] Reproduce or otherwise explain the first player04 startup SIGSEGV. The failed PID 936 left no
+  core dump, and the manual retry overwrote its local logs. The second process used the unchanged
+  `program.toml` and then ran for the full soak.
+- [ ] Change the physical-test launchers to preserve each invocation in a unique timestamped log
+  directory so a retry cannot destroy crash evidence.
 
-Passing criterion: playback and shutdown remain correct, no unexplained error/recovery loop occurs,
-and memory, threads, descriptors, and I/O are bounded rather than growing per playlist iteration.
+Passing criterion: playback and shutdown remain correct, no unexplained crash or error/recovery
+loop occurs, and memory, threads, descriptors, and I/O are bounded rather than growing per
+playlist iteration.
 The practical installation target is a 12-hour operating day without a crash and no more than one
 corrective resynchronization per hour, with one per two hours or less preferred. Initial
-synchronization is never counted as a recovery.
+synchronization is never counted as a recovery. The 2026-10-16/17 run passes the sustained-playback,
+synchronization, and resource portions but does not close this gate because startup crashed once
+and Master shutdown through the launcher failed with SIGPIPE.
 
 ### Complete synchronization and recovery qualification
 
-- [ ] Record sustained multi-host visual inspection and analyze `output.csv` with
-  `tools/analyze-diagnostics.py`; filming displays is optional rather than a v1.0 gate.
+- [x] Record sustained multi-host visual inspection and analyze `output.csv` with
+  `tools/analyze-diagnostics.py`; the four-Pi soak remained visually flawless and its full
+  distributions are in the dated report. Filming displays remains optional rather than a v1.0 gate.
 - [ ] For at least ten cold starts and a 60-minute continuous run, record signed mean, RMS,
   absolute-error percentiles, worst samples, rate error, disconnects, and recoveries for every
   player. At 25 fps, use 40 ms as the one-frame reference threshold.
-- [ ] Exercise same-file, A→B, and playlist-wrap transitions with equal-duration host-local
-  renditions.
+- [x] Exercise A→B transitions and playlist wrap with equal-duration host-local renditions. The
+  three-cue soak completed 629 wraps without a steady-state failure.
+- [ ] Exercise the focused same-file transition case.
 - [ ] Exercise the supported codec, resolution, frame-rate, and audio-format transition matrix.
 - [ ] Test TCP/state/clock network loss separately, Master restart, late Slave join, and one Slave
-  restarting without disturbing the others.
+  restarting without disturbing the others. The final shutdown supplied limited supporting
+  evidence—player04 remained free-running for at least approximately 40 seconds after the Master
+  exited—but did not exercise separated failure modes or successful reconnection.
 - [ ] Test CPU/I/O pressure and an injected sustained-drift recovery.
 - [ ] Test a real audio-backed Master clock and automatic `CLOCK_LOST` recovery.
 - [ ] Record measured transition limits and either confirm or revise the duration and drift
@@ -68,14 +95,21 @@ cannot observe.
 
 ### Qualify the promised platforms and output paths
 
-- [ ] Run the final 12-hour production-topology soak on four Raspberry Pis: one Master and three
-  Slaves. Apply the same crash, recovery-frequency, resource, and diagnostics criteria used above.
+- [x] Run at least 12 hours on the production topology of four Raspberry Pis: one Master and three
+  Slaves. The 2026-10-16/17 run supplied 17.62 observed hours and 17.16 hours of archived,
+  analyzed steady-state evidence.
+- [ ] Close the production-topology soak exceptions: explain the player04 startup SIGSEGV and
+  fix the Master's launcher-mediated SIGPIPE on Ctrl-C, then verify its clean shutdown. All three
+  Slaves already return zero on Ctrl-C.
+  Until then, the run is a steady-state pass rather than final platform acceptance.
 - [ ] Qualify Ubuntu x86-64 with the intended display server, sinks, decoder, and audio device.
 - [ ] Qualify Raspberry Pi AArch64 hardware decoding and the intended Wayland or direct KMS/GL
   output path.
 - [ ] Verify fullscreen and display/connector selection on the actual deployment topology.
 - [ ] Record selected decoders/sinks, negotiated memory path, rendered/dropped frames, and known
-  platform limitations.
+  platform limitations. The soak confirms `v4l2h264dec` hardware decode, automatic `glimagesink`
+  output, and 20–36 sparse QoS-drop messages per host, but the complete platform manifest and
+  negotiated memory path remain to be recorded.
 
 Only output paths actually tested should be described as supported in the v1.0 release notes.
 

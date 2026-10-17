@@ -1,6 +1,6 @@
 # Syncplayer v1.0 release checklist
 
-Last reviewed: 2026-10-16.
+Last reviewed: 2026-10-17.
 
 Syncplayer is an MVP-complete v1.0 release candidate. No additional playback, synchronization,
 transport, event, console, diagnostic, or shutdown feature is currently required for v1.0. The
@@ -21,32 +21,55 @@ otherwise, do not expand the feature set before release.
 - [x] Graceful SIGINT/SIGTERM shutdown and playback-stall watchdog behavior are implemented.
 - [ ] Physical qualification and release preparation below are complete.
 
-## 1. Complete and evaluate the four-Raspberry-Pi soak
+The 2026-10-16/17 four-Raspberry-Pi soak is documented in
+[`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
+It is a strong 17.62-hour observed steady-state pass with 17.16 hours of copied diagnostic and
+resource evidence, but it is not final acceptance because player04's first launch segfaulted
+without a retained core or log and Ctrl-C ended the Master with SIGPIPE.
 
-The weekend run should use the intended production topology of one Master and three Slaves. A run
-does not pass merely because the displays continue advancing.
+## 1. Close the remaining four-Raspberry-Pi soak items
 
-- [ ] Record the tested Git revision, Pi models, OS and GStreamer versions, media checksums,
-  display/audio topology, and complete launch commands.
-- [ ] Record elapsed time, playlist iterations, disconnects, corrective recoveries, watchdog exits,
-  and warnings for every player.
-- [ ] Stop every process normally and verify that each log ends with `shutdown complete`.
-- [ ] Archive or summarize the Master/Slave logs, diagnostics CSV, and resource CSVs in a dated
+The run used the intended production topology of one Master and three Slaves. A run does not pass
+merely because the displays continue advancing.
+
+- [ ] Record the tested Git revision, Pi models, OS and GStreamer versions, media checksums, and
+  display/audio topology.
+- [x] Record complete launch commands. The Master used
+  `tools/test-master.sh --debug 192.168.1.18:46000 __stuff/videos/program.toml`; Slaves used
+  `tools/test-slave.sh 192.168.1.18:46000 __stuff/videos/program.toml`.
+- [x] Record elapsed time, playlist iterations, disconnects, corrective recoveries, watchdog exits,
+  and warnings for every player. The successful processes were observed for 17.62 hours and 645
+  iterations; the copied evidence covers 17.16 hours and 629 iterations with no corrective
+  recovery, unhealthy clock, watchdog exit, or steady-state disconnect.
+- [ ] Stop every process normally and verify that each log ends with `shutdown complete`. The
+  Master currently fails this item (`syncplayer=141 tee=130` after Ctrl-C). Players 02, 03, and 04
+  all returned `syncplayer=0`, so the Slave process-exit portion passes; retain explicit
+  `shutdown complete` evidence when rechecking the Master launcher.
+- [x] Archive or summarize the Master/Slave logs, diagnostics CSV, and resource CSVs in a dated
   qualification record.
-- [ ] Run `tools/analyze-diagnostics.py` on the complete diagnostics CSV and review signed mean,
+- [x] Run `tools/analyze-diagnostics.py` on the complete diagnostics CSV and review signed mean,
   RMS, absolute-error percentiles, worst samples, rate error, disconnects, and recoveries for every
   player.
-- [ ] Confirm that diagnostic outliers correspond to expected startup, transition, or recovery
+- [x] Confirm that diagnostic outliers correspond to expected startup, transition, or recovery
   activity; investigate unexplained outliers.
-- [ ] Confirm that RSS, threads, file descriptors, and I/O are bounded rather than growing per
+- [x] Confirm that RSS, threads, file descriptors, and I/O are bounded rather than growing per
   playlist iteration.
-- [ ] Explain or fix any recurrence of the previously observed high memory profile (approximately
-  1.36 GiB RSS after 11 hours on the Master), including evidence of a stable plateau if accepted.
+- [x] Check for recurrence of the previously observed high memory profile. It did not recur on the
+  four-Pi topology: final RSS was 133.4–141.6 MiB and late-run growth flattened to 0.23–0.31 MiB
+  over the final nine hours. The earlier approximately 1.36 GiB laptop-Master profile must still be
+  addressed if Ubuntu x86-64 is included in the supported v1.0 platforms.
 - [ ] Confirm no crash, unrecovered freeze, or unexplained reconnect/recovery loop occurred.
+- [ ] Reproduce or explain player04's first-start SIGSEGV. PID 936 connected briefly, exited 139,
+  and was manually replaced 46.6 seconds later. The replacement used the same unchanged program
+  file and ran normally, but its launch overwrote the failed invocation's local evidence.
+- [ ] Preserve every test invocation in a unique timestamped directory and enable crash capture
+  before repeating startup qualification.
 
 Minimum acceptance target: at least 12 hours, no crash, clean shutdown, and no more than one
 corrective resynchronization per hour; one per two hours or less is preferred. Initial
-synchronization is not a recovery.
+synchronization is not a recovery. The run meets the duration, steady-state synchronization,
+recovery-frequency, and resource requirements, but the startup crash and failed Master shutdown
+keep this section open.
 
 ## 2. Complete focused synchronization and recovery qualification
 
@@ -55,10 +78,13 @@ procedure and metrics in [`prototypes/clock-sync.md`](prototypes/clock-sync.md):
 
 - [ ] Complete at least ten cold starts and record the synchronization result for every player.
 - [ ] Complete and analyze a continuous 60-minute real-sink run.
-- [ ] Exercise same-file, A-to-B, and playlist-wrap transitions.
+- [x] Exercise A-to-B and playlist-wrap transitions. The three-cue program completed 629 wraps.
+- [ ] Exercise the focused same-file transition case.
 - [ ] Exercise the codec, resolution, frame-rate, audio-format, embedded-audio, and external-audio
   combinations that v1.0 will claim to support.
-- [ ] Test TCP control loss, UDP state loss, and UDP clock loss separately.
+- [ ] Test TCP control loss, UDP state loss, and UDP clock loss separately. At final shutdown,
+  player04 did remain free-running for at least approximately 40 seconds after Master loss, but
+  that combined event does not replace the separated tests or demonstrate reconnection.
 - [ ] Test Master restart, late Slave join, and one Slave restarting without disturbing the others.
 - [ ] Test CPU and I/O pressure.
 - [ ] Inject sustained drift and verify one bounded correction followed by convergence.

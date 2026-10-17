@@ -92,6 +92,13 @@ send a rate command into a queued or crossing playlist transition.
 - On 2026-10-15, the Raspberry Pi Slave ran the same looping three-video workload with
   `--drift-slew` and its real playback sinks for nearly six hours without a pipeline error or
   process crash. The previous failure normally appeared after one to two hours.
+- On 2026-10-16/17, three Raspberry Pi Slaves used `--drift-slew` for a 17.62-hour observed,
+  645-iteration four-Pi soak; copied logs cover 17.16 hours and 629 iterations. After successful
+  startup, none reported a pipeline error, process exit, corrective recovery, or steady-state
+  disconnect. This substantially exceeds the original one-to-two-hour
+  reproduction window. An unexplained SIGSEGV on player04's first launch occurred before the
+  successful soak process and left no diagnostic evidence tying it to this handoff race. See the
+  [`soak report`](../reports/2026-10-17-four-raspberry-pi-soak-test.md).
 
 ## Prevention and guardrails
 
