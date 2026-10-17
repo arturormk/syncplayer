@@ -20,8 +20,9 @@ explicit V1 exclusions in blueprint section 103 are non-blocking.
   steady-state disconnect, no unhealthy clock, no process exit after successful startup, bounded
   resources, and no valid or pairwise diagnostic error above 4.5 ms. The first player04 launch did
   terminate with an unexplained SIGSEGV before the operator manually restarted the unchanged
-  program. Ctrl-C later ended the Master with `syncplayer=141` rather than a clean exit, while
-  all three Slaves returned zero; player04 had also continued free-running after Master loss. See
+  program. The run also exposed a launcher SIGPIPE during Master shutdown; that defect has since
+  been fixed and requalified with zero Master and Slave pipeline statuses. Player04 had also
+  continued free-running after Master loss. See
   [`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
 - **v1.0 readiness:** release candidate, pending the P0 gates below.
 
@@ -48,10 +49,9 @@ explicit V1 exclusions in blueprint section 103 are non-blocking.
 - [ ] Record the tested Git revision, exact Pi models, OS/GStreamer versions, media checksums, and
   display/audio topology. The launch commands and Raspberry Pi OS Lite/Debian 13 family are known,
   but the full reproducibility manifest is incomplete.
-- [ ] Fix and requalify launcher-mediated shutdown. Ctrl-C ended the Master with
-  `syncplayer=141 tee=130`, so its shutdown was not clean. Players 02, 03, and 04 all returned
-  `syncplayer=0`; the Slave process-exit check therefore passes. Verify that the Master reaches
-  `shutdown complete` and returns zero through the test launcher.
+- [x] Fix and requalify launcher-mediated shutdown. Both launchers now keep `tee` alive during
+  SIGINT. The Master reached `shutdown complete` and returned `syncplayer=0 tee=0`; a Slave
+  retrying an unavailable Master also returned `syncplayer=0 tee=0` on Ctrl-C.
 - [ ] Reproduce or otherwise explain the first player04 startup SIGSEGV. The failed PID 936 left no
   core dump, and the manual retry overwrote its local logs. The second process used the unchanged
   `program.toml` and then ran for the full soak.
@@ -65,7 +65,7 @@ The practical installation target is a 12-hour operating day without a crash and
 corrective resynchronization per hour, with one per two hours or less preferred. Initial
 synchronization is never counted as a recovery. The 2026-10-16/17 run passes the sustained-playback,
 synchronization, and resource portions but does not close this gate because startup crashed once
-and Master shutdown through the launcher failed with SIGPIPE.
+and remains unexplained. Launcher-mediated shutdown has been requalified successfully.
 
 ### Complete synchronization and recovery qualification
 
@@ -98,10 +98,12 @@ cannot observe.
 - [x] Run at least 12 hours on the production topology of four Raspberry Pis: one Master and three
   Slaves. The 2026-10-16/17 run supplied 17.62 observed hours and 17.16 hours of archived,
   analyzed steady-state evidence.
-- [ ] Close the production-topology soak exceptions: explain the player04 startup SIGSEGV and
-  fix the Master's launcher-mediated SIGPIPE on Ctrl-C, then verify its clean shutdown. All three
-  Slaves already return zero on Ctrl-C.
-  Until then, the run is a steady-state pass rather than final platform acceptance.
+- [x] Fix the Master's launcher-mediated SIGPIPE on Ctrl-C and verify clean shutdown. The Master
+  logged `shutdown complete` and both Master and Slave launcher checks returned
+  `syncplayer=0 tee=0`.
+- [ ] Close the remaining production-topology soak exception by reproducing or explaining the
+  player04 startup SIGSEGV. Until then, the run is a steady-state pass rather than final platform
+  acceptance.
 - [ ] Qualify Ubuntu x86-64 with the intended display server, sinks, decoder, and audio device.
 - [ ] Qualify Raspberry Pi AArch64 hardware decoding and the intended Wayland or direct KMS/GL
   output path.

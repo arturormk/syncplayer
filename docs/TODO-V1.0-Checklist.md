@@ -25,7 +25,8 @@ The 2026-10-16/17 four-Raspberry-Pi soak is documented in
 [`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
 It is a strong 17.62-hour observed steady-state pass with 17.16 hours of copied diagnostic and
 resource evidence, but it is not final acceptance because player04's first launch segfaulted
-without a retained core or log and Ctrl-C ended the Master with SIGPIPE.
+without a retained core or log. The launcher SIGPIPE exposed by that run was subsequently fixed
+and requalified on the same four-Raspberry-Pi deployment.
 
 ## 1. Close the remaining four-Raspberry-Pi soak items
 
@@ -41,10 +42,10 @@ merely because the displays continue advancing.
   and warnings for every player. The successful processes were observed for 17.62 hours and 645
   iterations; the copied evidence covers 17.16 hours and 629 iterations with no corrective
   recovery, unhealthy clock, watchdog exit, or steady-state disconnect.
-- [ ] Stop every process normally and verify that each log ends with `shutdown complete`. The
-  Master currently fails this item (`syncplayer=141 tee=130` after Ctrl-C). Players 02, 03, and 04
-  all returned `syncplayer=0`, so the Slave process-exit portion passes; retain explicit
-  `shutdown complete` evidence when rechecking the Master launcher.
+- [x] Requalify launcher-mediated Ctrl-C shutdown. After changing both launchers to keep `tee`
+  alive during SIGINT, the Master logged `shutdown requested; stopping playback` followed by
+  `shutdown complete` and returned `syncplayer=0 tee=0`. A Slave retrying an unavailable Master
+  also returned `syncplayer=0 tee=0` on Ctrl-C.
 - [x] Archive or summarize the Master/Slave logs, diagnostics CSV, and resource CSVs in a dated
   qualification record.
 - [x] Run `tools/analyze-diagnostics.py` on the complete diagnostics CSV and review signed mean,
@@ -68,8 +69,8 @@ merely because the displays continue advancing.
 Minimum acceptance target: at least 12 hours, no crash, clean shutdown, and no more than one
 corrective resynchronization per hour; one per two hours or less is preferred. Initial
 synchronization is not a recovery. The run meets the duration, steady-state synchronization,
-recovery-frequency, and resource requirements, but the startup crash and failed Master shutdown
-keep this section open.
+recovery-frequency, resource, and requalified shutdown requirements, but the unexplained startup
+crash keeps this section open.
 
 ## 2. Complete focused synchronization and recovery qualification
 
