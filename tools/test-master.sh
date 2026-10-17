@@ -154,6 +154,8 @@ main() {
     printf 'Logs:        %s/gstreamer.log, %s/master.log, %s/output.csv, and %s/master-resources.csv\n\n' \
         "$PWD" "$PWD" "$PWD" "$PWD"
 
+    # Keep the log reader alive on Ctrl-C so Syncplayer can log its graceful
+    # shutdown instead of receiving SIGPIPE after tee exits.
     GST_DEBUG_NO_COLOR=1 \
     GST_DEBUG_FILE="$PWD/gstreamer.log" \
     GST_DEBUG='2' \
@@ -169,7 +171,7 @@ main() {
         --console-bind 127.0.0.1:2323 \
         --diagnostics-log output.csv \
         "$program" \
-        2>&1 | tee master.log
+        2>&1 | tee --ignore-interrupts master.log
 
     pipeline_status=("${PIPESTATUS[@]}")
     syncplayer_status=${pipeline_status[0]}
