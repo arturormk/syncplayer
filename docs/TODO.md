@@ -45,7 +45,7 @@ explicit V1 exclusions in blueprint section 103 are non-blocking.
 - [x] Establish a bounded resource profile for the four-Pi topology. Final RSS was
   133.4–141.6 MiB; only 0.23–0.31 MiB was added from hour 8 to hour 17; thread, descriptor, and
   virtual-memory counts remained bounded. The earlier approximately 1.36 GiB laptop-Master result
-  did not recur on this topology and remains relevant if Ubuntu x86-64 is claimed for v1.0.
+  did not recur on this topology and must be resolved while qualifying Ubuntu x86-64 for v1.0.
 - [ ] Record the tested Git revision, exact Pi models, OS/GStreamer versions, media checksums, and
   display/audio topology. The launch commands and Raspberry Pi OS Lite/Debian 13 family are known,
   but the full reproducibility manifest is incomplete.
@@ -55,8 +55,10 @@ explicit V1 exclusions in blueprint section 103 are non-blocking.
 - [ ] Reproduce or otherwise explain the first player04 startup SIGSEGV. The failed PID 936 left no
   core dump, and the manual retry overwrote its local logs. The second process used the unchanged
   `program.toml` and then ran for the full soak.
-- [ ] Change the physical-test launchers to preserve each invocation in a unique timestamped log
-  directory so a retry cannot destroy crash evidence.
+- [x] Change the physical-test launchers to preserve each invocation in a unique timestamped log
+  directory so a retry cannot destroy crash evidence. They also enable traditional core dumps,
+  record the host core policy, preserve matching Ubuntu Apport reports, and export matching
+  `systemd-coredump` entries when available.
 
 Passing criterion: playback and shutdown remain correct, no unexplained crash or error/recovery
 loop occurs, and memory, threads, descriptors, and I/O are bounded rather than growing per
@@ -104,7 +106,11 @@ cannot observe.
 - [ ] Close the remaining production-topology soak exception by reproducing or explaining the
   player04 startup SIGSEGV. Until then, the run is a steady-state pass rather than final platform
   acceptance.
-- [ ] Qualify Ubuntu x86-64 with the intended display server, sinks, decoder, and audio device.
+- [ ] Qualify Ubuntu x86-64, including the intended NUC-class deployment, with the intended display
+  server, sinks, decoder, and audio device. Use available PC hardware and a mixed-platform
+  synchronized run where possible; a representative multi-NUC endurance soak cannot currently be
+  performed because enough machines are unavailable, and that limitation must be recorded in the
+  v1.0 qualification record and release notes.
 - [ ] Qualify Raspberry Pi AArch64 hardware decoding and the intended Wayland or direct KMS/GL
   output path.
 - [ ] Verify fullscreen and display/connector selection on the actual deployment topology.

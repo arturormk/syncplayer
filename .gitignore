@@ -1,5 +1,6 @@
 /target/
 /__stuff/
+/runs/
 *.log
 .DS_Store
 *.swp

@@ -6,7 +6,7 @@ readonly SCRIPT_NAME="${0##*/}"
 
 usage() {
     cat <<EOF
-Usage: $SCRIPT_NAME <OUTPUT.csv> <INTERVAL_SECONDS> -- <COMMAND> [ARGUMENT...]
+Usage: $SCRIPT_NAME [--pid-file <PATH>] <OUTPUT.csv> <INTERVAL_SECONDS> -- <COMMAND> [ARGUMENT...]
 
 Run a command while sampling its Linux process metrics from /proc. The CSV is
 rewritten for each run and flushed after every sample.
@@ -46,6 +46,14 @@ read_io_value() {
 }
 
 main() {
+    local pid_file=
+
+    if [[ "${1:-}" == --pid-file ]]; then
+        (($# >= 3)) || die 'Missing value for --pid-file.'
+        pid_file=$2
+        shift 2
+    fi
+
     (($# >= 4)) || die 'Missing output, interval, separator, or command.'
 
     local output=$1
@@ -71,6 +79,13 @@ main() {
 
     "$@" &
     child_pid=$!
+    if [[ -n "$pid_file" ]]; then
+        if ! printf '%s\n' "$child_pid" >"$pid_file"; then
+            kill -TERM "$child_pid" 2>/dev/null || true
+            wait "$child_pid" 2>/dev/null || true
+            die "Unable to write child PID file: $pid_file"
+        fi
+    fi
 
     local started_at
     local previous_at=

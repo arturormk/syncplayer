@@ -58,13 +58,15 @@ merely because the displays continue advancing.
 - [x] Check for recurrence of the previously observed high memory profile. It did not recur on the
   four-Pi topology: final RSS was 133.4–141.6 MiB and late-run growth flattened to 0.23–0.31 MiB
   over the final nine hours. The earlier approximately 1.36 GiB laptop-Master profile must still be
-  addressed if Ubuntu x86-64 is included in the supported v1.0 platforms.
+  addressed while qualifying Ubuntu x86-64 for v1.0.
 - [ ] Confirm no crash, unrecovered freeze, or unexplained reconnect/recovery loop occurred.
 - [ ] Reproduce or explain player04's first-start SIGSEGV. PID 936 connected briefly, exited 139,
   and was manually replaced 46.6 seconds later. The replacement used the same unchanged program
   file and ran normally, but its launch overwrote the failed invocation's local evidence.
-- [ ] Preserve every test invocation in a unique timestamped directory and enable crash capture
-  before repeating startup qualification.
+- [x] Preserve every test invocation in a unique timestamped directory and enable crash capture
+  before repeating startup qualification. Both launchers now enable core dumps, record the host
+  policy, preserve traditional cores or matching Ubuntu Apport reports, and export a matching
+  `systemd-coredump` entry when possible.
 
 Minimum acceptance target: at least 12 hours, no crash, clean shutdown, and no more than one
 corrective resynchronization per hour; one per two hours or less is preferred. Initial
@@ -102,14 +104,18 @@ require a drift-triggered correction.
 
 Only configurations actually tested should be described as supported.
 
-- [ ] Decide whether v1.0 supports only the qualified Raspberry Pi deployment or also Ubuntu
-  x86-64.
+- [x] Define the v1.0 platform scope as Raspberry Pi AArch64 plus Ubuntu x86-64, including
+  NUC-class installation PCs. Hardware availability currently prevents a representative
+  multi-NUC endurance soak; that limitation does not remove x86-64 from the supported scope.
 - [ ] For Raspberry Pi AArch64, record the supported OS, GStreamer version, decoder, negotiated
   memory path, video/audio sinks, display path, and known limitations.
 - [ ] Verify hardware decoding, fullscreen behavior, and connector/display selection on the actual
   Raspberry Pi deployment.
-- [ ] If Ubuntu x86-64 is included, qualify its intended display server, decoder, sinks, audio
-  device, fullscreen behavior, and display selection to the same standard.
+- [ ] Qualify Ubuntu x86-64 on available PC hardware with the intended display server, decoder,
+  sinks, audio device, fullscreen behavior, and display selection. Include an x86-64 host in a
+  synchronized mixed-platform run where possible.
+- [ ] State explicitly in the v1.0 qualification record and release notes that a representative
+  multi-NUC endurance soak was not performed because enough NUC-class PCs were unavailable.
 - [ ] Record rendered/dropped-frame statistics for every supported output path.
 - [ ] Remove or clearly label claims about configurations that were not qualified for v1.0.
 

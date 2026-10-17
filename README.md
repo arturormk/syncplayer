@@ -15,9 +15,9 @@ installation controls, centralized diagnostics, and lifecycle handling described
 four-Raspberry-Pi topology completed a 17.62-hour observed steady-state soak, including 17.16 hours
 of analyzed diagnostics, with sub-millisecond p99 pairwise separation, no corrective recovery, and
 bounded resources. Final physical qualification remains open because one initial Slave launch
-segfaulted without retained crash evidence and the
-Master launcher ended with SIGPIPE after Ctrl-C. Recovery, platform-manifest, and deployment
-qualification also remain in progress; see [`docs/TODO.md`](docs/TODO.md) and the
+segfaulted without retained crash evidence. The Master launcher's subsequent SIGPIPE-on-Ctrl-C
+defect has been fixed and requalified. Recovery, platform-manifest, and deployment qualification
+also remain in progress; see [`docs/TODO.md`](docs/TODO.md) and the
 [`2026-10-17 soak report`](docs/reports/2026-10-17-four-raspberry-pi-soak-test.md).
 
 ## Prerequisites
@@ -85,9 +85,12 @@ For repeatable physical or endurance runs, use `tools/test-master.sh` and
 resource CSV (`master-resources.csv` or `slave-resources.csv`) with elapsed time, process CPU,
 resident/peak/virtual memory, threads, open file descriptors, and read/write byte counters. The
 default interval is one second; change it with `--resource-interval SECONDS`. The Slave launcher
-enables gradual drift correction unconditionally. These launchers currently rewrite fixed output
-filenames on every invocation; copy a failed run's files before retrying, because a retry otherwise
-destroys the first run's application, GStreamer, and resource evidence.
+enables gradual drift correction unconditionally. Each invocation creates a unique directory under
+`./runs`; use `--output-root DIRECTORY` to choose a different parent. The directory
+contains a reproducibility manifest, PID, exit statuses, and core-capture report in addition to the
+logs. The launchers enable traditional core dumps and preserve new `core*` files from the launch
+directory. They also preserve the exact PID's Ubuntu Apport report, unpacking its embedded core
+when possible, or export the exact PID's dump with `coredumpctl` on `systemd-coredump` hosts.
 
 ## Command-line reference
 

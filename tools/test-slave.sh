@@ -4,6 +4,7 @@ set -o pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
 readonly PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$PROJECT_ROOT/tools/test-launcher-common.sh"
 
 usage() {
     cat <<EOF
@@ -17,13 +18,14 @@ Arguments:
 
 Options:
       --debug                        Enable debug-level Syncplayer logging
+      --output-root <DIRECTORY>      Parent for unique run directories (default: ./runs)
       --resource-interval <SECONDS>  Sampling interval (default: 1)
   -h, --help                         Show this help text and exit
 
 The tool automatically selects a release build for the native target, falling
-back to a native debug build. It writes GStreamer logs to gstreamer.log, the
-combined player output to slave.log, and CPU/memory/thread/file-descriptor/I/O
-samples to slave-resources.csv in the current directory.
+back to a native debug build. Each invocation gets a unique directory containing
+its manifest, GStreamer and player logs, resource samples, exit status, and any
+core dump the host makes available.
 EOF
 }
 
@@ -77,6 +79,7 @@ main() {
     local debug=false
     local rust_log=syncplayer=warn
     local resource_interval=1
+    local output_root=$PWD/runs
     local syncplayer
     local -a pipeline_status
     local syncplayer_status
@@ -86,6 +89,11 @@ main() {
     while (($# > 0)); do
         case "$1" in
             --debug) debug=true ;;
+            --output-root)
+                (($# >= 2)) || die 'Missing value for --output-root.'
+                output_root=$2
+                shift
+                ;;
             --resource-interval)
                 (($# >= 2)) || die 'Missing value for --resource-interval.'
                 resource_interval=$2
@@ -128,30 +136,40 @@ main() {
         die "No native Syncplayer executable found. Build one with 'cargo build --release'."
     fi
 
+    initialize_test_run slave "$output_root" "$syncplayer" "$program"
+
+    local gstreamer_log=$TEST_RUN_DIRECTORY/gstreamer.log
+    local slave_log=$TEST_RUN_DIRECTORY/slave.log
+    local resources_log=$TEST_RUN_DIRECTORY/slave-resources.csv
+    local -a command=(
+        "$syncplayer"
+        slave
+        --master "$master"
+        --drift-slew
+        --mute
+        "$program"
+    )
+    record_test_command "${command[@]}"
+
     printf 'Executable: %s\n' "$syncplayer"
     printf 'Master:     %s\n' "$master"
     printf 'Program:    %s\n' "$program"
     printf 'Rust log:   %s\n' "$rust_log"
     printf 'Resources:  every %ss\n' "$resource_interval"
-    printf 'Logs:       %s/gstreamer.log, %s/slave.log, and %s/slave-resources.csv\n\n' \
-        "$PWD" "$PWD" "$PWD"
+    printf 'Run output: %s\n\n' "$TEST_RUN_DIRECTORY"
 
     # Keep the log reader alive on Ctrl-C so Syncplayer can log its graceful
     # shutdown instead of receiving SIGPIPE after tee exits.
     GST_DEBUG_NO_COLOR=1 \
-    GST_DEBUG_FILE="$PWD/gstreamer.log" \
+    GST_DEBUG_FILE="$gstreamer_log" \
     GST_DEBUG='2' \
     RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
     "$PROJECT_ROOT/tools/run-with-resource-sampling.sh" \
-        slave-resources.csv "$resource_interval" -- \
-        "$syncplayer" \
-        slave \
-        --master "$master" \
-        --drift-slew \
-        --mute \
-        "$program" \
-        2>&1 | tee --ignore-interrupts slave.log
+        --pid-file "$TEST_RUN_PID_FILE" \
+        "$resources_log" "$resource_interval" -- \
+        "${command[@]}" \
+        2>&1 | tee --ignore-interrupts "$slave_log"
 
     pipeline_status=("${PIPESTATUS[@]}")
     syncplayer_status=${pipeline_status[0]}
@@ -159,7 +177,9 @@ main() {
 
     printf 'syncplayer=%s tee=%s\n' \
         "$syncplayer_status" "$tee_status" |
-        tee -a slave.log
+        tee -a "$slave_log"
+
+    finish_test_run "$syncplayer_status" "$tee_status"
 
     return "$syncplayer_status"
 }

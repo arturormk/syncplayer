@@ -4,6 +4,7 @@ set -o pipefail
 
 readonly SCRIPT_NAME="${0##*/}"
 readonly PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$PROJECT_ROOT/tools/test-launcher-common.sh"
 
 usage() {
     cat <<EOF
@@ -17,14 +18,14 @@ Arguments:
 
 Options:
       --debug                        Enable debug-level Syncplayer logging
+      --output-root <DIRECTORY>      Parent for unique run directories (default: ./runs)
       --resource-interval <SECONDS>  Sampling interval (default: 1)
   -h, --help                         Show this help text and exit
 
 The clock port is the master port plus one. The installation console listens
-on 127.0.0.1:2323. The tool writes GStreamer logs to gstreamer.log, combined
-player output to master.log, synchronization diagnostics to output.csv, and
-CPU/memory/thread/file-descriptor/I/O samples to master-resources.csv in the
-current directory.
+on 127.0.0.1:2323. Each invocation gets a unique directory containing its
+manifest, GStreamer and player logs, synchronization diagnostics, resource
+samples, exit status, and any core dump the host makes available.
 
 The tool automatically selects a release build for the native target, falling
 back to a native debug build.
@@ -81,6 +82,7 @@ main() {
     local debug=false
     local rust_log=syncplayer=warn
     local resource_interval=1
+    local output_root=$PWD/runs
     local port
     local port_number
     local clock_port
@@ -93,6 +95,11 @@ main() {
     while (($# > 0)); do
         case "$1" in
             --debug) debug=true ;;
+            --output-root)
+                (($# >= 2)) || die 'Missing value for --output-root.'
+                output_root=$2
+                shift
+                ;;
             --resource-interval)
                 (($# >= 2)) || die 'Missing value for --resource-interval.'
                 resource_interval=$2
@@ -144,6 +151,24 @@ main() {
         die "No native Syncplayer executable found. Build one with 'cargo build --release'."
     fi
 
+    initialize_test_run master "$output_root" "$syncplayer" "$program"
+
+    local gstreamer_log=$TEST_RUN_DIRECTORY/gstreamer.log
+    local master_log=$TEST_RUN_DIRECTORY/master.log
+    local diagnostics_log=$TEST_RUN_DIRECTORY/output.csv
+    local resources_log=$TEST_RUN_DIRECTORY/master-resources.csv
+    local -a command=(
+        "$syncplayer"
+        master
+        --bind "$master"
+        --clock-port "$clock_port"
+        --startup-delay 0
+        --console-bind 127.0.0.1:2323
+        --diagnostics-log "$diagnostics_log"
+        "$program"
+    )
+    record_test_command "${command[@]}"
+
     printf 'Executable:  %s\n' "$syncplayer"
     printf 'Master bind: %s\n' "$master"
     printf 'Clock port:  %s\n' "$clock_port"
@@ -151,27 +176,20 @@ main() {
     printf 'Console:     127.0.0.1:2323\n'
     printf 'Rust log:    %s\n' "$rust_log"
     printf 'Resources:   every %ss\n' "$resource_interval"
-    printf 'Logs:        %s/gstreamer.log, %s/master.log, %s/output.csv, and %s/master-resources.csv\n\n' \
-        "$PWD" "$PWD" "$PWD" "$PWD"
+    printf 'Run output:  %s\n\n' "$TEST_RUN_DIRECTORY"
 
     # Keep the log reader alive on Ctrl-C so Syncplayer can log its graceful
     # shutdown instead of receiving SIGPIPE after tee exits.
     GST_DEBUG_NO_COLOR=1 \
-    GST_DEBUG_FILE="$PWD/gstreamer.log" \
+    GST_DEBUG_FILE="$gstreamer_log" \
     GST_DEBUG='2' \
     RUST_LOG="$rust_log" \
     RUST_BACKTRACE=1 \
     "$PROJECT_ROOT/tools/run-with-resource-sampling.sh" \
-        master-resources.csv "$resource_interval" -- \
-        "$syncplayer" \
-        master \
-        --bind "$master" \
-        --clock-port "$clock_port" \
-        --startup-delay 0 \
-        --console-bind 127.0.0.1:2323 \
-        --diagnostics-log output.csv \
-        "$program" \
-        2>&1 | tee --ignore-interrupts master.log
+        --pid-file "$TEST_RUN_PID_FILE" \
+        "$resources_log" "$resource_interval" -- \
+        "${command[@]}" \
+        2>&1 | tee --ignore-interrupts "$master_log"
 
     pipeline_status=("${PIPESTATUS[@]}")
     syncplayer_status=${pipeline_status[0]}
@@ -179,7 +197,9 @@ main() {
 
     printf 'syncplayer=%s tee=%s\n' \
         "$syncplayer_status" "$tee_status" |
-        tee -a master.log
+        tee -a "$master_log"
+
+    finish_test_run "$syncplayer_status" "$tee_status"
 
     return "$syncplayer_status"
 }
