@@ -21,7 +21,7 @@ gstreamer-pbutils = "0.25"
 hostname = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
-signal-hook = "0.3"
+signal-hook = "0.4"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
