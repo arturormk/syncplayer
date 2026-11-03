@@ -273,7 +273,7 @@ mod tests {
             player_id: player_id.to_owned(),
             program_id: "show".to_owned(),
             program_hash: ProgramHash::from_bytes([1; 32]),
-            software_version: "0.1.0".to_owned(),
+            software_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: Capabilities::current(),
             state_port: 0,
             cue_durations_ns: vec![10, 20],
