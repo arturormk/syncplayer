@@ -49,9 +49,9 @@ milestone. A four-Raspberry-Pi topology has demonstrated excellent synchronizati
 resources during a 17.62-hour observed steady-state run with 17.16 hours of analyzed evidence,
 documented in
 [`reports/2026-10-17-four-raspberry-pi-soak-test.md`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
-The unexplained first-start player04 SIGSEGV, deliberate recovery testing, the Master's
-launcher-mediated SIGPIPE on Ctrl-C, complete platform qualification, and a reproducible
-installation/runtime strategy remain open.
+The Master's launcher-mediated SIGPIPE on Ctrl-C found during that run has since been fixed and
+requalified. The unexplained first-start player04 SIGSEGV, deliberate recovery testing, complete
+platform qualification, and a reproducible installation/runtime strategy remain open.
 
 ---
 
@@ -3351,8 +3351,9 @@ The 2026-10-16/17 four-Raspberry-Pi run supplies the first overnight steady-stat
 observed hours and 645 iterations, including 17.16 hours and 629 iterations in the analyzed
 artifact set; no corrective recovery or steady-state disconnect, sub-millisecond
 pairwise p99 separation, and bounded resources. It does not fully close this requirement because
-one Slave's first launch segfaulted without retained crash evidence and Ctrl-C ended the Master
-with SIGPIPE instead of a clean exit. See the
+one Slave's first launch segfaulted without retained crash evidence. Ctrl-C also ended the Master
+with SIGPIPE instead of a clean exit; that launcher defect has since been fixed and requalified.
+See the
 [`dated report`](reports/2026-10-17-four-raspberry-pi-soak-test.md).
 
 ---

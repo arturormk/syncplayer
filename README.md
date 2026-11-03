@@ -4,7 +4,7 @@
 [![CI](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml/badge.svg)](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENCE.md)
 
-Syncplayer is intended to be a Rust/GStreamer video player for installations in which every host
+Syncplayer is a Rust/GStreamer video player for installations in which every host
 decodes independent local media against one Master-derived timeline. The accepted architecture is
 recorded in [`docs/adr/`](docs/adr/); [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) provides the broader
 design context.
