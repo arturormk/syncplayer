@@ -153,8 +153,9 @@ struct SlaveArgs {
     drift_slew: bool,
 
     /// Follow the Master timeline this many seconds late, across cue transitions and loops.
-    #[arg(long, value_name = "SECONDS", default_value_t = 0.0, value_parser = non_negative_seconds)]
-    delay: f64,
+    /// Overrides the player's `delay` in the program file; defaults to that value, else 0.
+    #[arg(long, value_name = "SECONDS", value_parser = non_negative_seconds)]
+    delay: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -294,6 +295,13 @@ fn run_master(args: &MasterArgs, shutdown: &ShutdownSignal) -> Result<()> {
     // is normally the device-backed audio clock, so the Master does not have
     // to slave its own output to an unrelated system clock.
     let program = load_runtime_program(&args.playback)?;
+    if program.presentation_delay > 0.0 {
+        info!(
+            player = %program.player_id,
+            delay_s = program.presentation_delay,
+            "program file delay applies only to Slaves; the Master presents without delay"
+        );
+    }
     let sequence = PlaybackSequence::prepare(&program)?;
     let compatibility = ProgramCompatibility {
         program_id: program.program_id.clone(),
@@ -446,7 +454,8 @@ fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
         info!("shutdown complete");
         return Ok(());
     };
-    let presentation_delay = PresentationDelay::from_seconds(args.delay)?;
+    let presentation_delay =
+        PresentationDelay::from_seconds(args.delay.unwrap_or(program.presentation_delay))?;
     let player = Arc::new(
         Player::new(&args.playback, sequence, Some(&clock), args.drift_slew)?
             .with_presentation_delay(presentation_delay),
@@ -458,6 +467,11 @@ fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
         release_at_ns = plan.release_at.get(),
         drift_slew = args.drift_slew,
         presentation_delay_ns = presentation_delay.get(),
+        presentation_delay_source = if args.delay.is_some() {
+            "command line"
+        } else {
+            "program"
+        },
         "accepted shared-clock release"
     );
 
@@ -531,6 +545,9 @@ fn run_validate(args: &ValidateArgs) -> Result<()> {
     println!("Program: {}", report.program_id);
     println!("Hash:    {}", report.program_hash);
     println!("Player:  {}", report.player_id);
+    if program.presentation_delay > 0.0 {
+        println!("Delay:   {} s (Slave only)", program.presentation_delay);
+    }
     println!();
     println!("Cues:");
     for cue in &report.cues {
@@ -6316,8 +6333,12 @@ mod tests {
         let Command::Slave(args) = parse(&[]).unwrap().command else {
             panic!("expected Slave command");
         };
+        assert_eq!(args.delay, None);
+        let Command::Slave(args) = parse(&["--delay", "0"]).unwrap().command else {
+            panic!("expected Slave command");
+        };
         assert!(
-            PresentationDelay::from_seconds(args.delay)
+            PresentationDelay::from_seconds(args.delay.unwrap())
                 .unwrap()
                 .is_zero()
         );
@@ -6325,7 +6346,9 @@ mod tests {
             panic!("expected Slave command");
         };
         assert_eq!(
-            PresentationDelay::from_seconds(args.delay).unwrap().get(),
+            PresentationDelay::from_seconds(args.delay.unwrap())
+                .unwrap()
+                .get(),
             2_500_000_000
         );
         assert!(parse(&["--delay", "-1"]).is_err());

@@ -12,6 +12,8 @@ use std::str::FromStr;
 
 const PROGRAM_VERSION: u64 = 1;
 const CANONICAL_FORMAT: &[u8] = b"syncplayer-program-v1\0";
+/// Player-table key holding the player's presentation delay; reserved as a cue ID.
+const DELAY_KEY: &str = "delay";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramConfig {
@@ -19,6 +21,8 @@ pub struct ProgramConfig {
     pub program: Program,
     pub aliases: BTreeMap<String, String>,
     pub players: BTreeMap<String, BTreeMap<String, PlayerCue>>,
+    /// Presentation delay in seconds per player table (`[players.<id>] delay`).
+    pub player_delays: BTreeMap<String, f64>,
     source_path: PathBuf,
     base_directory: PathBuf,
 }
@@ -160,6 +164,8 @@ pub struct ResolvedProgram {
     pub hash: ProgramHash,
     pub player_id: PlayerId,
     pub looping: bool,
+    /// Seconds a Slave presents the Master timeline late; ignored by the Master.
+    pub presentation_delay: f64,
     pub cues: Vec<ResolvedCue>,
 }
 
@@ -180,7 +186,15 @@ struct ProgramDocument {
     program: Program,
     #[serde(default)]
     aliases: BTreeMap<String, String>,
-    players: BTreeMap<String, BTreeMap<String, PlayerCue>>,
+    players: BTreeMap<String, PlayerDocument>,
+}
+
+/// One `[players.<id>]` table: an optional player-wide delay plus cue mappings.
+#[derive(Debug, Deserialize)]
+struct PlayerDocument {
+    delay: Option<f64>,
+    #[serde(flatten)]
+    cues: BTreeMap<String, PlayerCue>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -233,11 +247,20 @@ impl ProgramConfig {
                 document.version
             );
         }
+        let mut players = BTreeMap::new();
+        let mut player_delays = BTreeMap::new();
+        for (player_id, player) in document.players {
+            if let Some(delay) = player.delay {
+                player_delays.insert(player_id.clone(), delay);
+            }
+            players.insert(player_id, player.cues);
+        }
         let config = Self {
             version: document.version,
             program: document.program,
             aliases: document.aliases,
-            players: document.players,
+            players,
+            player_delays,
             source_path,
             base_directory,
         };
@@ -283,6 +306,14 @@ impl ProgramConfig {
                         }
                     }
                 }
+            }
+        }
+        // Appended only when present so programs without delays keep their hashes.
+        if !self.player_delays.is_empty() {
+            writer.u64(self.player_delays.len() as u64);
+            for (player, delay) in &self.player_delays {
+                writer.string(player);
+                writer.optional_f64(Some(*delay));
             }
         }
         writer.finish()
@@ -372,11 +403,17 @@ impl ProgramConfig {
                 events,
             });
         }
+        let presentation_delay = choose_copy(
+            self.player_delays.get(selected).copied(),
+            self.player_delays.get("default").copied(),
+        )
+        .unwrap_or(0.0);
         Ok(ResolvedProgram {
             program_id: self.program.id.clone(),
             hash: self.program_hash(),
             player_id,
             looping: self.program.looping,
+            presentation_delay,
             cues,
         })
     }
@@ -401,6 +438,9 @@ impl ProgramConfig {
         let mut cue_ids = BTreeSet::new();
         for cue in &self.program.cues {
             validate_identifier("cue ID", &cue.id)?;
+            if cue.id == DELAY_KEY {
+                bail!("cue ID '{DELAY_KEY}' is reserved for the player presentation delay");
+            }
             if !cue_ids.insert(cue.id.as_str()) {
                 bail!("duplicate cue ID '{}'", cue.id);
             }
@@ -408,6 +448,11 @@ impl ProgramConfig {
         for (source, target) in &self.aliases {
             validate_identifier("alias hostname", source)?;
             validate_identifier("alias player ID", target)?;
+        }
+        for (player_id, delay) in &self.player_delays {
+            if !delay.is_finite() || *delay < 0.0 {
+                bail!("player '{player_id}' delay must be a finite non-negative number of seconds");
+            }
         }
         for (player_id, cues) in &self.players {
             if player_id != "default" {
@@ -785,6 +830,10 @@ port = 9000
 payload_hex = "01 02 ff"
 "#;
 
+    /// Hash of `PROGRAM` computed before player delays existed.
+    const PROGRAM_HASH_WITHOUT_DELAYS: &str =
+        "1c2acf88f31fc85354104cd8a323167b066a551e374319c695cc6812ffdcf830";
+
     fn parse(text: &str) -> Result<ProgramConfig> {
         ProgramConfig::parse(
             text,
@@ -841,6 +890,69 @@ payload_hex = "01 02 ff"
         assert_ne!(first.program_hash(), payload_changed.program_hash());
         assert_ne!(first.program_hash(), timing_changed.program_hash());
         assert_ne!(first.program_hash(), mapping_changed.program_hash());
+    }
+
+    #[test]
+    fn resolves_player_delay_with_default_fallback() {
+        let without = parse(PROGRAM).unwrap();
+        assert!(without.player_delays.is_empty());
+        let resolved = without
+            .resolve_player_with_hostname(Some("left"), "x")
+            .unwrap();
+        assert!(resolved.presentation_delay.abs() < f64::EPSILON);
+
+        let with_default = PROGRAM.replace(
+            "[players.default.intro]",
+            "[players.default]\ndelay = 2\n\n[players.default.intro]",
+        );
+        let config = parse(&with_default).unwrap();
+        let other = config
+            .resolve_player_with_hostname(Some("right"), "x")
+            .unwrap();
+        assert!((other.presentation_delay - 2.0).abs() < f64::EPSILON);
+
+        let with_both = with_default.replace(
+            "[players.left.intro]",
+            "[players.left]\ndelay = 4.5\n\n[players.left.intro]",
+        );
+        let config = parse(&with_both).unwrap();
+        let left = config.resolve_player_with_hostname(None, "host-a").unwrap();
+        assert!((left.presentation_delay - 4.5).abs() < f64::EPSILON);
+        assert_eq!(left.cues.len(), 2);
+        assert!(!left.cues[0].mute);
+    }
+
+    #[test]
+    fn canonical_hash_covers_player_delays_and_is_stable_without_them() {
+        let base = parse(PROGRAM).unwrap();
+        let with_delay = |value: &str| {
+            parse(&PROGRAM.replace(
+                "[players.left.intro]",
+                &format!("[players.left]\ndelay = {value}\n\n[players.left.intro]"),
+            ))
+            .unwrap()
+            .program_hash()
+        };
+        assert_ne!(base.program_hash(), with_delay("0"));
+        assert_ne!(with_delay("1"), with_delay("2"));
+        assert_eq!(with_delay("2"), with_delay("2.0"));
+        // Golden value guards that delay-free programs keep their pre-delay hash.
+        assert_eq!(base.program_hash().to_string(), PROGRAM_HASH_WITHOUT_DELAYS);
+    }
+
+    #[test]
+    fn rejects_invalid_delays_and_reserved_cue_id() {
+        let delayed = |value: &str| {
+            parse(&PROGRAM.replace(
+                "[players.left.intro]",
+                &format!("[players.left]\ndelay = {value}\n\n[players.left.intro]"),
+            ))
+        };
+        assert!(delayed("-1").is_err());
+        assert!(delayed("nan").is_err());
+        assert!(delayed("inf").is_err());
+        assert!(delayed("\"4s\"").is_err());
+        assert!(parse(&PROGRAM.replace("id = \"main\"", "id = \"delay\"")).is_err());
     }
 
     #[test]

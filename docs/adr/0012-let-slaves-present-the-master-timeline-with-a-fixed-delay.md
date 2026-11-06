@@ -39,6 +39,14 @@ different delays.
 - Debug loops are not delayed; all participants repeat them in lockstep.
 - Host-local events (ADR 0009), the OSD, and drift diagnostics follow the delayed timeline.
 
+The delay is configured on the Slave command line or per player in the shared program file as
+`[players.<id>] delay = <seconds>`. Resolution follows the program's other player settings: the
+player's own value, then `[players.default]`, then zero; an explicit command-line value overrides
+the program file. Program-file delays are covered by the program hash, which is unchanged for
+programs that declare none, so participants still agree on a single program definition. `delay`
+is therefore reserved and cannot be a cue ID. The Master ignores any delay resolved for its own
+player.
+
 Discontinuous operations (ADR 0010) still release at the Master-selected timestamp; only the
 target position is delayed. A delayed Slave therefore does not replay the final `d` seconds before
 an operator pause, stop, or goto.

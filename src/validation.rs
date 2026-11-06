@@ -361,6 +361,7 @@ mod tests {
             hash: ProgramHash::from_bytes([7; 32]),
             player_id: PlayerId::new("left").unwrap(),
             looping: true,
+            presentation_delay: 0.0,
             cues: vec![
                 ResolvedCue {
                     id: "a".to_owned(),
@@ -437,6 +438,7 @@ mod tests {
             hash: ProgramHash::from_bytes([0; 32]),
             player_id: PlayerId::new("left").unwrap(),
             looping: false,
+            presentation_delay: 0.0,
             cues: vec![ResolvedCue {
                 id: "a".to_owned(),
                 video: path.clone(),

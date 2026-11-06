@@ -218,7 +218,7 @@ startup deadline for a slow or absent Slave.
 | `--keepalive-interval <SECONDS>` | No | Control keepalive cadence; defaults to 2 seconds. |
 | `--keepalive-timeout <SECONDS>` | No | Time to wait for a keepalive acknowledgement before reconnecting; defaults to 8 seconds. |
 | `--drift-slew` | No | Correct sustained 100-250 ms local drift with temporary playback-rate changes of at most 2%. Disabled by default. |
-| `--delay <SECONDS>` | No | Present the Master timeline this many seconds late. Defaults to 0. See [Delayed Slaves](#delayed-slaves). |
+| `--delay <SECONDS>` | No | Present the Master timeline this many seconds late. Overrides the player's `delay` in the program file, which defaults to 0. See [Delayed Slaves](#delayed-slaves). |
 
 The Slave retries the initial Master connection once per second until the Master is available. It
 first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
@@ -241,6 +241,26 @@ sequence position used for ordinary Slaves. As a result it crosses every cue bou
 final-to-first playlist wrap exactly `delay` after the Master, through the same prepared gapless
 handoff and drift correction. The delay is local to the Slave: the Master and the protocol do not
 change, and different Slaves may use different delays.
+
+The delay can also be set per player in the program file with a `delay` key (seconds) in the
+player's table. A player's own value overrides `[players.default]`, and an explicit `--delay`
+overrides both:
+
+```toml
+[players.default]
+delay = 0
+
+[players.right-wall]
+delay = 4.5
+
+[players.right-wall.main]
+video = "media/main-right.mp4"
+```
+
+Because `delay` names a player setting, it cannot be used as a cue ID. Delays are part of the
+program hash, so every participant must load the same file; programs without any `delay` keep the
+hash they had before this field existed. The Master ignores the delay resolved for its own player
+and logs that it did so, and `syncplayer validate` shows the delay for the selected player.
 
 When the delayed position would fall before the start of the program, for example right after
 startup, `stop`, or `goto` near a cue's start, the Slave holds the first frame and releases it once the
