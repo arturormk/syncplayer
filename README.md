@@ -218,6 +218,7 @@ startup deadline for a slow or absent Slave.
 | `--keepalive-interval <SECONDS>` | No | Control keepalive cadence; defaults to 2 seconds. |
 | `--keepalive-timeout <SECONDS>` | No | Time to wait for a keepalive acknowledgement before reconnecting; defaults to 8 seconds. |
 | `--drift-slew` | No | Correct sustained 100-250 ms local drift with temporary playback-rate changes of at most 2%. Disabled by default. |
+| `--delay <SECONDS>` | No | Present the Master timeline this many seconds late. Defaults to 0. See [Delayed Slaves](#delayed-slaves). |
 
 The Slave retries the initial Master connection once per second until the Master is available. It
 first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
@@ -230,6 +231,25 @@ connected—the Slave closes the stale connection,
 continues playing from its last disciplined clock estimate, and attempts to reconnect in the
 background. A successful reconnect always creates and calibrates a new network clock before a
 prepared pause/seek/release.
+
+#### Delayed Slaves
+
+A Slave started with `--delay SECONDS` stays synchronized to the Master but shows what the Master
+showed that many seconds earlier. Its expected position is
+`anchor_position + (synchronized_clock - anchor_clock) - delay`, computed in the same absolute
+sequence position used for ordinary Slaves. As a result it crosses every cue boundary and
+final-to-first playlist wrap exactly `delay` after the Master, through the same prepared gapless
+handoff and drift correction. The delay is local to the Slave: the Master and the protocol do not
+change, and different Slaves may use different delays.
+
+When the delayed position would fall before the start of the program, for example right after
+startup, `stop`, or `goto` near a cue's start, the Slave holds the first frame and releases it once the
+Master has played for `delay`. Pause keeps the lag: the Slave freezes `delay` behind the Master's
+paused position and resumes from there. When a non-looping program completes, the delayed Slave
+plays its remaining `delay` of media rather than stopping with the Master. Debug loops set with
+`loop` are not delayed; every participant repeats the loop in lockstep, and the lag returns after
+`unloop`. Host-local events and the OSD follow the delayed timeline. Pairwise separation reported
+by `tools/analyze-diagnostics.py` includes the configured delay.
 
 Protocol version 9 is intentionally incompatible with older prototype binaries. Deploy the same
 Syncplayer build to the Master and every Slave.

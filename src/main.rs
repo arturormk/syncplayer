@@ -151,6 +151,10 @@ struct SlaveArgs {
     /// Gently vary local playback speed to correct sustained 100-250 ms drift.
     #[arg(long)]
     drift_slew: bool,
+
+    /// Follow the Master timeline this many seconds late, across cue transitions and loops.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0.0, value_parser = non_negative_seconds)]
+    delay: f64,
 }
 
 #[derive(Debug, Args)]
@@ -442,18 +446,18 @@ fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
         info!("shutdown complete");
         return Ok(());
     };
-    let player = Arc::new(Player::new(
-        &args.playback,
-        sequence,
-        Some(&clock),
-        args.drift_slew,
-    )?);
+    let presentation_delay = PresentationDelay::from_seconds(args.delay)?;
+    let player = Arc::new(
+        Player::new(&args.playback, sequence, Some(&clock), args.drift_slew)?
+            .with_presentation_delay(presentation_delay),
+    );
     let plan = receive_release(&mut stream, &clock, authority)?;
-    player.apply_control_plan(&clock, plan)?;
+    let plan = player.apply_control_plan(&clock, plan)?;
     report_prepared(&mut stream, authority)?;
     info!(
         release_at_ns = plan.release_at.get(),
         drift_slew = args.drift_slew,
+        presentation_delay_ns = presentation_delay.get(),
         "accepted shared-clock release"
     );
 
@@ -1939,7 +1943,7 @@ fn monitor_master(
                 match connect_to_master(master, &subscription).and_then(
                     |(mut new_stream, clock, new_authority)| {
                         let plan = receive_release(&mut new_stream, &clock, new_authority)?;
-                        player.apply_control_plan(&clock, plan)?;
+                        let plan = player.apply_control_plan(&clock, plan)?;
                         report_prepared(&mut new_stream, new_authority)?;
                         player.set_clock_health(true);
                         Ok((new_stream, plan, new_authority))
@@ -2519,6 +2523,115 @@ struct EventProjection {
     debug_loop: Option<DebugLoopState>,
 }
 
+/// A fixed lag between the authoritative Master timeline and this player's
+/// presentation of it. It is zero on the Master and on ordinary Slaves.
+///
+/// The delay is applied to every authoritative anchor a Slave accepts, in
+/// absolute sequence space, so the delayed player crosses cue boundaries and
+/// playlist wraps exactly `delay` after the Master instead of following them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PresentationDelay(u64);
+
+impl PresentationDelay {
+    fn from_seconds(seconds: f64) -> Result<Self> {
+        let nanos = Duration::try_from_secs_f64(seconds)
+            .context("presentation delay must be a finite non-negative number of seconds")?
+            .as_nanos();
+        Ok(Self(u64::try_from(nanos).context(
+            "presentation delay is too large for the clock",
+        )?))
+    }
+
+    const fn get(self) -> u64 {
+        self.0
+    }
+
+    const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Re-expresses an authoritative anchor as the same timeline presented
+    /// later: `delayed(t) = authoritative(t - delay)`.
+    ///
+    /// A delayed position before the start of the sequence cannot be shown,
+    /// so a playing anchor instead holds the first frame and is released once
+    /// the authoritative timeline has advanced by the delay. A paused anchor
+    /// keeps the same lag so a later resume preserves it.
+    fn apply(
+        self,
+        position: MediaPositionNs,
+        anchor_clock: ClockNs,
+        state: TransportState,
+    ) -> Result<(MediaPositionNs, ClockNs)> {
+        let position_ns = position.get();
+        if state == TransportState::Paused || position_ns >= self.0 {
+            return Ok((
+                MediaPositionNs::new(position_ns.saturating_sub(self.0)),
+                anchor_clock,
+            ));
+        }
+        let release_at = anchor_clock
+            .get()
+            .checked_add(self.0 - position_ns)
+            .ok_or_else(|| anyhow!("delayed release timestamp overflow"))?;
+        Ok((MediaPositionNs::new(0), ClockNs::new(release_at)))
+    }
+
+    /// Delays a Master release plan. Debug loops are cue-local diagnostics
+    /// that every participant repeats in lockstep, so they are not delayed.
+    fn delay_plan(self, plan: ReleasePlan) -> Result<ReleasePlan> {
+        if self.is_zero() || plan.operation == Operation::Loop {
+            return Ok(plan);
+        }
+        let (media_position, release_at) =
+            self.apply(plan.media_position, plan.release_at, plan.transport_state)?;
+        Ok(ReleasePlan {
+            media_position,
+            release_at,
+            ..plan
+        })
+    }
+}
+
+/// Moves an authoritative cue identity to the delayed sequence position.
+///
+/// Returns the delayed item, playlist iteration, and cue occurrence. The
+/// occurrence is decremented by the number of cue boundaries between the two
+/// positions so host-local events see the same traversal the Master did.
+fn delayed_cue_identity(
+    sequence: &PlaybackSequence,
+    authoritative_item: ItemPosition,
+    authoritative_iteration: u64,
+    authoritative_occurrence: u64,
+    delayed_position: MediaPositionNs,
+) -> Result<(ItemPosition, u64, u64)> {
+    let Ok(item) = sequence.locate(delayed_position.get()) else {
+        // Only the endpoint of a completed non-looping sequence is not
+        // locatable, and that cannot lie behind a delayed authoritative anchor.
+        return Ok((
+            authoritative_item,
+            authoritative_iteration,
+            authoritative_occurrence,
+        ));
+    };
+    let iteration = sequence.timeline.as_ref().map_or(0, |timeline| {
+        timeline.playlist_iteration(delayed_position.get())
+    });
+    let cue_count = u64::try_from(sequence.cue_ids.len()).context("cue count does not fit u64")?;
+    let ordinal = |index: usize, iteration: u64| -> Result<u64> {
+        Ok(iteration
+            .saturating_mul(cue_count)
+            .saturating_add(u64::try_from(index).context("cue index does not fit u64")?))
+    };
+    let skipped = ordinal(authoritative_item.index, authoritative_iteration)?
+        .saturating_sub(ordinal(item.index, iteration)?);
+    Ok((
+        item,
+        iteration,
+        authoritative_occurrence.saturating_sub(skipped),
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriftAction {
     None,
@@ -2733,6 +2846,7 @@ struct Player {
     boundary_mismatch: Mutex<Option<(usize, usize, u64)>>,
     scheduled_release: Arc<Mutex<Option<ScheduledRelease>>>,
     release_error: Arc<Mutex<Option<String>>>,
+    presentation_delay: PresentationDelay,
 }
 
 struct ScheduledRelease {
@@ -3127,6 +3241,7 @@ impl Player {
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
+            presentation_delay: PresentationDelay::default(),
         })
     }
 
@@ -3290,6 +3405,7 @@ impl Player {
             boundary_mismatch: Mutex::new(None),
             scheduled_release: Arc::new(Mutex::new(None)),
             release_error: Arc::new(Mutex::new(None)),
+            presentation_delay: PresentationDelay::default(),
         })
     }
 
@@ -3342,16 +3458,25 @@ impl Player {
         result
     }
 
-    fn apply_control_plan(&self, clock: &gst::Clock, plan: ReleasePlan) -> Result<()> {
+    fn with_presentation_delay(mut self, delay: PresentationDelay) -> Self {
+        self.presentation_delay = delay;
+        self
+    }
+
+    /// Applies a Master release plan and returns the plan actually scheduled,
+    /// which differs from the received one when a presentation delay is set.
+    fn apply_control_plan(&self, clock: &gst::Clock, plan: ReleasePlan) -> Result<ReleasePlan> {
+        let plan = self.presentation_delay.delay_plan(plan)?;
         match plan.operation {
             Operation::Pause if plan.transport_state == TransportState::Paused => {
-                self.schedule_pause(plan)
+                self.schedule_pause(plan)?;
             }
             _ if plan.transport_state == TransportState::Paused => {
-                self.prepare_paused(clock, plan, "operator-control")
+                self.prepare_paused(clock, plan, "operator-control")?;
             }
-            _ => self.resynchronize(clock, plan, "operator-control"),
+            _ => self.resynchronize(clock, plan, "operator-control")?,
         }
+        Ok(plan)
     }
 
     fn prepare_paused(
@@ -3713,40 +3838,40 @@ impl Player {
                 "holding shorter local rendition at its last valid cue position"
             );
         }
-        let local_media_position = self.sequence.position_for_remote_snapshot(
-            ItemPosition {
-                index: item_index,
-                local_ns: snapshot.item_position.get(),
-            },
-            snapshot.playlist_iteration,
-        )?;
+        let authoritative_item = ItemPosition {
+            index: item_index,
+            local_ns: snapshot.item_position.get(),
+        };
         self.set_osd_enabled(snapshot.osd_enabled)?;
-        self.update_osd_metadata(OsdMetadata {
-            cue_index: item_index,
-            cue_id: snapshot.cue_id.clone(),
-            transport_state: snapshot.transport_state,
-        })?;
-        self.update_event_projection(EventProjection {
+        let Some(presented) = self.delay_projection(EventProjection {
             session: authority.session,
             generation: snapshot.generation,
             anchor_clock: snapshot.anchor_clock,
-            anchor_media_position: local_media_position,
-            anchor_item: ItemPosition {
-                index: item_index,
-                local_ns: snapshot.item_position.get(),
-            },
+            anchor_media_position: self
+                .sequence
+                .position_for_remote_snapshot(authoritative_item, snapshot.playlist_iteration)?,
+            anchor_item: authoritative_item,
             cue_occurrence: snapshot.cue_occurrence,
             playlist_iteration: snapshot.playlist_iteration,
             transport_state: snapshot.transport_state,
             debug_loop: snapshot.debug_loop,
+        })?
+        else {
+            return Ok(());
+        };
+        self.update_osd_metadata(OsdMetadata {
+            cue_index: presented.anchor_item.index,
+            cue_id: self.sequence.cue_ids[presented.anchor_item.index].clone(),
+            transport_state: presented.transport_state,
         })?;
+        self.update_event_projection(presented)?;
 
         let refreshed = ReleasePlan {
             generation: snapshot.generation,
             operation: snapshot.operation,
-            transport_state: snapshot.transport_state,
-            media_position: local_media_position,
-            release_at: snapshot.anchor_clock,
+            transport_state: presented.transport_state,
+            media_position: presented.anchor_media_position,
+            release_at: presented.anchor_clock,
         };
         let mut plan = self
             .plan
@@ -3755,9 +3880,9 @@ impl Player {
         if plan.as_ref() != Some(&refreshed) {
             debug!(
                 transport_generation = snapshot.generation,
-                anchor_clock_ns = snapshot.anchor_clock.get(),
+                anchor_clock_ns = presented.anchor_clock.get(),
                 authoritative_position_ns = snapshot.media_position.get(),
-                local_anchor_position_ns = local_media_position.get(),
+                local_anchor_position_ns = presented.anchor_media_position.get(),
                 item_index,
                 item_position_ns = snapshot.item_position.get(),
                 playlist_iteration = snapshot.playlist_iteration,
@@ -3768,8 +3893,69 @@ impl Player {
         *self
             .transport_state
             .lock()
-            .map_err(|_| anyhow!("transport state lock poisoned"))? = snapshot.transport_state;
+            .map_err(|_| anyhow!("transport state lock poisoned"))? = presented.transport_state;
         Ok(())
+    }
+
+    /// Converts an authoritative anchor into the anchor this player presents.
+    ///
+    /// Returns `None` when the snapshot must not replace the current plan:
+    /// the Master has completed a non-looping program while this delayed
+    /// player still has media left to present.
+    fn delay_projection(&self, authoritative: EventProjection) -> Result<Option<EventProjection>> {
+        let delay = self.presentation_delay;
+        if delay.is_zero() || authoritative.debug_loop.is_some() {
+            return Ok(Some(authoritative));
+        }
+        let completed_while_playing = authoritative.transport_state == TransportState::Paused
+            && self
+                .plan
+                .lock()
+                .map_err(|_| anyhow!("plan lock poisoned"))?
+                .is_some_and(|plan| {
+                    plan.generation == authoritative.generation
+                        && plan.transport_state != TransportState::Paused
+                });
+        if completed_while_playing {
+            // Operator pauses always start a new generation, so a playing
+            // generation that becomes paused has reached the end of a
+            // non-looping program. The delayed timeline still has `delay` of
+            // media left to present; keep following it.
+            debug!(
+                transport_generation = authoritative.generation,
+                presentation_delay_ns = delay.get(),
+                "Master completed the program; delayed Slave continues to its own end"
+            );
+            return Ok(None);
+        }
+        let (anchor_media_position, anchor_clock) = delay.apply(
+            authoritative.anchor_media_position,
+            authoritative.anchor_clock,
+            authoritative.transport_state,
+        )?;
+        let (anchor_item, playlist_iteration, cue_occurrence) = delayed_cue_identity(
+            &self.sequence,
+            authoritative.anchor_item,
+            authoritative.playlist_iteration,
+            authoritative.cue_occurrence,
+            anchor_media_position,
+        )?;
+        let now = ClockNs::new(self.clock()?.time().nseconds());
+        let transport_state =
+            if authoritative.transport_state == TransportState::Playing && anchor_clock > now {
+                TransportState::Waiting
+            } else {
+                authoritative.transport_state
+            };
+        Ok(Some(EventProjection {
+            anchor_clock,
+            anchor_media_position,
+            anchor_item,
+            cue_occurrence,
+            playlist_iteration,
+            transport_state,
+            ..authoritative
+        }))
     }
 
     fn monitor(
@@ -5373,12 +5559,13 @@ mod tests {
         DriftAction, DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy,
         FitMode, HardwareDecoding, LocalDriftRecovery, MasterSession, MediaItem, MediaPositionNs,
         Operation, PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, PlayerRole,
-        ProgramCompatibility, ShutdownSignal, StateSnapshot, Timeline, TransportState,
-        build_playbin_video_sink, can_join_startup, combined_gain, drift_slew_enabled, finite_f64,
-        gain_db_to_linear, interruptible_sleep, local_drift_recovery, make_kms_gl_sink,
-        non_negative_seconds, recovery_attempt_is_active, scheduled_release_deadline,
-        select_video_sink, validate_playback_args, validate_snapshot_generation,
-        validate_state_datagram, validate_subscription,
+        PresentationDelay, ProgramCompatibility, ReleasePlan, ShutdownSignal, StateSnapshot,
+        Timeline, TransportState, build_playbin_video_sink, can_join_startup, combined_gain,
+        delayed_cue_identity, drift_slew_enabled, finite_f64, gain_db_to_linear,
+        interruptible_sleep, local_drift_recovery, make_kms_gl_sink, non_negative_seconds,
+        recovery_attempt_is_active, scheduled_release_deadline, select_video_sink,
+        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
+        validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -6110,6 +6297,160 @@ mod tests {
                 },
                 6,
             )
+        );
+    }
+
+    #[test]
+    fn slave_accepts_a_non_negative_presentation_delay() {
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec![
+                "syncplayer",
+                "slave",
+                "show.toml",
+                "--master",
+                "127.0.0.1:46000",
+            ];
+            arguments.extend_from_slice(extra);
+            Cli::try_parse_from(arguments)
+        };
+        let Command::Slave(args) = parse(&[]).unwrap().command else {
+            panic!("expected Slave command");
+        };
+        assert!(
+            PresentationDelay::from_seconds(args.delay)
+                .unwrap()
+                .is_zero()
+        );
+        let Command::Slave(args) = parse(&["--delay", "2.5"]).unwrap().command else {
+            panic!("expected Slave command");
+        };
+        assert_eq!(
+            PresentationDelay::from_seconds(args.delay).unwrap().get(),
+            2_500_000_000
+        );
+        assert!(parse(&["--delay", "-1"]).is_err());
+        assert!(parse(&["--delay", "inf"]).is_err());
+        assert!(
+            Cli::try_parse_from(["syncplayer", "master", "show.toml", "--delay", "1"]).is_err()
+        );
+    }
+
+    #[test]
+    fn presentation_delay_shifts_anchors_and_holds_before_the_start() {
+        let delay = PresentationDelay(5);
+        let playing = TransportState::Playing;
+        assert_eq!(
+            delay
+                .apply(MediaPositionNs::new(42), ClockNs::new(100), playing)
+                .unwrap(),
+            (MediaPositionNs::new(37), ClockNs::new(100))
+        );
+        // Two units into the authoritative timeline, the delayed player still
+        // has three units to wait on its first frame.
+        assert_eq!(
+            delay
+                .apply(MediaPositionNs::new(2), ClockNs::new(100), playing)
+                .unwrap(),
+            (MediaPositionNs::new(0), ClockNs::new(103))
+        );
+        assert_eq!(
+            delay
+                .apply(
+                    MediaPositionNs::new(2),
+                    ClockNs::new(100),
+                    TransportState::Waiting
+                )
+                .unwrap(),
+            (MediaPositionNs::new(0), ClockNs::new(103))
+        );
+        assert_eq!(
+            delay
+                .apply(
+                    MediaPositionNs::new(2),
+                    ClockNs::new(100),
+                    TransportState::Paused
+                )
+                .unwrap(),
+            (MediaPositionNs::new(0), ClockNs::new(100))
+        );
+        assert_eq!(
+            delay
+                .apply(
+                    MediaPositionNs::new(9),
+                    ClockNs::new(100),
+                    TransportState::Paused
+                )
+                .unwrap(),
+            (MediaPositionNs::new(4), ClockNs::new(100))
+        );
+        assert!(
+            delay
+                .apply(MediaPositionNs::new(0), ClockNs::new(u64::MAX), playing)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn presentation_delay_applies_to_plans_except_debug_loops() {
+        let plan = ReleasePlan {
+            generation: 3,
+            operation: Operation::Goto,
+            transport_state: TransportState::Playing,
+            media_position: MediaPositionNs::new(12),
+            release_at: ClockNs::new(1_000),
+        };
+        assert_eq!(PresentationDelay::default().delay_plan(plan).unwrap(), plan);
+        assert_eq!(
+            PresentationDelay(20).delay_plan(plan).unwrap(),
+            ReleasePlan {
+                media_position: MediaPositionNs::new(0),
+                release_at: ClockNs::new(1_008),
+                ..plan
+            }
+        );
+        let debug_loop = ReleasePlan {
+            operation: Operation::Loop,
+            ..plan
+        };
+        assert_eq!(
+            PresentationDelay(20).delay_plan(debug_loop).unwrap(),
+            debug_loop
+        );
+    }
+
+    #[test]
+    fn delayed_cue_identity_follows_cue_boundaries_and_playlist_wraps() {
+        let looping = sequence(true);
+        // Cue "b" at 2 units in the second iteration is absolute position 42.
+        let authoritative = syncplayer::playlist::ItemPosition {
+            index: 1,
+            local_ns: 2,
+        };
+        assert_eq!(
+            delayed_cue_identity(&looping, authoritative, 1, 7, MediaPositionNs::new(37)).unwrap(),
+            (
+                syncplayer::playlist::ItemPosition {
+                    index: 0,
+                    local_ns: 7,
+                },
+                1,
+                6,
+            )
+        );
+        assert_eq!(
+            delayed_cue_identity(&looping, authoritative, 1, 7, MediaPositionNs::new(27)).unwrap(),
+            (
+                syncplayer::playlist::ItemPosition {
+                    index: 1,
+                    local_ns: 17,
+                },
+                0,
+                5,
+            )
+        );
+        assert_eq!(
+            delayed_cue_identity(&looping, authoritative, 1, 7, MediaPositionNs::new(42)).unwrap(),
+            (authoritative, 1, 7)
         );
     }
 }
