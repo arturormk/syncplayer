@@ -23,6 +23,7 @@ ADR, the ADR takes precedence until a later ADR supersedes it.
 - [0010 - Schedule discontinuous transport operations against the shared clock](0010-schedule-discontinuous-transport-operations-against-the-shared-clock.md) (Accepted, 2026-09-16)
 - [0011 - Centralize structured playback diagnostics on the Master](0011-centralize-structured-playback-diagnostics-on-the-master.md) (Accepted, 2026-10-13)
 - [0012 - Let Slaves present the Master timeline with a fixed delay](0012-let-slaves-present-the-master-timeline-with-a-fixed-delay.md) (Proposed, 2026-11-06)
+- [0013 - Let a resubscription replace the previous participant](0013-let-a-resubscription-replace-the-previous-participant.md) (Accepted, 2026-11-07)
 <!-- ADR-INDEX:END -->
 
 ## Authority and lifecycle

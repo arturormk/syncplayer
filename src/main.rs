@@ -1300,7 +1300,9 @@ fn welcome_slave(mut stream: TcpStream, peer: SocketAddr, server: &SlaveServer) 
     }
 
     let result = run_master_keepalives(&mut stream, peer, server, authority, &lease);
-    let disconnect_kind = if server.authority()?.generation == authority.generation {
+    let disconnect_kind = if lease.is_superseded() {
+        "superseded"
+    } else if server.authority()?.generation == authority.generation {
         "disconnected"
     } else {
         "transport-rejoin"
@@ -1348,19 +1350,35 @@ fn accept_subscription(
             return Err(error);
         }
     };
-    let lease = match server.registry.register(
+    let connection = match stream.try_clone() {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            warn!(%peer, %error, "cannot retain Slave connection handle; a replacement subscription will not close it early");
+            None
+        }
+    };
+    let (lease, replaced) = match server.registry.register(
         &subscription,
         peer,
+        connection,
         Instant::now(),
         server.keepalive_timeout,
     ) {
-        Ok(lease) => lease,
+        Ok(registration) => registration,
         Err(error) => {
             let error = anyhow!(error);
             reject_connection(stream, &error);
             return Err(error);
         }
     };
+    if let Some(previous_peer) = replaced {
+        warn!(
+            player = %subscription.player_id,
+            %peer,
+            %previous_peer,
+            "Slave resubscribed; replacing its previous subscription"
+        );
+    }
     if subscription.software_version != env!("CARGO_PKG_VERSION") {
         warn!(
             player = %subscription.player_id,

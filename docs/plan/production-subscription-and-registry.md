@@ -9,6 +9,8 @@ Status: Complete
 - [x] Explicit acceptance or diagnostic rejection before network-clock calibration.
 - [x] Rejection of program/hash/capability incompatibility and IDs colliding with the Master.
 - [x] Tokenized active-participant registry with duplicate detection and stale expiration.
+      Duplicate detection was later replaced: a resubscription for a registered player ID now
+      replaces the previous participant and closes its control connection (ADR 0013).
 - [x] Readiness, clock synchronization, last-seen, remote address, endpoint, version, capability,
       and duration status suitable for the later console.
 - [x] Configurable Master duration tolerance and warn/reject policy.

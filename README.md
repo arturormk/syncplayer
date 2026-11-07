@@ -224,8 +224,11 @@ startup deadline for a slow or absent Slave.
 The Slave retries the initial Master connection once per second until the Master is available. It
 first subscribes with its player ID, program ID/hash, software/protocol version, capabilities,
 UDP state endpoint, and probed cue durations. The Master rejects program mismatches,
-missing capabilities, duplicate active player IDs, and duration mismatches outside its configured
-policy before the Slave calibrates a network-derived clock and accepts a release plan. The Master
+missing capabilities, and duration mismatches outside its configured policy before the Slave
+calibrates a network-derived clock and accepts a release plan. A subscription for a player ID that
+is already registered replaces the previous one: a Slave that rebooted or lost its network cannot
+announce its departure, so the Master closes the old control connection, records a `superseded`
+event, and continues with the new subscription. The Master
 receives Slave-originated keepalives on the reliable control channel and acknowledges them. If an
 acknowledgement does not arrive before the configured timeout—even when TCP still appears
 connected—the Slave closes the stale connection,
@@ -310,8 +313,9 @@ shows current/minimum/maximum/RMS error, disconnect and recovery counts, clock/t
 and the error slope in parts per million. For example, a player consistently running 0.1% slow
 converges toward approximately `-1000 ppm`. Rate windows restart after generations, disconnects,
 recoveries, unhealthy-clock periods, or transitions. The optional CSV log flushes every sample so
-long-running physical tests retain useful evidence after an abnormal exit; connection and planned
-transport-rejoin events are recorded in the same file.
+long-running physical tests retain useful evidence after an abnormal exit; connection, planned
+transport-rejoin, and `superseded` (replaced by a resubscription) events are recorded in the same
+file.
 
 A recovery means a corrective resynchronization after playback has started. Initial synchronized
 startup is not counted as a recovery. The CSV retains the internal monotonic recovery-attempt

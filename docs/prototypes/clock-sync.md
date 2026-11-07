@@ -16,9 +16,9 @@ interrupting existing playback.
 
 The bounded binary protocol is currently version 9. Before clock calibration, a Slave
 subscribes with its player identity, program identity and hash, software version, capabilities,
-state endpoint, and probed cue durations. The Master rejects incompatible or duplicate active
-participants and returns its authoritative cue durations on success. A Master session UUID
-identifies one process run; the transport generation remains stable when Slaves join and changes for
+state endpoint, and probed cue durations. The Master rejects incompatible participants, replaces
+the previous participant when a player ID resubscribes (ADR 0013), and returns its authoritative
+cue durations on success. A Master session UUID identifies one process run; the transport generation remains stable when Slaves join and changes for
 goto, stop, pause/release, debug-loop changes, and program loads. Master and Slave binaries must
 have the same protocol version.
 
@@ -117,8 +117,11 @@ of the test matrix and generated binaries do not belong in the repository.
 - Failure to synchronize the clock or preroll within the configured timeout exits clearly without
   starting unsynchronized playback.
 - A malformed, oversized, truncated, incompatible, stale, or non-future control message is rejected.
-- A Slave with a mismatched program identity or hash, missing capability, colliding player ID, or
-  duplicate active player ID is rejected before clock calibration.
+- A Slave with a mismatched program identity or hash, missing capability, or a player ID colliding
+  with the Master is rejected before clock calibration.
+- A Slave that resubscribes with an already-registered player ID (for example after a reboot)
+  replaces its previous participant immediately; the old control connection is closed and recorded
+  as `superseded`.
 - Cue-duration differences obey the configured tolerance and warn/reject policy.
 - Loss of application control keepalive is detected within eight seconds and does not immediately stop or
   blank Slave playback.

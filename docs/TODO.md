@@ -154,8 +154,9 @@ These are useful but do not block the unattended auto-start MVP:
   clock policy, decoder controls, and prepared cue handoff.
 - [x] Master clock export, Slave clock calibration, future-clock release, late join, reconnect, and
   free-running playback during control/state loss.
-- [x] Production subscription registry with compatibility, duplicate-ID, program-hash, capability,
-  duration, readiness, and liveness checks.
+- [x] Production subscription registry with compatibility, program-hash, capability, duration,
+  readiness, and liveness checks; a resubscription replaces the player's previous participant
+  (ADR 0013).
 - [x] Version 9 bounded binary TCP control and unicast UDP state protocols with complete snapshots,
   ordering checks, configurable cadence, and stale-session/generation rejection.
 - [x] Authoritative cue progression, playlist wrap, local early-EOS handling, clock-loss recovery,

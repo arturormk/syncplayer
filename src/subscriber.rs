@@ -3,7 +3,7 @@
 use crate::protocol::{Capabilities, Subscription};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,6 +51,7 @@ struct Participant {
     readiness: Readiness,
     clock_synchronized: bool,
     last_seen: Instant,
+    connection: Option<TcpStream>,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,6 @@ pub struct ParticipantLease {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RegistryError {
-    DuplicatePlayer(String),
     LockPoisoned,
     ParticipantExpired(String),
 }
@@ -70,9 +70,6 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::DuplicatePlayer(player) => {
-                write!(formatter, "player ID '{player}' is already connected")
-            }
             Self::LockPoisoned => formatter.write_str("participant registry lock poisoned"),
             Self::ParticipantExpired(player) => {
                 write!(formatter, "participant '{player}' is no longer registered")
@@ -94,26 +91,34 @@ impl ParticipantRegistry {
 
     /// Registers an active participant and returns its connection-scoped lease.
     ///
+    /// A new subscription for a player ID that is already registered replaces the previous
+    /// one: a Slave that rebooted or lost its network cannot announce its departure, so the
+    /// most recent subscription is authoritative. The previous lease expires and its control
+    /// connection, when one was supplied, is shut down so its handler stops promptly. The
+    /// remote address of the replaced participant is returned alongside the new lease.
+    ///
     /// # Errors
     ///
-    /// Returns an error for a duplicate non-stale player or poisoned registry.
+    /// Returns an error if the registry lock is poisoned.
     pub fn register(
         self: &Arc<Self>,
         subscription: &Subscription,
         remote_address: SocketAddr,
+        connection: Option<TcpStream>,
         now: Instant,
         stale_after: Duration,
-    ) -> Result<ParticipantLease, RegistryError> {
+    ) -> Result<(ParticipantLease, Option<SocketAddr>), RegistryError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| RegistryError::LockPoisoned)?;
         entries.retain(|_, participant| now.duration_since(participant.last_seen) <= stale_after);
-        if entries.contains_key(&subscription.player_id) {
-            return Err(RegistryError::DuplicatePlayer(
-                subscription.player_id.clone(),
-            ));
-        }
+        let replaced = entries.remove(&subscription.player_id).map(|previous| {
+            if let Some(stream) = &previous.connection {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            previous.remote_address
+        });
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let state_endpoint = if subscription.state_port == 0 {
             StateEndpoint::ControlConnection
@@ -135,12 +140,30 @@ impl ParticipantRegistry {
                 readiness: Readiness::Subscribed,
                 clock_synchronized: false,
                 last_seen: now,
+                connection,
             },
         );
-        Ok(ParticipantLease {
+        let lease = ParticipantLease {
             registry: self.clone(),
             player_id: subscription.player_id.clone(),
             token,
+        };
+        Ok((lease, replaced))
+    }
+
+    fn is_current(&self, player_id: &str, token: u64) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries
+                .get(player_id)
+                .is_some_and(|participant| participant.token == token)
+        })
+    }
+
+    fn is_superseded(&self, player_id: &str, token: u64) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries
+                .get(player_id)
+                .is_some_and(|participant| participant.token != token)
         })
     }
 
@@ -217,6 +240,19 @@ impl ParticipantLease {
         &self.player_id
     }
 
+    /// Returns whether this lease still owns its player ID, i.e. it has neither expired nor
+    /// been replaced by a newer subscription.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.registry.is_current(&self.player_id, self.token)
+    }
+
+    /// Returns whether a newer subscription currently owns this lease's player ID.
+    #[must_use]
+    pub fn is_superseded(&self) -> bool {
+        self.registry.is_superseded(&self.player_id, self.token)
+    }
+
     /// Marks the participant's network clock as synchronized.
     ///
     /// # Errors
@@ -281,47 +317,105 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicates_and_releases_identity_on_drop() {
+    fn new_subscription_replaces_previous_participant() {
         let registry = ParticipantRegistry::new();
         let now = Instant::now();
-        let first = registry
+        let (first, replaced) = registry
             .register(
                 &subscription("left"),
                 "127.0.0.1:1000".parse().unwrap(),
+                None,
                 now,
                 Duration::from_secs(8),
             )
             .unwrap();
-        assert!(matches!(
-            registry.register(
+        assert_eq!(replaced, None);
+        let (second, replaced) = registry
+            .register(
                 &subscription("left"),
                 "127.0.0.1:1001".parse().unwrap(),
+                None,
                 now,
-                Duration::from_secs(8)
-            ),
-            Err(RegistryError::DuplicatePlayer(_))
+                Duration::from_secs(8),
+            )
+            .unwrap();
+        assert_eq!(replaced, Some("127.0.0.1:1000".parse().unwrap()));
+        assert!(!first.is_current());
+        assert!(first.is_superseded());
+        assert!(second.is_current());
+        assert!(!second.is_superseded());
+        assert!(matches!(
+            first.mark_seen(),
+            Err(RegistryError::ParticipantExpired(_))
         ));
+
+        // Dropping the superseded lease must not evict its replacement.
         drop(first);
+        let current = registry
+            .snapshot(Instant::now(), Duration::from_secs(8))
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(
+            current[0].remote_address,
+            "127.0.0.1:1001".parse::<SocketAddr>().unwrap()
+        );
+        second.mark_seen().unwrap();
+
+        drop(second);
         assert!(
             registry
-                .register(
-                    &subscription("left"),
-                    "127.0.0.1:1001".parse().unwrap(),
-                    now,
-                    Duration::from_secs(8)
-                )
-                .is_ok()
+                .snapshot(Instant::now(), Duration::from_secs(8))
+                .unwrap()
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn replacement_shuts_down_previous_connection() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, peer) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let registry = ParticipantRegistry::new();
+        let now = Instant::now();
+        let (_first, _) = registry
+            .register(
+                &subscription("left"),
+                peer,
+                Some(server_side),
+                now,
+                Duration::from_secs(8),
+            )
+            .unwrap();
+        let (_second, _) = registry
+            .register(
+                &subscription("left"),
+                "127.0.0.1:1001".parse().unwrap(),
+                None,
+                now,
+                Duration::from_secs(8),
+            )
+            .unwrap();
+
+        let mut buffer = [0_u8; 1];
+        assert_eq!(client.read(&mut buffer).unwrap(), 0);
     }
 
     #[test]
     fn expires_stale_entries_and_tracks_readiness() {
         let registry = ParticipantRegistry::new();
         let now = Instant::now();
-        let lease = registry
+        let (lease, _) = registry
             .register(
                 &subscription("left"),
                 "127.0.0.1:1000".parse().unwrap(),
+                None,
                 now,
                 Duration::from_secs(8),
             )
@@ -349,10 +443,11 @@ mod tests {
         let registry = ParticipantRegistry::new();
         let mut details = subscription("left");
         details.state_port = 5_000;
-        let _lease = registry
+        let (_lease, _) = registry
             .register(
                 &details,
                 "192.0.2.10:1000".parse().unwrap(),
+                None,
                 Instant::now(),
                 Duration::from_secs(8),
             )
