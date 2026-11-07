@@ -219,6 +219,24 @@ enum EventActionType {
     Udp,
 }
 
+/// Finds a `delay` key written inside a `[players.<id>.<cue>]` table.
+///
+/// TOML assigns keys to the most recent table header, so `delay` placed after
+/// a cue header lands in the cue rather than the player and fails with an
+/// opaque unknown-field error. Returns the first offending player and cue.
+fn misplaced_cue_delay(text: &str) -> Option<(String, String)> {
+    let document: toml::Table = toml::from_str(text).ok()?;
+    let players = document.get("players")?.as_table()?;
+    players.iter().find_map(|(player, cues)| {
+        cues.as_table()?.iter().find_map(|(cue, settings)| {
+            settings
+                .as_table()?
+                .contains_key(DELAY_KEY)
+                .then(|| (player.clone(), cue.clone()))
+        })
+    })
+}
+
 impl ProgramConfig {
     /// Loads and structurally validates a program definition.
     ///
@@ -240,7 +258,16 @@ impl ProgramConfig {
     }
 
     fn parse(text: &str, source_path: PathBuf, base_directory: PathBuf) -> Result<Self> {
-        let document: ProgramDocument = toml::from_str(text).context("invalid program TOML")?;
+        let document: ProgramDocument = toml::from_str(text).map_err(|error| {
+            match misplaced_cue_delay(text) {
+                Some((player, cue)) => anyhow!(
+                    "`{DELAY_KEY}` is set in cue table [players.{player}.{cue}]; move it to the \
+                     player table [players.{player}], above its cue tables"
+                ),
+                None => anyhow!(error),
+            }
+            .context("invalid program TOML")
+        })?;
         if document.version != PROGRAM_VERSION {
             bail!(
                 "unsupported program version {}; expected version {PROGRAM_VERSION}",
@@ -953,6 +980,16 @@ payload_hex = "01 02 ff"
         assert!(delayed("inf").is_err());
         assert!(delayed("\"4s\"").is_err());
         assert!(parse(&PROGRAM.replace("id = \"main\"", "id = \"delay\"")).is_err());
+    }
+
+    #[test]
+    fn explains_delay_placed_in_a_cue_table() {
+        let text = PROGRAM.replace("[players.left.intro]", "[players.left.intro]\ndelay = 3");
+        let error = format!("{:#}", parse(&text).unwrap_err());
+        assert!(
+            error.contains("[players.left.intro]") && error.contains("move it to the player table"),
+            "{error}"
+        );
     }
 
     #[test]
