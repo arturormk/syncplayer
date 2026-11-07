@@ -66,8 +66,9 @@ For Raspberry Pi players, use the hardware-decoder-compatible profile:
 Both tools default to an exact 1920x1080 canvas at 25 fps and 48 kHz stereo AAC. They preserve and
 normalize an existing audio stream or insert silence when the input has no audio, keeping the
 Master's audio-driven clock available across program cue transitions. Aspect ratio is preserved with
-black padding. The Raspberry Pi profile also enforces conservative H.264 decoder limits. Both
-profiles tone-map HDR sources to SDR Rec.709. See
+black padding by default; `--fit stretch` fills the canvas instead. The Raspberry Pi profile also
+enforces conservative H.264 decoder limits. Both profiles convert colour to SDR Rec.709, tone-mapping
+HDR sources. See
 [`docs/media-preparation.md`](docs/media-preparation.md) for options and the workflow for keeping
 host-specific renditions synchronized.
 

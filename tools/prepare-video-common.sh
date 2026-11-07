@@ -12,6 +12,7 @@ FPS=25
 WIDTH=1920
 HEIGHT=1080
 PRESET=slow
+FIT=contain
 OUTPUT=""
 INPUT=""
 TMPFILE=""
@@ -57,12 +58,15 @@ Options:
                       Exact output canvas (default: 1920x1080)
       --fps N         Output frame rate (default: 25, max: $MAX_FPS)
       --preset NAME   x264 preset (default: slow)
+      --fit MODE      contain: preserve aspect ratio and pad with black (default)
+                      stretch: scale to fill the canvas, distorting the aspect
+                      ratio (for content the display stretches back)
   -f, --force         Overwrite an existing output file
   -h, --help          Show this help
 
 Sequence normalization:
   Video:              H.264, yuv420p, exact size and constant frame rate
-  Scaling:            Preserve aspect ratio and pad with black as needed
+  Scaling:            Preserve aspect ratio and pad with black (--fit contain)
   GOP:                2 seconds, fixed keyframe interval
   Color:              SDR Rec.709 (HDR inputs are tone-mapped)
   Audio:              AAC, 48 kHz, stereo; silence added when absent
@@ -139,6 +143,11 @@ while (($#)); do
             PRESET=$2
             shift 2
             ;;
+        --fit)
+            (($# >= 2)) || die "Missing argument for $1"
+            FIT=$2
+            shift 2
+            ;;
         --)
             shift
             (($# == 1)) || die "Expected exactly one input file"
@@ -179,6 +188,11 @@ command -v ffprobe >/dev/null 2>&1 || die "ffprobe is not installed"
 case "$PRESET" in
     ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow) ;;
     *) die "Invalid x264 preset: $PRESET" ;;
+esac
+
+case "$FIT" in
+    contain|stretch) ;;
+    *) die "Invalid fit mode: $FIT (expected contain or stretch)" ;;
 esac
 
 ffprobe -v error -select_streams v:0 \
@@ -232,8 +246,24 @@ OUTPUT_DIR=$(dirname -- "$OUTPUT")
 TMPFILE=$(mktemp "${OUTPUT}.tmp.XXXXXXXX.mp4") ||
     die "Could not create temporary output file"
 
-VIDEO_FILTER="fps=${FPS},scale=w=${WIDTH}:h=${HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-VIDEO_FILTER+=",pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+SCALE_ARGS="w=${WIDTH}:h=${HEIGHT}"
+if [[ "$FIT" == contain ]]; then
+    SCALE_ARGS+=":force_original_aspect_ratio=decrease:force_divisible_by=2"
+fi
+if ((!HDR_TO_SDR)); then
+    # swscale converts RGB and BT.601 sources with its BT.601 default unless
+    # told otherwise, which would contradict the Rec.709 tags written below.
+    # HDR sources get their matrix conversion from zscale instead: FFmpeg 4.4's
+    # scale filter does not update frame color tags, so converting here would
+    # mislead the tone-mapping chain.
+    SCALE_ARGS+=":out_color_matrix=bt709:out_range=tv"
+fi
+
+VIDEO_FILTER="fps=${FPS},scale=${SCALE_ARGS}"
+if [[ "$FIT" == contain ]]; then
+    VIDEO_FILTER+=",pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black"
+fi
+VIDEO_FILTER+=",setsar=1"
 
 if ((HDR_TO_SDR)); then
     VIDEO_FILTER+=",zscale=transfer=linear:npl=100,format=gbrpf32le"
@@ -316,7 +346,7 @@ fi
 echo "CRF:        $CRF"
 echo "Preset:     $PRESET"
 echo "FPS:        $FPS"
-echo "Size:       ${WIDTH}x${HEIGHT}"
+echo "Size:       ${WIDTH}x${HEIGHT} (fit: $FIT)"
 if ((HDR_TO_SDR)); then
     echo "Color:      HDR ($INPUT_COLOR_TRANSFER) -> SDR Rec.709"
 else

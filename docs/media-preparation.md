@@ -27,6 +27,15 @@ Use the same overrides for every item in a playlist when a different format is r
 ./tools/prepare-video-for-pc.sh --size 1280x720 --fps 30 source/example.mov
 ```
 
+`--fit stretch` scales the source to fill the canvas instead of padding it, distorting the aspect
+ratio. Use it for content authored at another aspect ratio that the display stretches back, for
+example 1920x1200 material shown on a 16:10 output through a Raspberry Pi, whose decoder is limited
+to 1920x1080; play it with `--fit stretch` as well.
+
+Both tools convert colour explicitly to the Rec.709 matrix they tag. RGB sources (PNG/TIFF
+sequences, ProRes 4444, screen recordings) and SD BT.601 sources are therefore reproduced without the
+hue and saturation shift that a relabelled BT.601 conversion would cause.
+
 ## Raspberry Pi renditions
 
 If any player is a Raspberry Pi, prepare every video intended for that player with
