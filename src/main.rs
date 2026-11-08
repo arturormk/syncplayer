@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use gst::glib;
 use gst::prelude::*;
-use gst_gl::prelude::ContextGLExt;
+use gst_gl::prelude::{ContextGLExt, GLContextExt, GLDisplayExt};
 use gstreamer as gst;
 use gstreamer_gl as gst_gl;
 use gstreamer_net as gst_net;
@@ -5201,13 +5202,87 @@ fn configure_video_sink(sink: &gst::Element, args: &PlaybackArgs) -> Result<()> 
     Ok(())
 }
 
+/// EGL configuration requested for GL contexts that render into a GBM scanout surface.
+///
+/// The GBM window of `GStreamer` GL creates its surface in the EGL config's native format but registers each
+/// buffer with the legacy `drmModeAddFB(depth 32, bpp 32)`, which the kernel always reads as
+/// ARGB8888. Mesa v3d ranks its A2R10G10B10 config first, so without this request every
+/// intermediate pixel value is scanned out scrambled (INC-0007). Requiring eight alpha bits
+/// excludes the 2-bit-alpha configs.
+const GBM_EGL_CONFIG: &str =
+    "gst-gl-context-config,red-size=(int)8,green-size=(int)8,blue-size=(int)8,alpha-size=(int)8";
+
+/// Ask every GBM GL display that appears in `pipeline` to create 8-bit-per-channel contexts.
+///
+/// GL elements announce the display they create with a synchronous `HAVE_CONTEXT` message before
+/// they create their context, so a sync handler can reach displays created inside `autovideosink`
+/// or `glimagesink`. Displays the application provides (`--kms-gl`) are handled directly by
+/// `configure_kms_gl_context`.
+fn guard_gbm_scanout_format(pipeline: &gst::Pipeline) {
+    let Some(bus) = pipeline.bus() else {
+        return;
+    };
+    bus.set_sync_handler(|_, message| {
+        if let gst::MessageView::HaveContext(have) = message.view()
+            && let Some(display) = have.context().gl_display()
+        {
+            request_eight_bit_gbm_contexts(&display);
+        }
+        gst::BusSyncReply::Pass
+    });
+}
+
+fn request_eight_bit_gbm_contexts(display: &gst_gl::GLDisplay) {
+    if display.handle_type() != gst_gl::GLDisplayType::GBM {
+        return;
+    }
+    let Some(signal) = glib::subclass::SignalId::lookup("create-context", display.type_()) else {
+        return;
+    };
+    if glib::signal::signal_has_handler_pending(display, signal, None, true) {
+        return;
+    }
+    // Connect generically: the typed binding cannot represent the NULL `other_context` that
+    // glimagesink normally passes.
+    display.connect("create-context", false, |values| {
+        let no_context = || Some(None::<gst_gl::GLContext>.to_value());
+        let Ok(display) = values[0].get::<gst_gl::GLDisplay>() else {
+            return no_context();
+        };
+        let other = values[1].get::<Option<gst_gl::GLContext>>().ok().flatten();
+        let config = GBM_EGL_CONFIG
+            .parse::<gst::Structure>()
+            .expect("the GBM EGL config is a valid structure");
+        let context = gst_gl::GLContext::new(&display);
+        if !context.request_config(Some(config)) {
+            warn!("GStreamer GL rejected the 8-bit GBM config request; using its default config");
+            return no_context();
+        }
+        match context.create(other.as_ref()) {
+            Ok(()) => {
+                info!(
+                    config = GBM_EGL_CONFIG,
+                    "created GBM GL context with 8-bit scanout config"
+                );
+                Some(context.to_value())
+            }
+            Err(error) => {
+                warn!(%error, "8-bit GBM GL context unavailable; using GStreamer's default config");
+                no_context()
+            }
+        }
+    });
+}
+
 fn configure_kms_gl_context(pipeline: &gst::Pipeline, args: &PlaybackArgs) -> Result<()> {
+    guard_gbm_scanout_format(pipeline);
     if !args.kms_gl {
         return Ok(());
     }
     let display = gst_gl::GLDisplay::with_type(gst_gl::GLDisplayType::GBM).context(
         "--kms-gl requires GStreamer GL built with Mesa GBM support and an accessible DRM device",
     )?;
+    request_eight_bit_gbm_contexts(&display);
     let mut context = gst::Context::new(gst_gl::GL_DISPLAY_CONTEXT_TYPE, true);
     context
         .get_mut()
@@ -5592,15 +5667,15 @@ mod tests {
     use super::{
         ActiveConnections, Authority, Cli, ClockNs, ClockPolicy, Command, DRIFT_RECOVERY_COOLDOWN,
         DriftAction, DriftPolicy, DriftSlewAction, DriftSlewController, DurationMismatchPolicy,
-        FitMode, HardwareDecoding, LocalDriftRecovery, MasterSession, MediaItem, MediaPositionNs,
-        Operation, PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, PlayerRole,
-        PresentationDelay, ProgramCompatibility, ReleasePlan, ShutdownSignal, StateSnapshot,
-        Timeline, TransportState, build_playbin_video_sink, can_join_startup, combined_gain,
-        delayed_cue_identity, drift_slew_enabled, finite_f64, gain_db_to_linear,
-        interruptible_sleep, local_drift_recovery, make_kms_gl_sink, non_negative_seconds,
-        recovery_attempt_is_active, scheduled_release_deadline, select_video_sink,
-        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
-        validate_subscription,
+        FitMode, GBM_EGL_CONFIG, HardwareDecoding, LocalDriftRecovery, MasterSession, MediaItem,
+        MediaPositionNs, Operation, PlaybackSequence, PlaybackWatchdogController,
+        PlaybackWatchdogEvent, PlayerRole, PresentationDelay, ProgramCompatibility, ReleasePlan,
+        ShutdownSignal, StateSnapshot, Timeline, TransportState, build_playbin_video_sink,
+        can_join_startup, combined_gain, delayed_cue_identity, drift_slew_enabled, finite_f64,
+        gain_db_to_linear, interruptible_sleep, local_drift_recovery, make_kms_gl_sink,
+        non_negative_seconds, recovery_attempt_is_active, scheduled_release_deadline,
+        select_video_sink, validate_playback_args, validate_snapshot_generation,
+        validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -5891,6 +5966,18 @@ mod tests {
                 .to_string()
                 .contains("does not yet support --width/--height")
         );
+    }
+
+    #[test]
+    fn gbm_egl_config_excludes_ten_bit_scanout_formats() {
+        gst::init().unwrap();
+        let config: gst::Structure = GBM_EGL_CONFIG.parse().unwrap();
+        assert_eq!(config.name(), "gst-gl-context-config");
+        for field in ["red-size", "green-size", "blue-size"] {
+            assert_eq!(config.get::<i32>(field).unwrap(), 8, "{field}");
+        }
+        // A2R10G10B10 has two alpha bits; requiring eight is what excludes it.
+        assert_eq!(config.get::<i32>("alpha-size").unwrap(), 8);
     }
 
     #[test]
