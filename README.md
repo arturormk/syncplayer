@@ -168,7 +168,11 @@ workaround_gst_v4l2codecs_sand_bug = true
 The workaround inserts an in-process element at the head of the video chain. It refuses
 SAND128 `DMA_DRM` caps, which makes the decoder fall back to system-memory `NV12_128C8`, and
 untiles those frames to linear `NV12` on the CPU. Every other format, including DMA-BUF H.264,
-passes through unchanged. It costs about 10 ms of one core per 1920x1200 frame (larger frames use
+passes through unchanged. So that the element receives the decoder's output directly, `playbin3`
+is told not to insert its own converters (its `native-video` flag is set and `deinterlace` and
+`soft-colorbalance` are cleared); Syncplayer's own video chain still converts and scales, but
+interlaced media is not deinterlaced while the workaround is enabled. After preroll the log reports
+the caps reaching the element and warns if `v4l2slh265dec` output is not being converted. It costs about 10 ms of one core per 1920x1200 frame (larger frames use
 two threads) plus the upload of system-memory video. With `--kms-gl`, the DMA-BUF requirement
 described above is relaxed to a warning because untiled frames are in system memory. The startup
 log reports the workaround and its source, and a line such as `v4l2codecs SAND128 workaround active`

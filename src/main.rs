@@ -3242,6 +3242,9 @@ impl Player {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
+        if sequence.gst_v4l2codecs_sand_workaround {
+            log_sand_workaround_input(&pipeline);
+        }
         log_and_validate_video_negotiation(
             &osd_overlay,
             args,
@@ -3336,6 +3339,9 @@ impl Player {
             .property("force-aspect-ratio", args.fit == FitMode::Contain)
             .build()
             .context("playbin3 is unavailable")?;
+        if sequence.gst_v4l2codecs_sand_workaround {
+            disable_playsink_video_conversion(&element)?;
+        }
         let (video_sink, osd_overlay) =
             build_playbin_video_sink(args, sequence.gst_v4l2codecs_sand_workaround)?;
         let video_rate_control = video_sink.clone();
@@ -3411,6 +3417,9 @@ impl Player {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
+        if sequence.gst_v4l2codecs_sand_workaround {
+            log_sand_workaround_input(&pipeline);
+        }
         log_and_validate_video_negotiation(
             &osd_overlay,
             args,
@@ -5166,6 +5175,82 @@ fn make_sand_untile(name: &str) -> Result<gst::Element> {
         .context("v4l2codecs SAND128 workaround element is unavailable")
 }
 
+/// Stops `playsink` from inserting its own deinterlace, color-balance, and
+/// conversion elements ahead of the video-sink bin.
+///
+/// Those elements would convert the decoder's output before the v4l2codecs
+/// SAND128 workaround sees it, so the workaround must sit directly behind the
+/// decoder. The video-sink bin still converts and scales on its own.
+fn disable_playsink_video_conversion(playbin: &gst::Element) -> Result<()> {
+    let value = playbin.property_value("flags");
+    let class = gst::glib::FlagsClass::with_type(value.type_())
+        .context("playbin3 'flags' is not a flags property")?;
+    let flags = class
+        .builder_with_value(value)
+        .context("playbin3 'flags' cannot be edited")?
+        .set_by_nick("native-video")
+        .unset_by_nick("deinterlace")
+        .unset_by_nick("soft-colorbalance")
+        .build()
+        .context(
+            "playbin3 does not support the native-video, deinterlace, and soft-colorbalance flags",
+        )?;
+    playbin.set_property_from_value("flags", &flags);
+    info!(
+        flags = ?flags,
+        "playbin3 converters disabled so the v4l2codecs SAND128 workaround receives decoder output"
+    );
+    Ok(())
+}
+
+/// Reports which caps reach the v4l2codecs SAND128 workaround element, and
+/// warns when the HEVC decoder feeds it anything other than the tiled format.
+fn log_sand_workaround_input(pipeline: &gst::Pipeline) {
+    let mut untile_caps = Vec::new();
+    let mut hevc_decoder = false;
+    for element in pipeline
+        .iterate_recurse()
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let Some(factory) = element.factory() else {
+            continue;
+        };
+        if factory.name() == "v4l2slh265dec" {
+            hevc_decoder = true;
+        }
+        if factory.name() == syncplayer::v4l2codecs_workaround::ELEMENT_NAME {
+            untile_caps.push(
+                element
+                    .static_pad("sink")
+                    .and_then(|pad| pad.current_caps()),
+            );
+        }
+    }
+    for caps in untile_caps {
+        let converting = caps.as_ref().is_some_and(|caps| {
+            caps.structure(0)
+                .and_then(|structure| structure.get::<&str>("format").ok())
+                == Some(v4l2codecs_workaround::SAND_FORMAT)
+        });
+        let caps = caps.as_ref().map(ToString::to_string);
+        if converting {
+            info!(caps, "v4l2codecs SAND128 workaround input");
+        } else if hevc_decoder {
+            warn!(
+                caps,
+                "v4l2codecs SAND128 workaround is not converting the v4l2slh265dec output; colors \
+                 may still be wrong"
+            );
+        } else {
+            info!(
+                caps,
+                "v4l2codecs SAND128 workaround passing video through (no v4l2slh265dec selected)"
+            );
+        }
+    }
+}
+
 fn build_playbin_video_sink(
     args: &PlaybackArgs,
     gst_v4l2codecs_sand_workaround: bool,
@@ -5681,11 +5766,11 @@ mod tests {
         Operation, PlaybackSequence, PlaybackWatchdogController, PlaybackWatchdogEvent, PlayerRole,
         PresentationDelay, ProgramCompatibility, ReleasePlan, ShutdownSignal, StateSnapshot,
         Timeline, TransportState, build_playbin_video_sink, can_join_startup, combined_gain,
-        delayed_cue_identity, drift_slew_enabled, finite_f64, gain_db_to_linear,
-        interruptible_sleep, local_drift_recovery, make_kms_gl_sink, non_negative_seconds,
-        recovery_attempt_is_active, scheduled_release_deadline, select_video_sink,
-        validate_playback_args, validate_snapshot_generation, validate_state_datagram,
-        validate_subscription,
+        delayed_cue_identity, disable_playsink_video_conversion, drift_slew_enabled, finite_f64,
+        gain_db_to_linear, interruptible_sleep, local_drift_recovery, make_kms_gl_sink,
+        non_negative_seconds, recovery_attempt_is_active, scheduled_release_deadline,
+        select_video_sink, validate_playback_args, validate_snapshot_generation,
+        validate_state_datagram, validate_subscription,
     };
     use clap::Parser;
     use gst::prelude::*;
@@ -6083,6 +6168,32 @@ mod tests {
                 .iter()
                 .any(|name| name == syncplayer::v4l2codecs_workaround::ELEMENT_NAME)
         );
+    }
+
+    #[test]
+    fn sand_workaround_disables_playsink_converters() {
+        gst::init().unwrap();
+        let playbin = gst::ElementFactory::make("playbin3").build().unwrap();
+        let nicks = |playbin: &gst::Element| {
+            let value = playbin.property_value("flags");
+            let class = gst::glib::FlagsClass::with_type(value.type_()).unwrap();
+            class
+                .values()
+                .iter()
+                .filter(|flag| class.is_set_by_nick(&value, flag.nick()))
+                .map(|flag| flag.nick().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let before = nicks(&playbin);
+        assert!(before.iter().any(|nick| nick == "deinterlace"));
+        disable_playsink_video_conversion(&playbin).unwrap();
+        let after = nicks(&playbin);
+        assert!(after.iter().any(|nick| nick == "native-video"));
+        assert!(!after.iter().any(|nick| nick == "deinterlace"));
+        assert!(!after.iter().any(|nick| nick == "soft-colorbalance"));
+        for kept in ["video", "audio", "soft-volume"] {
+            assert!(after.iter().any(|nick| nick == kept), "{kept}");
+        }
     }
 
     #[test]

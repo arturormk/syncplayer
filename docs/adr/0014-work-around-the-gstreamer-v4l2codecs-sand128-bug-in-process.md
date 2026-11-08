@@ -38,6 +38,11 @@ Syncplayer feature:
   upstream wherever downstream accepts system-memory `NV12`, and untiles `NV12_128C8` to `NV12`. It
   derives each plane's column height from its memory size. Every other format and memory type
   passes through unchanged.
+- In the `playbin3` pipeline, the workaround sets playbin's `native-video` flag and clears
+  `deinterlace` and `soft-colorbalance`, because `playsink` otherwise inserts its own
+  `videoconvert` ahead of the video-sink bin and the element would only ever see converted frames.
+  After preroll Syncplayer logs the caps reaching the element and warns when `v4l2slh265dec`
+  output is not being converted.
 - Under `--kms-gl` with the workaround enabled, a negotiated output without DMA-BUF is logged as a
   warning instead of rejected.
 - Independently of the switch, Syncplayer warns when it negotiates SAND128 `DMA_DRM` caps.
@@ -56,6 +61,7 @@ Negative / Trade-offs:
 
 - Untiling costs CPU (about 26% of one core at 1920x1200@25, more for larger frames) and the GPU
   upload of system-memory video replaces a zero-copy import.
+- Interlaced media is not deinterlaced while the workaround is enabled.
 - Any SAND128 `DMA_DRM` path is refused while the workaround is enabled, including a correctly
   labelled one from a future fixed decoder.
 - The single-memory input layout is inferred from the video meta and has not been observed on
