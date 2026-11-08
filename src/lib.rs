@@ -10,5 +10,4 @@ pub mod protocol;
 pub mod subscriber;
 pub mod time;
 pub mod transport;
-pub mod v4l2codecs_workaround;
 pub mod validation;

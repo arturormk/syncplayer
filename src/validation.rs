@@ -362,7 +362,6 @@ mod tests {
             player_id: PlayerId::new("left").unwrap(),
             looping: true,
             presentation_delay: 0.0,
-            gst_v4l2codecs_sand_workaround: false,
             cues: vec![
                 ResolvedCue {
                     id: "a".to_owned(),
@@ -440,7 +439,6 @@ mod tests {
             player_id: PlayerId::new("left").unwrap(),
             looping: false,
             presentation_delay: 0.0,
-            gst_v4l2codecs_sand_workaround: false,
             cues: vec![ResolvedCue {
                 id: "a".to_owned(),
                 video: path.clone(),
