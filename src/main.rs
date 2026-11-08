@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 use syncplayer::console::{ConsoleCommand, HELP as CONSOLE_HELP, OsdCommand, parse_command};
 use syncplayer::diagnostics::DiagnosticsHub;
 use syncplayer::events::{EventCue, EventObservation, EventRuntime};
+use syncplayer::overlay::{
+    self, DEFAULT_OVERLAY_PORT, Geometry as OverlayGeometry, LayerStore, OverlayServer,
+    Request as OverlayRequest, Response as OverlayResponse, attach_layers_around_osd,
+};
 use syncplayer::playlist::{ItemPosition, PlaylistCursor, Timeline};
 use syncplayer::program::{ProgramConfig, ProgramHash, ResolvedProgram};
 use syncplayer::protocol::{
@@ -70,6 +74,8 @@ enum Command {
     Slave(SlaveArgs),
     /// Validate a shared program for the selected local player.
     Validate(ValidateArgs),
+    /// Set, move, list, or remove overlay layers on a player started with `--overlay-bind`.
+    Overlay(OverlayArgs),
 }
 
 #[derive(Debug, Args)]
@@ -216,6 +222,14 @@ struct PlaybackArgs {
     /// Override `GStreamer`'s automatically selected audio sink.
     #[arg(long)]
     audio_sink: Option<String>,
+
+    /// Accept overlay layers for this player on this TCP address (for example 0.0.0.0:46002).
+    #[arg(long, value_name = "IP:PORT")]
+    overlay_bind: Option<SocketAddr>,
+
+    /// Shared token that overlay clients must present.
+    #[arg(long, value_name = "TOKEN", requires = "overlay_bind")]
+    overlay_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -262,6 +276,7 @@ fn main() -> Result<()> {
         Command::Master(args) => run_master(&args, &ShutdownSignal::install()?),
         Command::Slave(args) => run_slave(&args, &ShutdownSignal::install()?),
         Command::Validate(args) => run_validate(&args),
+        Command::Overlay(args) => run_overlay_client(&args),
     }
 }
 
@@ -292,6 +307,7 @@ impl ShutdownSignal {
 #[allow(clippy::too_many_lines)]
 fn run_master(args: &MasterArgs, shutdown: &ShutdownSignal) -> Result<()> {
     validate_playback_args(&args.playback)?;
+    let overlay = OverlayService::start(&args.playback)?;
     // Let the pipeline choose its natural clock. With a real audio sink this
     // is normally the device-backed audio clock, so the Master does not have
     // to slave its own output to an unrelated system clock.
@@ -316,6 +332,7 @@ fn run_master(args: &MasterArgs, shutdown: &ShutdownSignal) -> Result<()> {
         mismatch_policy: args.duration_mismatch,
     };
     let player = Arc::new(Player::new(&args.playback, sequence, None, false)?);
+    OverlayService::attach(overlay.as_ref(), &player)?;
     let clock = player.clock()?;
     let bind_ip = match args.bind.ip() {
         IpAddr::V4(ip) => ip.to_string(),
@@ -440,6 +457,7 @@ fn run_master(args: &MasterArgs, shutdown: &ShutdownSignal) -> Result<()> {
 
 fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
     validate_playback_args(&args.playback)?;
+    let overlay = OverlayService::start(&args.playback)?;
     let program = load_runtime_program(&args.playback)?;
     let sequence = PlaybackSequence::prepare(&program)?;
     let state_socket = UdpSocket::bind(args.state_bind)
@@ -461,6 +479,7 @@ fn run_slave(args: &SlaveArgs, shutdown: &ShutdownSignal) -> Result<()> {
         Player::new(&args.playback, sequence, Some(&clock), args.drift_slew)?
             .with_presentation_delay(presentation_delay),
     );
+    OverlayService::attach(overlay.as_ref(), &player)?;
     let plan = receive_release(&mut stream, &clock, authority)?;
     let plan = player.apply_control_plan(&clock, plan)?;
     report_prepared(&mut stream, authority)?;
@@ -4958,6 +4977,281 @@ fn media_uri(path: &Path) -> Result<String> {
     gst::glib::filename_to_uri(&canonical, None)
         .map(String::from)
         .with_context(|| format!("cannot convert {} to a file URI", canonical.display()))
+}
+
+/// The optional per-player overlay layer listener (ADR 0014).
+///
+/// The listener starts before the pipeline so a bad address fails fast and layers sent while a
+/// Slave still waits for its Master are shown as soon as video starts.
+struct OverlayService {
+    server: OverlayServer,
+    store: Arc<LayerStore>,
+}
+
+impl OverlayService {
+    fn start(args: &PlaybackArgs) -> Result<Option<Self>> {
+        let Some(bind) = args.overlay_bind else {
+            return Ok(None);
+        };
+        let listener = TcpListener::bind(bind)
+            .with_context(|| format!("failed to bind overlay listener {bind}"))?;
+        let store = Arc::new(LayerStore::new());
+        let server = OverlayServer::spawn(listener, store.clone(), args.overlay_token.clone())
+            .context("failed to start overlay listener")?;
+        info!(
+            address = %server.local_addr(),
+            token_required = args.overlay_token.is_some(),
+            "overlay layer listener ready"
+        );
+        Ok(Some(Self { server, store }))
+    }
+
+    fn attach(service: Option<&Self>, player: &Player) -> Result<()> {
+        let Some(service) = service else {
+            return Ok(());
+        };
+        attach_layers_around_osd(&player.osd_overlay, service.store.clone())
+            .map_err(|error| anyhow!("failed to attach overlay layers: {error}"))?;
+        debug!(address = %service.server.local_addr(), "overlay layers attached to video");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+struct OverlayArgs {
+    /// Player overlay address as HOST or HOST:PORT; the port defaults to 46002.
+    #[arg(long, value_name = "HOST[:PORT]")]
+    player: String,
+
+    /// Shared token configured on the player with `--overlay-token`.
+    #[arg(long, value_name = "TOKEN", default_value = "")]
+    token: String,
+
+    /// Seconds to wait for the connection and for each reply.
+    #[arg(long, default_value_t = 10.0, value_parser = positive_seconds)]
+    timeout: f64,
+
+    #[command(subcommand)]
+    action: OverlayAction,
+}
+
+#[derive(Debug, Subcommand)]
+enum OverlayAction {
+    /// Create or replace a layer from a PNG file.
+    Put {
+        /// Layer name: 1-64 ASCII letters, digits, '.', '_' or '-'.
+        #[arg(long)]
+        id: String,
+        /// Render rectangle X,Y,W,H in output pixels; defaults to the image size at 0,0.
+        #[arg(long, value_name = "X,Y,W,H", allow_hyphen_values = true, value_parser = parse_overlay_rect)]
+        rect: Option<OverlayRect>,
+        /// Top-left corner X,Y, rendering the image at its own size.
+        #[arg(long, value_name = "X,Y", allow_hyphen_values = true, conflicts_with = "rect", value_parser = parse_overlay_point)]
+        at: Option<(i32, i32)>,
+        /// Stacking order; higher values are drawn on top.
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        z: i16,
+        /// Whole-layer opacity from 0 to 1.
+        #[arg(long, default_value_t = 1.0, value_parser = parse_overlay_opacity)]
+        opacity: f64,
+        /// PNG image, ideally with an alpha channel.
+        #[arg(value_name = "PNG")]
+        file: PathBuf,
+    },
+    /// Change a layer's position, size, stacking, or opacity without resending its image.
+    Move {
+        #[arg(long)]
+        id: String,
+        /// New render rectangle X,Y,W,H.
+        #[arg(long, value_name = "X,Y,W,H", allow_hyphen_values = true, value_parser = parse_overlay_rect)]
+        rect: Option<OverlayRect>,
+        /// New top-left corner X,Y, keeping the current size.
+        #[arg(long, value_name = "X,Y", allow_hyphen_values = true, conflicts_with = "rect", value_parser = parse_overlay_point)]
+        at: Option<(i32, i32)>,
+        #[arg(long, allow_hyphen_values = true)]
+        z: Option<i16>,
+        #[arg(long, value_parser = parse_overlay_opacity)]
+        opacity: Option<f64>,
+    },
+    /// Remove one layer.
+    Delete {
+        #[arg(long)]
+        id: String,
+    },
+    /// Remove every layer.
+    Clear,
+    /// Show the layers in drawing order, bottom first.
+    List,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OverlayRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn parse_overlay_rect(value: &str) -> Result<OverlayRect, String> {
+    let parts: Vec<_> = value.split(',').map(str::trim).collect();
+    let [x, y, width, height] = parts.as_slice() else {
+        return Err("expected X,Y,W,H".to_owned());
+    };
+    let rect = OverlayRect {
+        x: x.parse().map_err(|_| "X must be an integer".to_owned())?,
+        y: y.parse().map_err(|_| "Y must be an integer".to_owned())?,
+        width: width
+            .parse()
+            .map_err(|_| "W must be a positive integer".to_owned())?,
+        height: height
+            .parse()
+            .map_err(|_| "H must be a positive integer".to_owned())?,
+    };
+    if rect.width == 0 || rect.height == 0 {
+        return Err("W and H must be positive".to_owned());
+    }
+    Ok(rect)
+}
+
+fn parse_overlay_point(value: &str) -> Result<(i32, i32), String> {
+    let (x, y) = value.split_once(',').ok_or("expected X,Y")?;
+    Ok((
+        x.trim().parse().map_err(|_| "X must be an integer")?,
+        y.trim().parse().map_err(|_| "Y must be an integer")?,
+    ))
+}
+
+fn parse_overlay_opacity(value: &str) -> Result<f64, String> {
+    let opacity: f64 = value.parse().map_err(|_| "must be a number".to_owned())?;
+    if (0.0..=1.0).contains(&opacity) {
+        Ok(opacity)
+    } else {
+        Err("must be between 0 and 1".to_owned())
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn opacity_byte(opacity: f64) -> u8 {
+    // The parser bounds the value to 0..=1, so the rounded product fits in a byte.
+    (opacity * 255.0).round() as u8
+}
+
+/// Adds the default overlay port to a bare host name or address.
+fn overlay_address(player: &str) -> String {
+    if player.parse::<SocketAddr>().is_ok() {
+        return player.to_owned();
+    }
+    if let Some((host, port)) = player.rsplit_once(':')
+        && !host.contains(':')
+        && port.parse::<u16>().is_ok()
+    {
+        return player.to_owned();
+    }
+    let host = player.trim_start_matches('[').trim_end_matches(']');
+    if host.contains(':') {
+        format!("[{host}]:{DEFAULT_OVERLAY_PORT}")
+    } else {
+        format!("{host}:{DEFAULT_OVERLAY_PORT}")
+    }
+}
+
+fn run_overlay_client(args: &OverlayArgs) -> Result<()> {
+    let address = overlay_address(&args.player);
+    let timeout = Duration::from_secs_f64(args.timeout);
+    let send = |request: &OverlayRequest| {
+        overlay::send_request(address.as_str(), &args.token, request, timeout)
+            .with_context(|| format!("overlay request to {address} failed"))
+    };
+    let request = match &args.action {
+        OverlayAction::Put {
+            id,
+            rect,
+            at,
+            z,
+            opacity,
+            file,
+        } => {
+            let png = std::fs::read(file)
+                .with_context(|| format!("failed to read {}", file.display()))?;
+            let (x, y, width, height) = match (rect, at) {
+                (Some(rect), _) => (rect.x, rect.y, rect.width, rect.height),
+                (None, Some((x, y))) => (*x, *y, 0, 0),
+                (None, None) => (0, 0, 0, 0),
+            };
+            OverlayRequest::Put {
+                id: id.clone(),
+                geometry: OverlayGeometry {
+                    x,
+                    y,
+                    width,
+                    height,
+                    z: *z,
+                    opacity: opacity_byte(*opacity),
+                },
+                png,
+            }
+        }
+        OverlayAction::Move {
+            id,
+            rect,
+            at,
+            z,
+            opacity,
+        } => {
+            let current = match send(&OverlayRequest::List)? {
+                OverlayResponse::Layers(layers) => {
+                    layers
+                        .into_iter()
+                        .find(|layer| &layer.id == id)
+                        .ok_or_else(|| anyhow!("layer '{id}' does not exist on {address}"))?
+                        .geometry
+                }
+                OverlayResponse::Error(message) => bail!("player refused the request: {message}"),
+                OverlayResponse::Ok => bail!("player sent an unexpected reply to a listing"),
+            };
+            let mut geometry = current;
+            if let Some(rect) = rect {
+                (geometry.x, geometry.y) = (rect.x, rect.y);
+                (geometry.width, geometry.height) = (rect.width, rect.height);
+            }
+            if let Some((x, y)) = at {
+                (geometry.x, geometry.y) = (*x, *y);
+            }
+            geometry.z = z.unwrap_or(geometry.z);
+            geometry.opacity = opacity.map_or(geometry.opacity, opacity_byte);
+            OverlayRequest::Move {
+                id: id.clone(),
+                geometry,
+            }
+        }
+        OverlayAction::Delete { id } => OverlayRequest::Delete { id: id.clone() },
+        OverlayAction::Clear => OverlayRequest::Clear,
+        OverlayAction::List => OverlayRequest::List,
+    };
+    match send(&request)? {
+        OverlayResponse::Ok => println!("ok"),
+        OverlayResponse::Error(message) => bail!("player refused the request: {message}"),
+        OverlayResponse::Layers(layers) if layers.is_empty() => println!("no layers"),
+        OverlayResponse::Layers(layers) => {
+            println!(
+                "{:<24} {:>13} {:>11} {:>5} {:>7} {:>11}",
+                "ID", "X,Y", "WxH", "Z", "OPACITY", "IMAGE"
+            );
+            for layer in layers {
+                let geometry = layer.geometry;
+                println!(
+                    "{:<24} {:>13} {:>11} {:>5} {:>7.2} {:>11}",
+                    layer.id,
+                    format!("{},{}", geometry.x, geometry.y),
+                    format!("{}x{}", geometry.width, geometry.height),
+                    geometry.z,
+                    f64::from(geometry.opacity) / 255.0,
+                    format!("{}x{}", layer.image_width, layer.image_height),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn make_element(factory: &str, description: &str) -> Result<gst::Element> {

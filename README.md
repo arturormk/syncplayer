@@ -95,12 +95,13 @@ when possible, or export the exact PID's dump with `coredumpctl` on `systemd-cor
 
 ## Command-line reference
 
-Syncplayer has three subcommands:
+Syncplayer has four subcommands:
 
 ```text
 syncplayer master [OPTIONS] <PROGRAM>
 syncplayer slave  [OPTIONS] <PROGRAM> --master <IP:PORT>
 syncplayer validate [OPTIONS] <PROGRAM>
+syncplayer overlay --player <HOST[:PORT]> <put|move|delete|clear|list> ...
 ```
 
 Run the corresponding `--help` command for generated details. `--help` and `--version` are also
@@ -125,6 +126,8 @@ These options are accepted by both `master` and `slave`:
 | `--hwdec <auto|off>` | No | Let GStreamer rank hardware decoders normally or disable factories classified as hardware video decoders. |
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
+| `--overlay-bind <IP:PORT>` | No | Accept [overlay layers](#overlay-layers) for this player on this TCP address, for example `0.0.0.0:46002`. Disabled by default. |
+| `--overlay-token <TOKEN>` | No | Shared token that overlay clients must present. Requires `--overlay-bind`. |
 
 While the transport and pipeline are both playing, an independent watchdog requires video buffers
 to keep crossing the final output path. It force-exits with status 70 if no frame passes for ten
@@ -364,6 +367,36 @@ onto common clock instants to report pairwise player separation directly. The op
 population excludes a stated interval after transitions or other discontinuities, is reported
 separately, and never hides the unfiltered worst cases. The default 40 ms threshold is one frame for
 25 fps test media; override or repeat `--threshold-ms` for other frame rates.
+
+### Overlay layers
+
+A player started with `--overlay-bind` draws named PNG layers over its video, beneath the
+diagnostic OSD. Each layer has a render rectangle in output pixels, a stacking order, and an
+opacity. Send only the bounding rectangle of the content: a sprite placed on a physical object, a
+mask, or a label. A full-screen layer is simply the rectangle `0,0,1920,1200`. Layers belong to one
+player, are not synchronized, and are lost on restart
+([ADR 0014](docs/adr/0014-accept-host-local-overlay-layers-on-a-per-player-channel.md)).
+
+```sh
+syncplayer slave show.toml --master 10.0.0.1:46000 --kms-gl \
+  --overlay-bind 0.0.0.0:46002 --overlay-token s3cret
+
+# From any host on the LAN (the port defaults to 46002):
+syncplayer overlay --player pi4-03 --token s3cret put --id label --rect 20,20,600,80 label.png
+syncplayer overlay --player pi4-03 --token s3cret put --id mask --opacity 0.8 mask-1920x1200.png
+syncplayer overlay --player pi4-03 --token s3cret move --id label --at 40,1100
+syncplayer overlay --player pi4-03 --token s3cret move --id label --rect 40,1000,900,120 --z 5
+syncplayer overlay --player pi4-03 --token s3cret list
+syncplayer overlay --player pi4-03 --token s3cret delete --id label
+syncplayer overlay --player pi4-03 --token s3cret clear
+```
+
+`put` without `--rect` renders the image at its own size at `0,0` (or at `--at X,Y`). `move`
+changes only the given properties and does not resend the image. With `--kms-gl` the GPU blends
+layers and only re-uploads a layer when it changes. On CPU sinks, large layers cost a per-frame
+blend proportional to their area. Rotation, skew, and perspective must be rendered into the PNG
+by the sender. The token is sent in clear text, so bind the listener to a trusted interface.
+Tools can speak the [overlay protocol](docs/overlay-protocol.md) directly.
 
 ### Logging
 

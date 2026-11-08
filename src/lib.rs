@@ -4,6 +4,7 @@
 pub mod console;
 pub mod diagnostics;
 pub mod events;
+pub mod overlay;
 pub mod playlist;
 pub mod program;
 pub mod protocol;
