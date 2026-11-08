@@ -496,6 +496,7 @@ mod imp {
     use gstreamer as gst;
     use gstreamer_base as gst_base;
     use gstreamer_base::subclass::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{LazyLock, Mutex};
 
     static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -509,6 +510,8 @@ mod imp {
     #[derive(Default)]
     pub struct SandUntile {
         state: Mutex<Option<Untiling>>,
+        /// Whether the first untiled frame's memory layout has been logged.
+        layout_logged: AtomicBool,
     }
 
     #[glib::object_subclass]
@@ -608,6 +611,23 @@ mod imp {
             Ok(())
         }
 
+        fn propose_allocation(
+            &self,
+            decide_query: Option<&gst::query::Allocation>,
+            query: &mut gst::query::Allocation,
+        ) -> Result<(), gst::LoggableError> {
+            let untiling = self.state.lock().is_ok_and(|state| state.is_some());
+            if untiling {
+                // Without video-meta support upstream, v4l2codecs copies
+                // each frame into a default-layout NV12_128C8 buffer, and
+                // that copy assumes the same single-plane SAND layout as the
+                // broken DMA-BUF label. Accepting the meta lets the decoder
+                // hand over its real two-plane V4L2 buffers.
+                query.add_allocation_meta::<gstreamer_video::VideoMeta>(None);
+            }
+            self.parent_propose_allocation(decide_query, query)
+        }
+
         fn transform_size(
             &self,
             _direction: gst::PadDirection,
@@ -637,6 +657,9 @@ mod imp {
                 );
                 return Err(gst::FlowError::NotNegotiated);
             };
+            if !self.layout_logged.swap(true, Ordering::Relaxed) {
+                log_input_layout(inbuf, untiling);
+            }
             untiling.convert(inbuf, outbuf).map_err(|error| {
                 let geometry = (0..inbuf.n_memory())
                     .map(|index| {
@@ -664,6 +687,29 @@ mod imp {
             })?;
             Ok(gst::FlowSuccess::Ok)
         }
+    }
+
+    /// Logs the memory layout of the first frame handed to the untiler, so
+    /// a wrong result can be traced to the buffers the decoder delivers.
+    fn log_input_layout(buffer: &gst::BufferRef, untiling: &Untiling) {
+        let memories: Vec<String> = (0..buffer.n_memory())
+            .map(|index| {
+                let size = buffer.peek_memory(index).size();
+                format!(
+                    "{size} bytes (column height {} at width {})",
+                    column_height_from_size(size, untiling.width),
+                    untiling.width
+                )
+            })
+            .collect();
+        let meta = buffer
+            .meta::<gstreamer_video::VideoMeta>()
+            .map(|meta| format!("offsets {:?} strides {:?}", meta.offset(), meta.stride()));
+        tracing::info!(
+            memories = ?memories,
+            video_meta = meta.as_deref(),
+            "v4l2codecs SAND128 workaround first input frame layout"
+        );
     }
 }
 
@@ -878,7 +924,7 @@ mod tests {
         upstream_caps: &gst::Caps,
         downstream_caps: &gst::Caps,
         input: gst::Buffer,
-    ) -> (gst::Caps, gst::Buffer) {
+    ) -> (gst::Caps, gst::Buffer, bool) {
         use std::sync::{Arc, Mutex};
         register().unwrap();
         let element = gst::ElementFactory::make(ELEMENT_NAME).build().unwrap();
@@ -911,11 +957,17 @@ mod tests {
                 gst::ClockTime,
             >::new()))
         );
+        let mut allocation = gst::query::Allocation::new(Some(upstream_caps), true);
+        // In passthrough the query reaches the test pad, which ignores it.
+        let video_meta = src.peer_query(&mut allocation)
+            && allocation
+                .find_allocation_meta::<gstreamer_video::VideoMeta>()
+                .is_some();
         src.push(input).unwrap();
         element.set_state(gst::State::Null).unwrap();
         let caps = sink.current_caps().unwrap();
         let buffer = received.lock().unwrap().take().unwrap();
-        (caps, buffer)
+        (caps, buffer, video_meta)
     }
 
     #[test]
@@ -931,7 +983,7 @@ mod tests {
             input.append_memory(gst::Memory::from_slice(chroma_src));
             input.set_pts(gst::ClockTime::from_mseconds(40));
         }
-        let (caps, output) = push_through(
+        let (caps, output, video_meta) = push_through(
             &caps("video/x-raw, format=NV12_128C8, width=300, height=4, framerate=25/1"),
             &caps("video/x-raw, format={ NV12_128C8, NV12, I420 }"),
             input,
@@ -939,6 +991,10 @@ mod tests {
         assert_eq!(
             caps.structure(0).unwrap().get::<&str>("format").unwrap(),
             "NV12"
+        );
+        assert!(
+            video_meta,
+            "the decoder must be allowed to hand over its own buffers"
         );
         assert_eq!(output.pts(), Some(gst::ClockTime::from_mseconds(40)));
         let info = gstreamer_video::VideoInfo::from_caps(&caps).unwrap();
@@ -965,7 +1021,7 @@ mod tests {
         gst::init().unwrap();
         let input = gst::Buffer::from_slice(vec![7_u8; 16 * 16 * 3 / 2]);
         let original = input.clone();
-        let (caps, output) = push_through(
+        let (caps, output, video_meta) = push_through(
             &caps("video/x-raw, format=I420, width=16, height=16, framerate=25/1"),
             &caps("video/x-raw, format={ NV12, I420 }"),
             input,
@@ -975,5 +1031,8 @@ mod tests {
             "I420"
         );
         assert_eq!(output.as_ptr(), original.as_ptr());
+        // Passthrough leaves the allocation answer to downstream, which here
+        // has no video-meta support.
+        assert!(!video_meta);
     }
 }
