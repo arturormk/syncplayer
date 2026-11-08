@@ -14,6 +14,11 @@ const PROGRAM_VERSION: u64 = 1;
 const CANONICAL_FORMAT: &[u8] = b"syncplayer-program-v1\0";
 /// Player-table key holding the player's presentation delay; reserved as a cue ID.
 const DELAY_KEY: &str = "delay";
+/// Player-table key enabling the `GStreamer` v4l2codecs SAND128 workaround;
+/// reserved as a cue ID.
+pub const SAND_WORKAROUND_KEY: &str = "workaround_gst_v4l2codecs_sand_bug";
+/// Keys that belong to a `[players.<id>]` table rather than to a cue.
+const PLAYER_KEYS: [&str; 2] = [DELAY_KEY, SAND_WORKAROUND_KEY];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProgramConfig {
@@ -23,6 +28,9 @@ pub struct ProgramConfig {
     pub players: BTreeMap<String, BTreeMap<String, PlayerCue>>,
     /// Presentation delay in seconds per player table (`[players.<id>] delay`).
     pub player_delays: BTreeMap<String, f64>,
+    /// `GStreamer` v4l2codecs SAND128 workaround per player table
+    /// (`[players.<id>] workaround_gst_v4l2codecs_sand_bug`).
+    pub player_sand_workarounds: BTreeMap<String, bool>,
     source_path: PathBuf,
     base_directory: PathBuf,
 }
@@ -166,6 +174,8 @@ pub struct ResolvedProgram {
     pub looping: bool,
     /// Seconds a Slave presents the Master timeline late; ignored by the Master.
     pub presentation_delay: f64,
+    /// Whether to work around the `GStreamer` v4l2codecs SAND128 bug.
+    pub gst_v4l2codecs_sand_workaround: bool,
     pub cues: Vec<ResolvedCue>,
 }
 
@@ -189,10 +199,11 @@ struct ProgramDocument {
     players: BTreeMap<String, PlayerDocument>,
 }
 
-/// One `[players.<id>]` table: an optional player-wide delay plus cue mappings.
+/// One `[players.<id>]` table: optional player-wide settings plus cue mappings.
 #[derive(Debug, Deserialize)]
 struct PlayerDocument {
     delay: Option<f64>,
+    workaround_gst_v4l2codecs_sand_bug: Option<bool>,
     #[serde(flatten)]
     cues: BTreeMap<String, PlayerCue>,
 }
@@ -219,20 +230,23 @@ enum EventActionType {
     Udp,
 }
 
-/// Finds a `delay` key written inside a `[players.<id>.<cue>]` table.
+/// Finds a player-wide key such as `delay` written inside a
+/// `[players.<id>.<cue>]` table.
 ///
-/// TOML assigns keys to the most recent table header, so `delay` placed after
-/// a cue header lands in the cue rather than the player and fails with an
-/// opaque unknown-field error. Returns the first offending player and cue.
-fn misplaced_cue_delay(text: &str) -> Option<(String, String)> {
+/// TOML assigns keys to the most recent table header, so a player key placed
+/// after a cue header lands in the cue rather than the player and fails with
+/// an opaque unknown-field error. Returns the first offending key, player,
+/// and cue.
+fn misplaced_player_key(text: &str) -> Option<(&'static str, String, String)> {
     let document: toml::Table = toml::from_str(text).ok()?;
     let players = document.get("players")?.as_table()?;
     players.iter().find_map(|(player, cues)| {
         cues.as_table()?.iter().find_map(|(cue, settings)| {
-            settings
-                .as_table()?
-                .contains_key(DELAY_KEY)
-                .then(|| (player.clone(), cue.clone()))
+            let settings = settings.as_table()?;
+            PLAYER_KEYS
+                .into_iter()
+                .find(|key| settings.contains_key(*key))
+                .map(|key| (key, player.clone(), cue.clone()))
         })
     })
 }
@@ -259,9 +273,9 @@ impl ProgramConfig {
 
     fn parse(text: &str, source_path: PathBuf, base_directory: PathBuf) -> Result<Self> {
         let document: ProgramDocument = toml::from_str(text).map_err(|error| {
-            match misplaced_cue_delay(text) {
-                Some((player, cue)) => anyhow!(
-                    "`{DELAY_KEY}` is set in cue table [players.{player}.{cue}]; move it to the \
+            match misplaced_player_key(text) {
+                Some((key, player, cue)) => anyhow!(
+                    "`{key}` is set in cue table [players.{player}.{cue}]; move it to the \
                      player table [players.{player}], above its cue tables"
                 ),
                 None => anyhow!(error),
@@ -276,9 +290,13 @@ impl ProgramConfig {
         }
         let mut players = BTreeMap::new();
         let mut player_delays = BTreeMap::new();
+        let mut player_sand_workarounds = BTreeMap::new();
         for (player_id, player) in document.players {
             if let Some(delay) = player.delay {
                 player_delays.insert(player_id.clone(), delay);
+            }
+            if let Some(enabled) = player.workaround_gst_v4l2codecs_sand_bug {
+                player_sand_workarounds.insert(player_id.clone(), enabled);
             }
             players.insert(player_id, player.cues);
         }
@@ -288,6 +306,7 @@ impl ProgramConfig {
             aliases: document.aliases,
             players,
             player_delays,
+            player_sand_workarounds,
             source_path,
             base_directory,
         };
@@ -341,6 +360,15 @@ impl ProgramConfig {
             for (player, delay) in &self.player_delays {
                 writer.string(player);
                 writer.optional_f64(Some(*delay));
+            }
+        }
+        // Tagged and appended only when present, for the same reason.
+        if !self.player_sand_workarounds.is_empty() {
+            writer.string(SAND_WORKAROUND_KEY);
+            writer.u64(self.player_sand_workarounds.len() as u64);
+            for (player, enabled) in &self.player_sand_workarounds {
+                writer.string(player);
+                writer.boolean(*enabled);
             }
         }
         writer.finish()
@@ -435,12 +463,18 @@ impl ProgramConfig {
             self.player_delays.get("default").copied(),
         )
         .unwrap_or(0.0);
+        let gst_v4l2codecs_sand_workaround = choose_copy(
+            self.player_sand_workarounds.get(selected).copied(),
+            self.player_sand_workarounds.get("default").copied(),
+        )
+        .unwrap_or(false);
         Ok(ResolvedProgram {
             program_id: self.program.id.clone(),
             hash: self.program_hash(),
             player_id,
             looping: self.program.looping,
             presentation_delay,
+            gst_v4l2codecs_sand_workaround,
             cues,
         })
     }
@@ -467,6 +501,9 @@ impl ProgramConfig {
             validate_identifier("cue ID", &cue.id)?;
             if cue.id == DELAY_KEY {
                 bail!("cue ID '{DELAY_KEY}' is reserved for the player presentation delay");
+            }
+            if cue.id == SAND_WORKAROUND_KEY {
+                bail!("cue ID '{SAND_WORKAROUND_KEY}' is reserved for a player setting");
             }
             if !cue_ids.insert(cue.id.as_str()) {
                 bail!("duplicate cue ID '{}'", cue.id);
@@ -988,6 +1025,76 @@ payload_hex = "01 02 ff"
         let error = format!("{:#}", parse(&text).unwrap_err());
         assert!(
             error.contains("[players.left.intro]") && error.contains("move it to the player table"),
+            "{error}"
+        );
+    }
+
+    fn with_sand_workaround(text: &str, player: &str, value: &str) -> String {
+        text.replace(
+            &format!("[players.{player}.intro]"),
+            &format!(
+                "[players.{player}]\n{SAND_WORKAROUND_KEY} = {value}\n\n[players.{player}.intro]"
+            ),
+        )
+    }
+
+    #[test]
+    fn resolves_sand_workaround_with_default_fallback() {
+        let without = parse(PROGRAM).unwrap();
+        assert!(without.player_sand_workarounds.is_empty());
+        let resolved = without
+            .resolve_player_with_hostname(Some("left"), "x")
+            .unwrap();
+        assert!(!resolved.gst_v4l2codecs_sand_workaround);
+
+        let with_default = with_sand_workaround(PROGRAM, "default", "true");
+        let config = parse(&with_default).unwrap();
+        for player in ["left", "right"] {
+            let resolved = config
+                .resolve_player_with_hostname(Some(player), "x")
+                .unwrap();
+            assert!(resolved.gst_v4l2codecs_sand_workaround, "{player}");
+        }
+
+        let left_disabled = with_sand_workaround(&with_default, "left", "false");
+        let config = parse(&left_disabled).unwrap();
+        let left = config.resolve_player_with_hostname(None, "host-a").unwrap();
+        assert!(!left.gst_v4l2codecs_sand_workaround);
+        assert_eq!(left.cues.len(), 2);
+        let right = config
+            .resolve_player_with_hostname(Some("right"), "x")
+            .unwrap();
+        assert!(right.gst_v4l2codecs_sand_workaround);
+    }
+
+    #[test]
+    fn canonical_hash_covers_sand_workaround_and_is_stable_without_it() {
+        let base = parse(PROGRAM).unwrap();
+        let hash = |value: &str| {
+            parse(&with_sand_workaround(PROGRAM, "left", value))
+                .unwrap()
+                .program_hash()
+        };
+        assert_ne!(base.program_hash(), hash("false"));
+        assert_ne!(hash("true"), hash("false"));
+        assert_eq!(base.program_hash().to_string(), PROGRAM_HASH_WITHOUT_DELAYS);
+    }
+
+    #[test]
+    fn rejects_invalid_sand_workaround_and_reserved_cue_id() {
+        assert!(parse(&with_sand_workaround(PROGRAM, "left", "1")).is_err());
+        assert!(parse(&with_sand_workaround(PROGRAM, "left", "\"yes\"")).is_err());
+        assert!(
+            parse(&PROGRAM.replace("id = \"main\"", &format!("id = \"{SAND_WORKAROUND_KEY}\"")))
+                .is_err()
+        );
+        let misplaced = PROGRAM.replace(
+            "[players.left.intro]",
+            &format!("[players.left.intro]\n{SAND_WORKAROUND_KEY} = true"),
+        );
+        let error = format!("{:#}", parse(&misplaced).unwrap_err());
+        assert!(
+            error.contains(SAND_WORKAROUND_KEY) && error.contains("move it to the player table"),
             "{error}"
         );
     }

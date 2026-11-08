@@ -125,6 +125,7 @@ These options are accepted by both `master` and `slave`:
 | `--hwdec <auto|off>` | No | Let GStreamer rank hardware decoders normally or disable factories classified as hardware video decoders. |
 | `--video-sink <FACTORY>` | No | Override GStreamer's automatically selected video-sink factory, for example `fakesink`. Primarily useful for diagnostics and headless testing. |
 | `--audio-sink <FACTORY>` | No | Override GStreamer's automatically selected audio-sink factory, for example `fakesink`. A test sink does not validate physical audio/video timing. |
+| `--workaround-gst-v4l2codecs-sand-bug[=BOOL]` | No | Work around a GStreamer v4l2codecs bug that scrambles HEVC colors from the Raspberry Pi 4 hardware decoder. Overrides the player's `workaround_gst_v4l2codecs_sand_bug` in the program file; `=false` disables it. See [HEVC on Raspberry Pi 4](#hevc-on-raspberry-pi-4-gstreamer-v4l2codecs-workaround). |
 
 While the transport and pipeline are both playing, an independent watchdog requires video buffers
 to keep crossing the final output path. It force-exits with status 70 if no frame passes for ten
@@ -146,6 +147,37 @@ The initial GL mode supports `--fit contain` (the default) and `--fit stretch`, 
 GBM chooses the first connected DRM output by default. For multi-output systems, set
 `GST_GL_GBM_DRM_DEVICE` and `GST_GL_GBM_DRM_CONNECTOR` in the player environment. GStreamer's
 public GBM API does not provide Syncplayer with a portable numeric connector selector.
+
+### HEVC on Raspberry Pi 4 (GStreamer v4l2codecs workaround)
+
+On a Raspberry Pi 4, GStreamer's `v4l2slh265dec` (from the v4l2codecs plugin in gst-plugins-bad)
+decodes HEVC correctly but labels its zero-copy output with the wrong layout: two-plane SAND128
+frames are advertised as `DMA_DRM` `NV12:0x0700000000000004` (single-plane SAND128, column height 0).
+The GPU follows that label, so video flashes with scrambled colors. This is a bug in GStreamer,
+not in the media or in Syncplayer. When Syncplayer negotiates such caps it logs a warning.
+
+H.264 media (`tools/prepare-video-for-rpi.sh`) avoids the problem entirely and remains the
+recommended choice. To play HEVC anyway, enable the workaround per player in the program file or
+with the command-line switch:
+
+```toml
+[players.default]
+workaround_gst_v4l2codecs_sand_bug = true
+```
+
+The workaround inserts an in-process element at the head of the video chain. It refuses
+SAND128 `DMA_DRM` caps, which makes the decoder fall back to system-memory `NV12_128C8`, and
+untiles those frames to linear `NV12` on the CPU. Every other format, including DMA-BUF H.264,
+passes through unchanged. It costs about 10 ms of one core per 1920x1200 frame (larger frames use
+two threads) plus the upload of system-memory video. With `--kms-gl`, the DMA-BUF requirement
+described above is relaxed to a warning because untiled frames are in system memory. The startup
+log reports the workaround and its source, and a line such as `v4l2codecs SAND128 workaround active`
+appears when frames are actually being untiled.
+
+Like `delay`, the key belongs in the player table, a player's own value overrides
+`[players.default]`, it is part of the program hash only when present, and its name cannot be used
+as a cue ID. Remove it once the decoder is fixed upstream. See
+[ADR 0014](docs/adr/0014-work-around-the-gstreamer-v4l2codecs-sand128-bug-in-process.md).
 
 The program defines ordered logical cues and maps each cue to host-local media:
 

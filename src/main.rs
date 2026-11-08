@@ -28,6 +28,7 @@ use syncplayer::protocol::{
 use syncplayer::subscriber::{ParticipantLease, ParticipantRegistry, Readiness, StateEndpoint};
 use syncplayer::time::{ClockNs, MediaPositionNs};
 use syncplayer::transport::{EosDecision, RuntimeState, TransportController};
+use syncplayer::v4l2codecs_workaround;
 use syncplayer::validation::{
     DiagnosticLevel, EXTERNAL_AUDIO_DURATION_TOLERANCE_NS, GstMediaProbe, validate_program,
 };
@@ -215,6 +216,18 @@ struct PlaybackArgs {
     /// Override `GStreamer`'s automatically selected audio sink.
     #[arg(long)]
     audio_sink: Option<String>,
+
+    /// Work around a bug in `GStreamer`'s v4l2codecs plugin (gst-plugins-bad) that scrambles
+    /// HEVC colors from the Raspberry Pi 4 hardware decoder, by untiling its frames on the CPU.
+    /// Overrides the player's `workaround_gst_v4l2codecs_sand_bug` in the program file.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    workaround_gst_v4l2codecs_sand_bug: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -524,7 +537,21 @@ fn create_subscription(
 fn load_runtime_program(args: &PlaybackArgs) -> Result<ResolvedProgram> {
     let config = ProgramConfig::load(&args.program)
         .with_context(|| format!("failed to load program {}", args.program.display()))?;
-    let program = config.resolve_player(args.player_id.as_deref())?;
+    let mut program = config.resolve_player(args.player_id.as_deref())?;
+    if let Some(enabled) = args.workaround_gst_v4l2codecs_sand_bug {
+        program.gst_v4l2codecs_sand_workaround = enabled;
+    }
+    if program.gst_v4l2codecs_sand_workaround {
+        warn!(
+            source = if args.workaround_gst_v4l2codecs_sand_bug.is_some() {
+                "command line"
+            } else {
+                "program"
+            },
+            "workaround for a GStreamer v4l2codecs bug enabled: SAND128 DMA-BUF video is refused \
+             and NV12_128C8 frames are untiled on the CPU"
+        );
+    }
     info!(
         program = %program.program_id,
         program_hash = %program.hash,
@@ -547,6 +574,9 @@ fn run_validate(args: &ValidateArgs) -> Result<()> {
     println!("Player:  {}", report.player_id);
     if program.presentation_delay > 0.0 {
         println!("Delay:   {} s (Slave only)", program.presentation_delay);
+    }
+    if program.gst_v4l2codecs_sand_workaround {
+        println!("Workaround: GStreamer v4l2codecs SAND128 bug (HEVC on Raspberry Pi 4)");
     }
     println!();
     println!("Cues:");
@@ -2030,6 +2060,7 @@ struct PlaybackSequence {
     timeline: Option<Timeline>,
     looping: bool,
     from_playlist: bool,
+    gst_v4l2codecs_sand_workaround: bool,
 }
 
 impl PlaybackSequence {
@@ -2175,6 +2206,7 @@ impl PlaybackSequence {
             timeline: Some(timeline),
             looping: program.looping,
             from_playlist,
+            gst_v4l2codecs_sand_workaround: program.gst_v4l2codecs_sand_workaround,
         })
     }
 
@@ -3041,6 +3073,9 @@ impl Player {
 
         let video_queue = make_named_element("queue", "video-queue", "video queue")?;
         let mut video_chain = vec![video_queue.clone()];
+        if sequence.gst_v4l2codecs_sand_workaround {
+            video_chain.push(make_sand_untile("video-sand-untile")?);
+        }
         if !args.kms_gl {
             let video_convert =
                 make_named_element("videoconvert", "video-convert", "video converter")?;
@@ -3207,7 +3242,11 @@ impl Player {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
-        log_and_validate_video_negotiation(&osd_overlay, args)?;
+        log_and_validate_video_negotiation(
+            &osd_overlay,
+            args,
+            sequence.gst_v4l2codecs_sand_workaround,
+        )?;
         let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
         // Pin the clock selected during preroll so the one exported by the
         // Master is exactly the one used once the pipeline starts playing.
@@ -3233,6 +3272,7 @@ impl Player {
             display = args.display.as_deref(),
             kms_gl = args.kms_gl,
             hwdec = ?args.hwdec,
+            gst_v4l2codecs_sand_workaround = sequence.gst_v4l2codecs_sand_workaround,
             looped = sequence.looping,
             playlist = sequence.from_playlist,
             "media sequence prerolled"
@@ -3296,7 +3336,8 @@ impl Player {
             .property("force-aspect-ratio", args.fit == FitMode::Contain)
             .build()
             .context("playbin3 is unavailable")?;
-        let (video_sink, osd_overlay) = build_playbin_video_sink(args)?;
+        let (video_sink, osd_overlay) =
+            build_playbin_video_sink(args, sequence.gst_v4l2codecs_sand_workaround)?;
         let video_rate_control = video_sink.clone();
         element.set_property("video-sink", &video_sink);
         let audio_sink = if let Some(name) = &args.audio_sink {
@@ -3370,7 +3411,11 @@ impl Player {
             configure_external_clock_audio_slaving(&pipeline)?;
         }
         log_selected_pipeline_elements(&pipeline);
-        log_and_validate_video_negotiation(&osd_overlay, args)?;
+        log_and_validate_video_negotiation(
+            &osd_overlay,
+            args,
+            sequence.gst_v4l2codecs_sand_workaround,
+        )?;
         let clock = select_playback_clock(&pipeline, forced_clock, args.clock, first.has_audio)?;
         pipeline.use_clock(Some(&clock));
         info!(
@@ -3395,6 +3440,7 @@ impl Player {
             display = args.display.as_deref(),
             kms_gl = args.kms_gl,
             hwdec = ?args.hwdec,
+            gst_v4l2codecs_sand_workaround = sequence.gst_v4l2codecs_sand_workaround,
             looped = sequence.looping,
             playlist = sequence.from_playlist,
             "embedded-media sequence prerolled"
@@ -5110,8 +5156,24 @@ fn make_osd_overlay() -> Result<gst::Element> {
         .context("diagnostic OSD requires the GStreamer timeoverlay element")
 }
 
-fn build_playbin_video_sink(args: &PlaybackArgs) -> Result<(gst::Element, gst::Element)> {
+/// Creates the in-process element that works around the `GStreamer`
+/// v4l2codecs SAND128 bug; see [`v4l2codecs_workaround`].
+fn make_sand_untile(name: &str) -> Result<gst::Element> {
+    v4l2codecs_workaround::register()?;
+    gst::ElementFactory::make(v4l2codecs_workaround::ELEMENT_NAME)
+        .name(name)
+        .build()
+        .context("v4l2codecs SAND128 workaround element is unavailable")
+}
+
+fn build_playbin_video_sink(
+    args: &PlaybackArgs,
+    gst_v4l2codecs_sand_workaround: bool,
+) -> Result<(gst::Element, gst::Element)> {
     let mut video_chain = Vec::new();
+    if gst_v4l2codecs_sand_workaround {
+        video_chain.push(make_sand_untile("embedded-video-sand-untile")?);
+    }
     if !args.kms_gl {
         let video_convert =
             make_named_element("videoconvert", "embedded-video-convert", "video converter")?;
@@ -5226,6 +5288,7 @@ fn configure_kms_gl_context(pipeline: &gst::Pipeline, args: &PlaybackArgs) -> Re
 fn log_and_validate_video_negotiation(
     osd_overlay: &gst::Element,
     args: &PlaybackArgs,
+    gst_v4l2codecs_sand_workaround: bool,
 ) -> Result<()> {
     let caps = osd_overlay
         .static_pad("src")
@@ -5242,8 +5305,19 @@ fn log_and_validate_video_negotiation(
         compositor = if args.kms_gl { "gpu-egl-gbm" } else { "inline" },
         caps = caps.as_ref().map(ToString::to_string),
         memory_features = ?features,
+        gst_v4l2codecs_sand_workaround,
         "negotiated video output"
     );
+    if caps
+        .as_ref()
+        .is_some_and(|caps| v4l2codecs_workaround::caps_have_sand128_dmabuf(caps))
+    {
+        warn!(
+            "negotiated Broadcom SAND128 DMA-BUF video; with the Raspberry Pi 4 HEVC decoder, a \
+             GStreamer v4l2codecs bug mislabels this layout and colors will be scrambled; \
+             consider --workaround-gst-v4l2codecs-sand-bug or H.264 media"
+        );
+    }
     if !args.kms_gl {
         return Ok(());
     }
@@ -5251,6 +5325,17 @@ fn log_and_validate_video_negotiation(
     let has_overlay = features
         .iter()
         .any(|feature| feature == "meta:GstVideoOverlayComposition");
+    if gst_v4l2codecs_sand_workaround && (!has_dmabuf || !has_overlay) {
+        // Untiled frames live in system memory, so the zero-copy path the
+        // check below enforces is unavailable by design.
+        warn!(
+            has_dmabuf,
+            has_overlay,
+            "--kms-gl is uploading system-memory video because the v4l2codecs SAND128 \
+             workaround is enabled"
+        );
+        return Ok(());
+    }
     if !has_dmabuf || !has_overlay {
         bail!(
             "--kms-gl requires negotiated DMA-BUF video with overlay-composition metadata; negotiated caps were {}",
@@ -5909,7 +5994,7 @@ mod tests {
             assert!(error.contains("install the GStreamer GL runtime plugins"));
             return;
         }
-        let (output, _) = build_playbin_video_sink(&args.playback).unwrap();
+        let (output, _) = build_playbin_video_sink(&args.playback, false).unwrap();
         let output = output.downcast::<gst::Bin>().unwrap();
         let factories: Vec<String> = output
             .iterate_recurse()
@@ -5921,6 +6006,83 @@ mod tests {
         assert!(factories.iter().any(|factory| factory == "glimagesink"));
         assert!(!factories.iter().any(|factory| factory == "videoconvert"));
         assert!(!factories.iter().any(|factory| factory == "videoscale"));
+    }
+
+    #[test]
+    fn command_line_parses_the_v4l2codecs_sand_workaround_switch() {
+        let parse = |extra: &[&str]| {
+            let mut command_line = vec!["syncplayer", "master", "show.toml"];
+            command_line.extend_from_slice(extra);
+            Cli::try_parse_from(command_line).map(|cli| match cli.command {
+                Command::Master(args) => args.playback.workaround_gst_v4l2codecs_sand_bug,
+                _ => panic!("expected Master command"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(
+            parse(&["--workaround-gst-v4l2codecs-sand-bug"]).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(&["--workaround-gst-v4l2codecs-sand-bug=false"]).unwrap(),
+            Some(false)
+        );
+        assert!(parse(&["--workaround-gst-v4l2codecs-sand-bug=maybe"]).is_err());
+        // A bare switch must not swallow the positional program argument.
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "master",
+            "--workaround-gst-v4l2codecs-sand-bug",
+            "show.toml",
+        ])
+        .unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        assert_eq!(args.playback.program, PathBuf::from("show.toml"));
+    }
+
+    #[test]
+    fn sand_workaround_heads_the_video_output_bin() {
+        gst::init().unwrap();
+        let cli = Cli::try_parse_from([
+            "syncplayer",
+            "master",
+            "show.toml",
+            "--video-sink",
+            "fakesink",
+        ])
+        .unwrap();
+        let Command::Master(args) = cli.command else {
+            panic!("expected Master command");
+        };
+        let element_names = |enabled: bool| -> Vec<String> {
+            let (output, _) = build_playbin_video_sink(&args.playback, enabled).unwrap();
+            let ghost = output
+                .static_pad("sink")
+                .unwrap()
+                .downcast::<gst::GhostPad>()
+                .unwrap();
+            let first = ghost.target().unwrap().parent_element().unwrap();
+            let bin = output.downcast::<gst::Bin>().unwrap();
+            let mut names: Vec<String> = bin
+                .iterate_elements()
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter_map(|element| element.factory())
+                .map(|factory| factory.name().to_string())
+                .collect();
+            names.insert(0, first.factory().unwrap().name().to_string());
+            names
+        };
+        let enabled = element_names(true);
+        assert_eq!(enabled[0], syncplayer::v4l2codecs_workaround::ELEMENT_NAME);
+        let disabled = element_names(false);
+        assert!(
+            !disabled
+                .iter()
+                .any(|name| name == syncplayer::v4l2codecs_workaround::ELEMENT_NAME)
+        );
     }
 
     #[test]
@@ -6215,6 +6377,7 @@ mod tests {
             timeline: Some(Timeline::new(vec![10, 20], looping).unwrap()),
             looping,
             from_playlist: true,
+            gst_v4l2codecs_sand_workaround: false,
         }
     }
 
@@ -6307,6 +6470,7 @@ mod tests {
             timeline: Some(Timeline::new(vec![2, 27], true).unwrap()),
             looping: true,
             from_playlist: true,
+            gst_v4l2codecs_sand_workaround: false,
         };
 
         // Master position 181 on a [10, 20] timeline is iteration 6,
