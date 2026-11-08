@@ -147,6 +147,34 @@ GBM chooses the first connected DRM output by default. For multi-output systems,
 `GST_GL_GBM_DRM_DEVICE` and `GST_GL_GBM_DRM_CONNECTOR` in the player environment. GStreamer's
 public GBM API does not provide Syncplayer with a portable numeric connector selector.
 
+### GL output color format without a desktop
+
+Without X11 or Wayland, `glimagesink` renders through EGL/GBM. This happens with `--kms-gl` and also
+when the default sink selection resolves to `glimagesink` on a console-only system. GStreamer
+1.26 registers each GBM buffer with KMS as ARGB8888, whatever EGL config it rendered with. Mesa on
+the Raspberry Pi 4 offers a 10-bit A2R10G10B10 config first. Rendering in that format while KMS
+reads ARGB8888 keeps black, white and flat saturated colors intact but scrambles every
+intermediate value. The picture keeps its shapes and text, while gradients become repeated color
+bands and fine detail becomes noise. The decoder and the codec are not involved
+([INC-0007](docs/incidents/INC-0007-pi4-gl-output-scrambles-colors.md)).
+
+Syncplayer therefore asks every GBM GL context for an 8-bit RGBA config. When it does, the log
+shows `created GBM GL context with 8-bit scanout config`. If the driver cannot create such a
+context, Syncplayer logs a warning and GStreamer uses its own default. X11, Wayland, `kmssink`
+and other sinks are not affected.
+
+`GST_GL_CONFIG` overrides this request. Use it if a future GPU, driver or GStreamer release needs
+a different config, for example after GStreamer registers GBM buffers in their real format:
+
+```sh
+GST_GL_CONFIG="gst-gl-context-config,red-size=(int)10,green-size=(int)10,blue-size=(int)10,alpha-size=(int)2" \
+  syncplayer master ...
+```
+
+If GL output ever looks recognizable but has wrong colors, compare it with `--video-sink kmssink`
+and run with `GST_DEBUG=glcontext:5`. That log prints the chosen config as `[R, G, B, A]`.
+Anything other than `[8, 8, 8, 8]` on a GBM display points to this mismatch, not to the decoder.
+
 The program defines ordered logical cues and maps each cue to host-local media:
 
 ```toml
