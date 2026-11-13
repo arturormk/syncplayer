@@ -1,6 +1,7 @@
 # Syncplayer
 
 ![Made with Codex](https://img.shields.io/badge/made%20with-Codex-111111)
+![Claude Code: delay, stretch, overlays, Pi 4 color fix](https://img.shields.io/badge/Claude%20Code-delay%2C%20stretch%2C%20overlays%2C%20Pi%204%20color%20fix-D97757)
 [![CI](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml/badge.svg)](https://github.com/arturormk/syncplayer/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENCE.md)
 
